@@ -9629,3 +9629,32 @@ When investigating live production behavior, debugging issues, or analyzing trad
      - *(หมายเหตุจากการตรวจสอบ Alpaca จริง: Brokerage commission ของหุ้น/ETF สหรัฐฯ คือ `$0` จริง แต่อาจมี Regulatory pass-through fees เล็กน้อยอย่าง SEC Section 31 / FINRA TAF ฝั่งขาย และ CAT ซึ่งมักปัดขึ้นทีละ `$0.01` จึงคง Slippage `0.01%` ไว้เป็นการประมาณต้นทุนแฝงขั้นต่ำ)*
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.71`** ใน `package.json` และ `src/version.ts`
+
+---
+
+## 317. v0.3.0.72 — Full Alpaca US Equities & ETFs Live/Paper Trading Integration (`src/exchange/alpaca/feed.ts`, `src/exchange/alpaca/client.ts`, `src/index.ts`, `src/config.ts`, `src/server.ts`, `public/index.html`, `public/app.js`)
+
+- **เป้าหมายที่แก้ไข**:
+  - รองรับการรันบอทเทรดหุ้นและ ETF สหรัฐฯ บน **Alpaca** ทั้งบัญชี **Paper (`paper-api.alpaca.markets`)** และ **Live (`api.alpaca.markets`)** อย่างสมบูรณ์ตั้งแต่ Exchange Adapter, Live Data Feeds, Runtime Engine Loop, การจัดการเวลาตลาดสหรัฐฯ (`/v2/clock`), จนถึงหน้าตั้งค่า Live Dashboard UI
+- **การแก้ไขที่ทำ**:
+  1. **เพิ่มโมดูล Alpaca Market Feeds (`src/exchange/alpaca/feed.ts` & `src/exchange/alpaca/index.ts`)**:
+     - `normalizeStockSymbol()` แปลง ticker ให้สะอาด (`AAPL`, `AAPL/USD`, `AAPLUSD` ➔ `AAPL` โดยป้องกันการตัดชื่อ ticker สั้นๆ)
+     - `fetchAlpacaBars()` ดึงแท่งเทียนย้อนหลังผ่าน Alpaca Data API v2 (`/v2/stocks/{sym}/bars?feed=iex`) พร้อม aggregate `4h` จาก `1Hour` ได้อัตโนมัติ
+     - `AlpacaAtrFeed implements AtrSource` คำนวณ rolling closed-bar ATR% และตรวจแท่งเทียนปิดรอบใหม่แบบ polling
+     - `AlpacaBookTickerFeed` ดึง `/v2/stocks/{sym}/snapshot?feed=iex` พร้อม fallback ไปยัง `latestTrade` / `minuteBar` นอกเวลาทำการตลาด
+  2. **ยกระดับ `AlpacaClient` (`src/exchange/alpaca/client.ts`)**:
+     - ลบ API Key/Secret แบบ Hardcoded ออกทั้งหมด ใช้เฉพาะค่าที่ส่งเข้า `opts`, `settings.db.json`, หรือ `.env` (`ALPACA_API_KEY` / `ALPACA_API_SECRET`)
+     - เพิ่ม `getMarketClock()` ดึงสถานะเปิด-ปิดตลาด NYSE/NASDAQ จาก `/v2/clock` (cached 15s)
+     - อัปเกรด `getTopOfBook()` ให้ใช้ `/snapshot?feed=iex` พร้อม trade/bar fallback, `placeOrder()` ส่ง `time_in_force: "day"` (รองรับ Fractional Shares ทั้ง Limit & Market), `cancelAllOpenOrders(symbol)` ยกเลิกเฉพาะออเดอร์ของหุ้นตัวที่ระบุได้ถูกต้อง
+  3. **เชื่อมต่อ Strategy, Config & Server (`src/config.ts`, `src/server.ts`, `src/strategy/*`, `src/exchange/types.ts`)**:
+     - เพิ่มคีย์ตั้งค่า `alpacaApiKey`, `alpacaApiSecret`, `alpacaBaseUrl`, `alpacaDataUrl`, `alpacaIgnoreMarketHours` ใน `defaultStrategyConfig` และ `loadConfigFromDatabase`
+     - Mask `alpacaApiKey` / `alpacaApiSecret` เป็น `"******"` ใน `/api/db/settings`, `/api/config` และป้องกันการบันทึกค่า Masked Placeholder ทับคีย์จริงใน `DynamicGrid`, `SwingTrader`, `MaFanStrategyAdapter`
+     - เพิ่ม `setCandles()` ใน `DowStructureEngine` (`src/market-structure/index.ts`) สำหรับโหลดแท่งเทียนเริ่มต้นที่ไม่ใช่ Binance
+  4. **Engine Runtime & US Market Hours Guard (`src/index.ts`)**:
+     - สร้างตัวช่วย `buildExchangeAdapter()`, `loadEngineCandlesForExchange()`, `createCandleFeedForExchange()` รองรับทั้ง initial boot, Dynamic Exchange Switch, Symbol Switch, Timeframe Reload และ Strategy Switch
+     - เพิ่ม **US Market Hours Guard** ใน Main Loop: เมื่ออยู่บน `alpaca` ในโหมด Live และตลาดปิด (`!clock.isOpen`) ระบบจะหยุดส่งคำสั่งเทรดใหม่ชั่วคราว (คง telemetry dashboard ไว้) ยกเว้นเปิด `dryRun` หรือ `alpacaIgnoreMarketHours: true`
+  5. **Live Dashboard UI (`public/index.html`, `public/app.js`)**:
+     - เพิ่มตัวเลือก `🇺🇸 Alpaca US Stocks (0% Commission)` ใน `#cfg_exchange` พร้อมกลุ่มตั้งค่า `.alpaca-fields-group` (`cfg_alpacaApiKey`, `cfg_alpacaApiSecret`, `cfg_alpacaBaseUrl`, `cfg_alpacaDataUrl`, `cfg_alpacaIgnoreMarketHours`)
+     - อัปเดต `#logoBadge` (`ALPACA ...`), `renderTopSymbolOptions()` ดึงรายการหุ้นสหรัฐฯ จาก `/api/symbols?exchange=alpaca`, และสลับ default ticker ให้อัตโนมัติเมื่อเปลี่ยนกระดานเทรด
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.72`** ใน `package.json` และ `src/version.ts`

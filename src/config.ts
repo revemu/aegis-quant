@@ -76,13 +76,21 @@ export const defaultStrategyConfig = {
   timezone: process.env.TZ || "Asia/Bangkok",
   dryRun: process.env.DRY_RUN === "true" || false,
 
-  /** Active Exchange Adapter: "binance" (default) or "dreamdex". */
+  /** Active Exchange Adapter: "binance" (default), "dreamdex", or "alpaca". */
   exchange: (process.env.EXCHANGE || "binance").toLowerCase(),
 
   // ── Binance API Credentials ─────────────────────────────────────────────
   binanceApiKey: process.env.BINANCE_API_KEY || "",
   binanceApiSecret: process.env.BINANCE_API_SECRET || "",
   binanceBaseUrl: process.env.BINANCE_BASE_URL || "https://api.binance.com",
+
+  // ── Alpaca US Equities Credentials & Endpoints ──────────────────────────
+  alpacaApiKey: process.env.ALPACA_API_KEY || "",
+  alpacaApiSecret: process.env.ALPACA_API_SECRET || "",
+  alpacaBaseUrl: process.env.ALPACA_BASE_URL || "https://paper-api.alpaca.markets",
+  alpacaDataUrl: process.env.ALPACA_DATA_URL || "https://data.alpaca.markets",
+  /** Ignore US market hours clock check for testing / forced execution (default false). */
+  alpacaIgnoreMarketHours: false,
 
   // ── DreamDEX On-Chain Credentials & Network ────────────────────────────
   dreamdexPrivateKey: process.env.DREAMDEX_PRIVATE_KEY || process.env.PRIVATE_KEY || "",
@@ -439,6 +447,21 @@ export function loadConfigFromDatabase(): typeof defaultStrategyConfig {
       }
       if (saved.dreamdexPrivateKey !== undefined && saved.dreamdexPrivateKey !== "******" && String(saved.dreamdexPrivateKey).trim() !== "") {
         merged.dreamdexPrivateKey = String(saved.dreamdexPrivateKey).trim();
+      }
+      if (saved.alpacaApiKey !== undefined && saved.alpacaApiKey !== "******" && String(saved.alpacaApiKey).trim() !== "") {
+        merged.alpacaApiKey = String(saved.alpacaApiKey).trim();
+      }
+      if (saved.alpacaApiSecret !== undefined && saved.alpacaApiSecret !== "******" && String(saved.alpacaApiSecret).trim() !== "") {
+        merged.alpacaApiSecret = String(saved.alpacaApiSecret).trim();
+      }
+      if (saved.alpacaBaseUrl !== undefined && String(saved.alpacaBaseUrl).trim() !== "") {
+        merged.alpacaBaseUrl = String(saved.alpacaBaseUrl).trim();
+      }
+      if (saved.alpacaDataUrl !== undefined && String(saved.alpacaDataUrl).trim() !== "") {
+        merged.alpacaDataUrl = String(saved.alpacaDataUrl).trim();
+      }
+      if (saved.alpacaIgnoreMarketHours !== undefined) {
+        merged.alpacaIgnoreMarketHours = Boolean(saved.alpacaIgnoreMarketHours);
       }
       if (saved.binanceBaseUrl !== undefined) merged.binanceBaseUrl = String(saved.binanceBaseUrl);
       if (saved.binanceWsBase !== undefined) merged.binanceWsBase = String(saved.binanceWsBase);

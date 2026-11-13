@@ -2912,14 +2912,18 @@
     // Top Brand Logo Badge (Exchange indicator)
     const elLogoBadge = document.getElementById("logoBadge");
     if (elLogoBadge) {
-      const isDreamdex = (data.exchange || "").toLowerCase() === "dreamdex" || rawSymbol.includes(":") || rawSymbol.includes("USDSO");
+      const exName = (data.exchange || "").toLowerCase();
+      const isDreamdex = exName === "dreamdex" || rawSymbol.includes(":") || rawSymbol.includes("USDSO");
+      const isAlpaca = exName === "alpaca";
       let stratSuffix = "GRID";
       if (data.strategyType === "swing_trade" || (data.strategyName && data.strategyName.includes("Swing"))) {
         stratSuffix = "SWING";
       } else if (isMaRibbonType(data.strategyType, data.strategyMode)) {
         stratSuffix = "MA-RIBBON";
       }
-      elLogoBadge.textContent = isDreamdex ? `DREAMDEX ${stratSuffix}` : `BINANCE ${stratSuffix}`;
+      elLogoBadge.textContent = isAlpaca
+        ? `ALPACA ${stratSuffix}`
+        : (isDreamdex ? `DREAMDEX ${stratSuffix}` : `BINANCE ${stratSuffix}`);
     }
 
     // Dry Run vs Live Trading Mode Badge
@@ -5289,14 +5293,21 @@
   const tabPanes = document.querySelectorAll(".tab-pane");
 
   function updateExchangeFieldsVisibility(exchange) {
-    const isDreamdex = exchange === "dreamdex";
+    const ex = (exchange || "binance").toLowerCase();
+    const isDreamdex = ex === "dreamdex";
+    const isAlpaca = ex === "alpaca";
+    const isBinance = !isDreamdex && !isAlpaca;
     const binanceGroups = document.querySelectorAll(".binance-fields-group");
     const dreamdexGroups = document.querySelectorAll(".dreamdex-fields-group");
+    const alpacaGroups = document.querySelectorAll(".alpaca-fields-group");
     binanceGroups.forEach((el) => {
-      el.style.display = isDreamdex ? "none" : "";
+      el.style.display = isBinance ? "" : "none";
     });
     dreamdexGroups.forEach((el) => {
       el.style.display = isDreamdex ? "" : "none";
+    });
+    alpacaGroups.forEach((el) => {
+      el.style.display = isAlpaca ? "" : "none";
     });
   }
 
@@ -5497,7 +5508,9 @@
       };
 
       const currentExchange = (data.exchange || "binance").toLowerCase();
-      const defaultSym = currentExchange === "dreamdex" ? "SOMI:USDSO" : "BTCFDUSD";
+      const defaultSym = currentExchange === "dreamdex"
+        ? "SOMI:USDSO"
+        : (currentExchange === "alpaca" ? "AAPL" : "BTCFDUSD");
       const resolvedSym = data.symbol || defaultSym;
       activeSymbol = resolvedSym;
       const elBtnOpenBacktestStudio = document.getElementById("btnOpenBacktestStudio");
@@ -5515,6 +5528,11 @@
       setVal("cfg_binanceWsBase", data.binanceWsBase || "wss://stream.binance.com:9443");
       setVal("cfg_dreamdexPrivateKey", data.dreamdexPrivateKey || "");
       setVal("cfg_dreamdexRpcUrl", data.dreamdexRpcUrl || "https://api.infra.mainnet.somnia.network");
+      setVal("cfg_alpacaApiKey", data.alpacaApiKey || "");
+      setVal("cfg_alpacaApiSecret", data.alpacaApiSecret || "");
+      setVal("cfg_alpacaBaseUrl", data.alpacaBaseUrl || "https://paper-api.alpaca.markets");
+      setVal("cfg_alpacaDataUrl", data.alpacaDataUrl || "https://data.alpaca.markets");
+      setCheck("cfg_alpacaIgnoreMarketHours", Boolean(data.alpacaIgnoreMarketHours));
       setVal("cfg_dashboardPort", data.dashboardPort || 3333);
       setCheck("cfg_dryRun", data.dryRun !== false);
       setVal("cfg_maxInventoryUsdso", data.maxInventoryQuote ?? data.maxInventoryUsdso);
@@ -5818,6 +5836,17 @@
         return (val && val !== "******") ? val : undefined;
       })(),
       dreamdexRpcUrl: document.getElementById("cfg_dreamdexRpcUrl") ? document.getElementById("cfg_dreamdexRpcUrl").value.trim() : undefined,
+      alpacaApiKey: (() => {
+        const val = document.getElementById("cfg_alpacaApiKey") ? document.getElementById("cfg_alpacaApiKey").value.trim() : "";
+        return (val && val !== "******") ? val : undefined;
+      })(),
+      alpacaApiSecret: (() => {
+        const val = document.getElementById("cfg_alpacaApiSecret") ? document.getElementById("cfg_alpacaApiSecret").value.trim() : "";
+        return (val && val !== "******") ? val : undefined;
+      })(),
+      alpacaBaseUrl: document.getElementById("cfg_alpacaBaseUrl") ? document.getElementById("cfg_alpacaBaseUrl").value.trim() : undefined,
+      alpacaDataUrl: document.getElementById("cfg_alpacaDataUrl") ? document.getElementById("cfg_alpacaDataUrl").value.trim() : undefined,
+      alpacaIgnoreMarketHours: document.getElementById("cfg_alpacaIgnoreMarketHours") ? document.getElementById("cfg_alpacaIgnoreMarketHours").checked : false,
       dashboardPort: document.getElementById("cfg_dashboardPort") ? parseInt(document.getElementById("cfg_dashboardPort").value, 10) : undefined,
       dryRun: document.getElementById("cfg_dryRun") ? document.getElementById("cfg_dryRun").checked : false,
       maxInventoryQuote: maxInvVal,
@@ -6050,12 +6079,15 @@
   const cachedExchangeSymbols = {
     binance: null,
     dreamdex: null,
+    alpaca: null,
   };
 
   async function renderTopSymbolOptions(exchange, currentSymbol) {
     const elTopSymbolSelect = document.getElementById("topSymbolSelect");
     const elCfgSymbol = document.getElementById("cfg_symbol");
-    const isDreamdex = exchange === "dreamdex";
+    const exLower = (exchange || "binance").toLowerCase();
+    const isDreamdex = exLower === "dreamdex";
+    const isAlpaca = exLower === "alpaca";
     const normCur = (currentSymbol || "").toUpperCase().replace(/[\/\-_:]/g, "");
 
     // 1. Initial Quick Render (Fallback options while loading)
@@ -6066,6 +6098,21 @@
       <option value="WBTC:USDSO">WBTC:USDso</option>
       <option value="WETH:USDSO">WETH:USDso</option>
       <option value="__custom__">➕ Custom Symbol (พิมพ์เอง)...</option>
+    `;
+    const alpacaInitial = `
+      <optgroup label="🇺🇸 Popular US Stocks & ETFs (0% Fee)">
+        <option value="SPY">SPY (S&P 500 ETF)</option>
+        <option value="QQQ">QQQ (Nasdaq 100 ETF)</option>
+        <option value="AAPL">AAPL (Apple)</option>
+        <option value="NVDA">NVDA (Nvidia)</option>
+        <option value="MSFT">MSFT (Microsoft)</option>
+        <option value="AMZN">AMZN (Amazon)</option>
+        <option value="GOOGL">GOOGL (Alphabet)</option>
+        <option value="META">META (Meta)</option>
+        <option value="TSLA">TSLA (Tesla)</option>
+        <option value="AMD">AMD (AMD)</option>
+      </optgroup>
+      <option value="__custom__">➕ Custom Ticker (พิมพ์ชื่อหุ้นเอง)...</option>
     `;
     const binanceInitial = `
       <optgroup label="🆓 FDUSD Pairs (0% Maker Fee)">
@@ -6115,18 +6162,20 @@
       }
     }
 
-    applyHtml(isDreamdex ? dreamdexInitial : binanceInitial);
+    applyHtml(isAlpaca ? alpacaInitial : (isDreamdex ? dreamdexInitial : binanceInitial));
 
     const lblSymbol = document.getElementById("lbl_symbol");
     if (lblSymbol) {
-      lblSymbol.innerHTML = isDreamdex
-        ? `DreamDEX Trading Pair (Symbol) <span class="help-tip" title="Choose or enter DreamDEX pair (e.g. SOMI, SOMI:USDso, WETH:USDso, WBTC:USDso)">ℹ️</span>`
-        : `Binance Trading Pair (Symbol) <span class="help-tip" title="Choose from Binance list or type custom pair (e.g. BTCFDUSD, ETHFDUSD, SOLUSDT)">ℹ️</span>`;
+      lblSymbol.innerHTML = isAlpaca
+        ? `Alpaca US Equity Ticker (Symbol) <span class="help-tip" title="Choose or enter US stock/ETF ticker (e.g. AAPL, NVDA, SPY, QQQ)">ℹ️</span>`
+        : (isDreamdex
+          ? `DreamDEX Trading Pair (Symbol) <span class="help-tip" title="Choose or enter DreamDEX pair (e.g. SOMI, SOMI:USDso, WETH:USDso, WBTC:USDso)">ℹ️</span>`
+          : `Binance Trading Pair (Symbol) <span class="help-tip" title="Choose from Binance list or type custom pair (e.g. BTCFDUSD, ETHFDUSD, SOLUSDT)">ℹ️</span>`);
     }
 
     // 2. Fetch full dynamic symbols list from backend
     try {
-      const cacheKey = isDreamdex ? "dreamdex" : "binance";
+      const cacheKey = isAlpaca ? "alpaca" : (isDreamdex ? "dreamdex" : "binance");
       let symData = cachedExchangeSymbols[cacheKey];
       if (!symData) {
         const resp = await fetch(`${API_BASE}/api/symbols?exchange=${cacheKey}`);
@@ -6138,7 +6187,22 @@
 
       if (symData) {
         let fullHtml = "";
-        if (isDreamdex) {
+        if (isAlpaca) {
+          const popStocks = Array.isArray(symData.popular) ? symData.popular : ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA"];
+          const allStocks = Array.isArray(symData.symbols) ? symData.symbols : popStocks;
+          const otherStocks = allStocks.filter((s) => !popStocks.includes(s));
+          const currentOptionHtml = (normCur && !allStocks.includes(normCur))
+            ? `<option value="${normCur}">📍 ${currentSymbol} (Current)</option>`
+            : "";
+          fullHtml = `
+            ${currentOptionHtml}
+            <optgroup label="⭐ Popular US Stocks & ETFs (0% Fee)">
+              ${popStocks.map((s) => `<option value="${s}">${s}/USD</option>`).join("")}
+            </optgroup>
+            ${otherStocks.length > 0 ? `<optgroup label="🇺🇸 US Equity Universe">${otherStocks.map((s) => `<option value="${s}">${s}/USD</option>`).join("")}</optgroup>` : ""}
+            <option value="__custom__">➕ Custom Ticker (พิมพ์ชื่อหุ้นเอง)...</option>
+          `;
+        } else if (isDreamdex) {
           const syms = Array.isArray(symData.symbols) ? symData.symbols : ["SOMI", "SOMI:USDSO", "USDC.E:USDSO", "WBTC:USDSO", "WETH:USDSO"];
           fullHtml = syms.map((s) => `<option value="${s}">${s}</option>`).join("") + `<option value="__custom__">➕ Custom Symbol (พิมพ์เอง)...</option>`;
         } else {
@@ -6193,15 +6257,21 @@
       const selectedExchange = (e.target.value || "binance").toLowerCase();
       updateExchangeFieldsVisibility(selectedExchange);
       const cfgSymbol = document.getElementById("cfg_symbol");
-      let newDefaultSym = selectedExchange === "dreamdex" ? "SOMI" : "BTCUSDT";
+      let newDefaultSym = selectedExchange === "dreamdex"
+        ? "SOMI"
+        : (selectedExchange === "alpaca" ? "AAPL" : "BTCUSDT");
       if (cfgSymbol) {
         const cur = (cfgSymbol.value || "").toUpperCase();
-        if (selectedExchange === "dreamdex" && (cur.includes("USDT") || cur.includes("FDUSD") || cur === "BTCUSDT")) {
-          cfgSymbol.value = "SOMI";
-        } else if (selectedExchange === "binance" && (cur.includes("USDSO") || cur === "SOMI")) {
-          cfgSymbol.value = "SOMIUSDT";
+        if (selectedExchange === "dreamdex" && (cur.includes("USDT") || cur.includes("FDUSD") || cur === "BTCUSDT" || (!cur.includes("SOMI") && !cur.includes("USDSO")))) {
+          newDefaultSym = "SOMI";
+        } else if (selectedExchange === "binance" && (cur.includes("USDSO") || cur === "SOMI" || !cur.includes("USD"))) {
+          newDefaultSym = cur.includes("SOMI") ? "SOMIUSDT" : "BTCFDUSD";
+        } else if (selectedExchange === "alpaca" && (cur.includes("USDT") || cur.includes("FDUSD") || cur.includes("USDSO") || cur === "SOMI")) {
+          newDefaultSym = "AAPL";
+        } else if (cur) {
+          newDefaultSym = cur;
         }
-        newDefaultSym = cfgSymbol.value;
+        cfgSymbol.value = newDefaultSym;
       }
       renderTopSymbolOptions(selectedExchange, newDefaultSym);
     });

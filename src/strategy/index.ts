@@ -690,6 +690,11 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
       binanceBaseUrl: this.cfg.binanceBaseUrl || "https://api.binance.com",
       binanceWsBase: this.cfg.binanceWsBase || "wss://stream.binance.com:9443",
       dreamdexPrivateKey: this.cfg.dreamdexPrivateKey ? "******" : "",
+      alpacaApiKey: this.cfg.alpacaApiKey ? "******" : "",
+      alpacaApiSecret: this.cfg.alpacaApiSecret ? "******" : "",
+      alpacaBaseUrl: this.cfg.alpacaBaseUrl || "https://paper-api.alpaca.markets",
+      alpacaDataUrl: this.cfg.alpacaDataUrl || "https://data.alpaca.markets",
+      alpacaIgnoreMarketHours: Boolean(this.cfg.alpacaIgnoreMarketHours),
       dreamdexRpcUrl: this.cfg.dreamdexRpcUrl || "https://api.infra.mainnet.somnia.network",
       minGasReserveSomi: this.cfg.minGasReserveSomi ?? 2.0,
       timezone: this.cfg.timezone || "Asia/Bangkok",
@@ -749,6 +754,14 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
 
   public getRealBinanceApiSecret(): string | undefined {
     return this.cfg.binanceApiSecret;
+  }
+
+  public getRealAlpacaApiKey(): string | undefined {
+    return this.cfg.alpacaApiKey;
+  }
+
+  public getRealAlpacaApiSecret(): string | undefined {
+    return this.cfg.alpacaApiSecret;
   }
 
   public getIntervalMs(): number {
@@ -899,7 +912,7 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
     for (const [key, val] of Object.entries(newSettings)) {
       if (val !== undefined) {
         // If updating secret/key and user kept the masked placeholder, do not overwrite
-        if ((key === "binanceApiKey" || key === "binanceApiSecret" || key === "dreamdexPrivateKey") && val === "******") continue;
+        if ((key === "binanceApiKey" || key === "binanceApiSecret" || key === "dreamdexPrivateKey" || key === "alpacaApiKey" || key === "alpacaApiSecret") && val === "******") continue;
         if (key === "enabledBuyLevels" && Array.isArray(val)) {
           this.cfg.enabledBuyLevels = val.map(Boolean);
           while (this.cfg.enabledBuyLevels.length < 5) this.cfg.enabledBuyLevels.push(true);
@@ -1100,6 +1113,19 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
         this.binance.updateCredentials(privKey, "", rpc);
       }
     }
+    if (this.binance.exchangeName === "alpaca") {
+      if (newSettings.alpacaApiKey !== undefined || newSettings.alpacaApiSecret !== undefined || newSettings.alpacaBaseUrl !== undefined || newSettings.alpacaDataUrl !== undefined) {
+        const newKey = (newSettings.alpacaApiKey !== undefined && newSettings.alpacaApiKey !== "******")
+          ? newSettings.alpacaApiKey
+          : this.cfg.alpacaApiKey;
+        const newSecret = (newSettings.alpacaApiSecret !== undefined && newSettings.alpacaApiSecret !== "******")
+          ? newSettings.alpacaApiSecret
+          : this.cfg.alpacaApiSecret;
+        const newBase = newSettings.alpacaBaseUrl !== undefined ? newSettings.alpacaBaseUrl : this.cfg.alpacaBaseUrl;
+        const newData = newSettings.alpacaDataUrl !== undefined ? newSettings.alpacaDataUrl : this.cfg.alpacaDataUrl;
+        this.binance.updateCredentials(newKey || "", newSecret || "", newBase, newData);
+      }
+    }
     if (newSettings.maxCandleCount !== undefined) {
       this.cfg.maxCandleCount = Math.max(50, Math.round(Number(newSettings.maxCandleCount)));
     }
@@ -1164,12 +1190,18 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
     if (this.cfg.dreamdexPrivateKey && this.cfg.dreamdexPrivateKey !== "******") configToPersist.dreamdexPrivateKey = this.cfg.dreamdexPrivateKey;
     if (configToPersist.binanceApiKey === "******") delete configToPersist.binanceApiKey;
     if (configToPersist.binanceApiSecret === "******") delete configToPersist.binanceApiSecret;
+    if (this.cfg.alpacaApiKey && this.cfg.alpacaApiKey !== "******") configToPersist.alpacaApiKey = this.cfg.alpacaApiKey;
+    if (this.cfg.alpacaApiSecret && this.cfg.alpacaApiSecret !== "******") configToPersist.alpacaApiSecret = this.cfg.alpacaApiSecret;
     if (configToPersist.dreamdexPrivateKey === "******") delete configToPersist.dreamdexPrivateKey;
+    if (configToPersist.alpacaApiKey === "******") delete configToPersist.alpacaApiKey;
+    if (configToPersist.alpacaApiSecret === "******") delete configToPersist.alpacaApiSecret;
     this.db.setSettings(configToPersist);
     const sanitizedLog = { ...newSettings };
     if (sanitizedLog.binanceApiKey) sanitizedLog.binanceApiKey = "******";
     if (sanitizedLog.binanceApiSecret) sanitizedLog.binanceApiSecret = "******";
     if (sanitizedLog.dreamdexPrivateKey) sanitizedLog.dreamdexPrivateKey = "******";
+    if (sanitizedLog.alpacaApiKey) sanitizedLog.alpacaApiKey = "******";
+    if (sanitizedLog.alpacaApiSecret) sanitizedLog.alpacaApiSecret = "******";
     this.log(`⚙️ [settings] updated runtime configuration in database: ${JSON.stringify(sanitizedLog)}`);
     return this.getRuntimeConfig();
   }

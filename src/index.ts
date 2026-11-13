@@ -8,8 +8,9 @@ import { createExchangeClient, type IExchangeClient } from "./exchange/index.js"
 import { DynamicGrid, createStrategy, normalizeStrategyType, type IStrategy } from "./strategy.js";
 import { VolatilityEngine } from "./volatility.js";
 import { BinanceAtrFeed, BinanceBookTickerFeed, BinanceUserDataFeed } from "./exchange/binance/feed.js";
+import { AlpacaAtrFeed, AlpacaBookTickerFeed, fetchAlpacaBars, normalizeStockSymbol } from "./exchange/alpaca/feed.js";
 import { sanitizeHttpErrorBody } from "./exchange/binance/client.js";
-import { DowStructureEngine } from "./market-structure.js";
+import { DowStructureEngine, type Candle } from "./market-structure.js";
 import { DashboardServer } from "./server.js";
 import { AutonomousPairRotator } from "./pair-rotator.js";
 import type { AtrSource } from "./types.js";
@@ -59,21 +60,56 @@ function log(msg: string, extra?: unknown): void {
   else console.log(line);
 }
 
+type ManagedCandleFeed = AtrSource & {
+  start(): void | Promise<void>;
+  stop(): void;
+  onCandle(fn: (candle: Candle, isClosed: boolean) => void): void;
+};
+
+type ManagedBookFeed = {
+  start(): void;
+  stop(): void;
+  onBook(fn: (b: any) => void): void;
+};
+
+function buildExchangeAdapter(exchangeName: string, src: Record<string, any>): IExchangeClient {
+  const norm = (exchangeName || "binance").toLowerCase();
+  if (norm === "alpaca") {
+    return createExchangeClient({
+      exchange: "alpaca",
+      apiKey: src.alpacaApiKey,
+      apiSecret: src.alpacaApiSecret,
+      baseUrl: src.alpacaBaseUrl,
+      dataUrl: src.alpacaDataUrl,
+      log: (msg) => log(`[alpaca] ${msg}`),
+    });
+  }
+  return createExchangeClient({
+    exchange: norm,
+    apiKey: src.binanceApiKey,
+    apiSecret: src.binanceApiSecret,
+    baseUrl: src.binanceBaseUrl,
+    privateKey: src.dreamdexPrivateKey,
+    rpcUrl: src.dreamdexRpcUrl,
+    log: (msg) => log(`[${norm}] ${msg}`),
+  });
+}
+
 async function main(): Promise<void> {
   const pairRotator = new AutonomousPairRotator((msg) => log(msg));
-  let exchange = createExchangeClient({
-    exchange: config.exchange || "binance",
-    apiKey: config.binanceApiKey,
-    apiSecret: config.binanceApiSecret,
-    baseUrl: config.binanceBaseUrl,
-    privateKey: config.dreamdexPrivateKey,
-    rpcUrl: config.dreamdexRpcUrl,
-    log: (msg) => log(`[${config.exchange || "binance"}] ${msg}`),
-  });
+  const startupExchange = (config.exchange || "binance").toLowerCase();
+  let exchange = buildExchangeAdapter(startupExchange, config);
 
   await exchange.syncTime();
 
-  let activeSymbol = (config.symbol || "BTCUSDT").toUpperCase().replace(/[\/\-_:]/g, "");
+  let rawStartupSymbol = (config.symbol || (startupExchange === "alpaca" ? "AAPL" : "BTCUSDT")).toUpperCase().replace(/[\/\-_:]/g, "");
+  if (startupExchange === "alpaca") {
+    const cleanStock = normalizeStockSymbol(rawStartupSymbol);
+    rawStartupSymbol = ["BTCUSDT", "BTCFDUSD", "ETHUSDT", "ETHFDUSD", "SOMI", "SOMIUSDSO"].includes(rawStartupSymbol)
+      ? "AAPL"
+      : (cleanStock || "AAPL");
+  }
+  let activeSymbol = rawStartupSymbol;
   let symbolInfo = await exchange.getExchangeInfo(activeSymbol);
 
   log(
@@ -105,14 +141,30 @@ async function main(): Promise<void> {
   );
 
   // Preload macro candles, trading candles, and HTF candles on boot
-  let macroFeed: BinanceAtrFeed | undefined;
-  let tradingFeed: BinanceAtrFeed | undefined;
-  let htfFeed: BinanceAtrFeed | undefined;
+  let macroFeed: ManagedCandleFeed | undefined;
+  let tradingFeed: ManagedCandleFeed | undefined;
+  let htfFeed: ManagedCandleFeed | undefined;
   let atrSource: AtrSource;
 
-  let bookTickerFeed: BinanceBookTickerFeed | undefined;
+  let bookTickerFeed: ManagedBookFeed | undefined;
   let userDataFeed: BinanceUserDataFeed | undefined;
   let dashboard: DashboardServer | null = null;
+  let gridRef: IStrategy | undefined;
+
+  const resolveAlpacaFeedCreds = (overrideCfg?: Record<string, any>) => {
+    const rt = gridRef?.getRuntimeConfig?.() ?? config;
+    const rawKey = overrideCfg?.alpacaApiKey && overrideCfg.alpacaApiKey !== "******"
+      ? overrideCfg.alpacaApiKey
+      : (gridRef?.getRealAlpacaApiKey?.() || config.alpacaApiKey || "");
+    const rawSecret = overrideCfg?.alpacaApiSecret && overrideCfg.alpacaApiSecret !== "******"
+      ? overrideCfg.alpacaApiSecret
+      : (gridRef?.getRealAlpacaApiSecret?.() || config.alpacaApiSecret || "");
+    return {
+      apiKey: String(rawKey || "").trim(),
+      apiSecret: String(rawSecret || "").trim(),
+      dataUrl: String(overrideCfg?.alpacaDataUrl || rt.alpacaDataUrl || config.alpacaDataUrl || "https://data.alpaca.markets"),
+    };
+  };
 
   // Map trading symbol (which may be on DreamDEX like SOMI, SOMI:USDSO, WBTC, WETH)
   // to a liquid Binance Spot Symbol for 100% reliable candlestick data & ATR calculations!
@@ -129,11 +181,80 @@ async function main(): Promise<void> {
     return s;
   };
 
-  const initFeeds = async (sym: string) => {
-    const binanceCandleSymbol = resolveBinanceCandleSymbol(sym);
-    const symLower = binanceCandleSymbol.toLowerCase();
+  const loadEngineCandlesForExchange = async (
+    engine: DowStructureEngine,
+    sym: string,
+    interval: string,
+    limit: number,
+  ): Promise<void> => {
+    if (exchange.exchangeName === "alpaca") {
+      const creds = resolveAlpacaFeedCreds();
+      try {
+        const bars = await fetchAlpacaBars({
+          symbol: sym,
+          interval,
+          limit,
+          apiKey: creds.apiKey,
+          apiSecret: creds.apiSecret,
+          dataUrl: creds.dataUrl,
+        });
+        engine.setCandles(bars, true);
+        log(`🇺🇸 Loaded ${bars.length} Alpaca historical bars (${normalizeStockSymbol(sym)} ${interval})`);
+      } catch (err) {
+        log(`⚠️ Failed to load Alpaca bars (${normalizeStockSymbol(sym)} ${interval}): ${(err as Error).message}`);
+      }
+      return;
+    }
+    await engine.loadHigherTimeframeCandles(
+      resolveBinanceCandleSymbol(sym),
+      interval,
+      config.binanceBaseUrl,
+      log,
+      limit,
+      true,
+    );
+  };
 
-    log(`📈 Initializing Binance market feeds for ${sym} -> using Binance symbol: ${binanceCandleSymbol}`);
+  const createCandleFeedForExchange = (
+    sym: string,
+    interval: string,
+    initialCandleCount: number,
+    tag: string,
+  ): ManagedCandleFeed => {
+    if (exchange.exchangeName === "alpaca") {
+      const creds = resolveAlpacaFeedCreds();
+      return new AlpacaAtrFeed(
+        {
+          symbol: normalizeStockSymbol(sym),
+          interval,
+          apiKey: creds.apiKey,
+          apiSecret: creds.apiSecret,
+          dataUrl: creds.dataUrl,
+          staleMs: 180_000,
+          initialCandleCount,
+        },
+        config.atrLookback,
+        (msg) => log(`[${tag}] ${msg}`),
+      );
+    }
+    return new BinanceAtrFeed(
+      {
+        symbol: resolveBinanceCandleSymbol(sym).toLowerCase(),
+        interval,
+        wsBase: config.binanceWsBase,
+        staleMs: config.binanceStaleMs,
+        initialCandleCount,
+      },
+      config.atrLookback,
+      (msg) => log(`[${tag}] ${msg}`),
+    );
+  };
+
+  const initFeeds = async (sym: string) => {
+    const isAlpaca = exchange.exchangeName === "alpaca";
+    const feedSymLabel = isAlpaca ? normalizeStockSymbol(sym) : resolveBinanceCandleSymbol(sym);
+
+    log(`📈 Initializing ${isAlpaca ? "Alpaca US Equities" : "Binance"} market feeds for ${sym} -> using symbol: ${feedSymLabel}`);
 
     macroDowEngine.clearCandles();
     localTrendEngine.clearCandles();
@@ -150,30 +271,9 @@ async function main(): Promise<void> {
     }
 
     await Promise.all([
-      macroDowEngine.loadHigherTimeframeCandles(
-        binanceCandleSymbol,
-        primaryInterval,
-        config.binanceBaseUrl,
-        log,
-        initialCandleLimit,
-        true,
-      ),
-      localTrendEngine.loadHigherTimeframeCandles(
-        binanceCandleSymbol,
-        config.tradingTimeframe,
-        config.binanceBaseUrl,
-        log,
-        config.initialCandleCount ?? 300,
-        true,
-      ),
-      htfDowEngine.loadHigherTimeframeCandles(
-        binanceCandleSymbol,
-        htfInterval,
-        config.binanceBaseUrl,
-        log,
-        300,
-        true,
-      ),
+      loadEngineCandlesForExchange(macroDowEngine, sym, primaryInterval, initialCandleLimit),
+      loadEngineCandlesForExchange(localTrendEngine, sym, config.tradingTimeframe, config.initialCandleCount ?? 300),
+      loadEngineCandlesForExchange(htfDowEngine, sym, htfInterval, 300),
     ]);
     dashboard?.setInitialHtfCandles(htfDowEngine.getCandles());
 
@@ -182,30 +282,10 @@ async function main(): Promise<void> {
     htfFeed?.stop();
     bookTickerFeed?.stop();
     userDataFeed?.stop();
+    userDataFeed = undefined;
 
-    macroFeed = new BinanceAtrFeed(
-      {
-        symbol: symLower,
-        interval: primaryInterval,
-        wsBase: config.binanceWsBase,
-        staleMs: config.binanceStaleMs,
-        initialCandleCount: config.initialCandleCount ?? 300,
-      },
-      config.atrLookback,
-      (msg) => log(`[macro ${primaryInterval}] ${msg}`),
-    );
-
-    tradingFeed = new BinanceAtrFeed(
-      {
-        symbol: symLower,
-        interval: config.tradingTimeframe,
-        wsBase: config.binanceWsBase,
-        staleMs: config.binanceStaleMs,
-        initialCandleCount: config.initialCandleCount ?? 300,
-      },
-      config.atrLookback,
-      (msg) => log(`[trading ${config.tradingTimeframe}] ${msg}`),
-    );
+    macroFeed = createCandleFeedForExchange(sym, primaryInterval, initialCandleLimit, `macro ${primaryInterval}`);
+    tradingFeed = createCandleFeedForExchange(sym, config.tradingTimeframe, config.initialCandleCount ?? 300, `trading ${config.tradingTimeframe}`);
 
     tradingFeed.onCandle((candle, isClosed) => {
       if (isClosed) {
@@ -213,17 +293,7 @@ async function main(): Promise<void> {
       }
     });
 
-    htfFeed = new BinanceAtrFeed(
-      {
-        symbol: symLower,
-        interval: htfInterval,
-        wsBase: config.binanceWsBase,
-        staleMs: config.binanceStaleMs,
-        initialCandleCount: 150,
-      },
-      config.atrLookback,
-      (msg) => log(`[htf ${htfInterval}] ${msg}`),
-    );
+    htfFeed = createCandleFeedForExchange(sym, htfInterval, 150, `htf ${htfInterval}`);
 
     htfFeed.onCandle((candle, isClosed) => {
       if (isClosed) {
@@ -233,12 +303,25 @@ async function main(): Promise<void> {
       }
     });
 
-    // 0-weight Real-Time Book Ticker WebSocket feed
-    bookTickerFeed = new BinanceBookTickerFeed(
-      symLower,
-      config.binanceWsBase,
-      (msg) => log(`[bookTicker] ${msg}`),
-    );
+    // Real-time Top-of-Book feed (Binance WS or Alpaca Data API snapshot polling)
+    if (isAlpaca) {
+      const creds = resolveAlpacaFeedCreds();
+      bookTickerFeed = new AlpacaBookTickerFeed(
+        {
+          symbol: normalizeStockSymbol(sym),
+          apiKey: creds.apiKey,
+          apiSecret: creds.apiSecret,
+          dataUrl: creds.dataUrl,
+        },
+        (msg) => log(`[alpaca bookTicker] ${msg}`),
+      );
+    } else {
+      bookTickerFeed = new BinanceBookTickerFeed(
+        feedSymLabel.toLowerCase(),
+        config.binanceWsBase,
+        (msg) => log(`[bookTicker] ${msg}`),
+      );
+    }
 
     // Real-Time User Data Stream WebSocket feed (if on Binance with API credentials)
     if (exchange.exchangeName === "binance" && exchange.hasCredentials()) {
@@ -291,6 +374,7 @@ async function main(): Promise<void> {
     localTrendEngine,
     htfDowEngine,
   });
+  gridRef = grid;
   await grid.syncOnChainOrders();
   if (exchange.exchangeName === "binance" && !config.dryRun && exchange.hasCredentials()) {
     try {
@@ -353,6 +437,12 @@ async function main(): Promise<void> {
       const targetExchangeName = (s.exchange || prevConfig.exchange || "binance").toLowerCase();
       const exchangeChanged = Boolean(s.exchange && targetExchangeName !== (prevConfig.exchange || "binance").toLowerCase());
       const privateKeyChanged = s.dreamdexPrivateKey && s.dreamdexPrivateKey !== "******";
+      const alpacaCredsChanged = Boolean(
+        (s.alpacaApiKey && s.alpacaApiKey !== "******") ||
+        (s.alpacaApiSecret && s.alpacaApiSecret !== "******") ||
+        (s.alpacaBaseUrl && s.alpacaBaseUrl !== prevConfig.alpacaBaseUrl) ||
+        (s.alpacaDataUrl && s.alpacaDataUrl !== prevConfig.alpacaDataUrl),
+      );
 
       const normPrevSymbol = (prevSymbol || "").toUpperCase().replace(/[\/\-_:]/g, "");
       let normNextSymbol = (s.symbol || "").toUpperCase().replace(/[\/\-_:]/g, "");
@@ -366,6 +456,17 @@ async function main(): Promise<void> {
           normNextSymbol = normPrevSymbol || "SOMIUSDSO";
           s.symbol = prevSymbol || "SOMI:USDSO";
         }
+      }
+
+      // 🛡️ Alpaca Accidental Crypto Symbol Guard:
+      if (!exchangeChanged && targetExchangeName === "alpaca" && ["BTCUSDT", "BTCFDUSD", "ETHUSDT", "ETHFDUSD", "SOMIUSDSO", "SOMI"].includes(normNextSymbol)) {
+        const keepStock = normalizeStockSymbol(prevSymbol || "AAPL") || "AAPL";
+        log(`🛡️ [SYMBOL GUARD] Ignored accidental crypto symbol '${normNextSymbol}' on Alpaca; keeping active ticker '${keepStock}'`);
+        normNextSymbol = keepStock;
+        s.symbol = keepStock;
+      }
+      if (targetExchangeName === "alpaca" && normNextSymbol) {
+        normNextSymbol = normalizeStockSymbol(normNextSymbol);
       }
 
       const symbolChanged = Boolean(normNextSymbol && normNextSymbol !== normPrevSymbol);
@@ -395,7 +496,11 @@ async function main(): Promise<void> {
       const res = grid.updateRuntimeSettings(s);
 
       // 1. Handle Exchange Adapter switch or credentials update dynamically
-      if (exchangeChanged || (targetExchangeName === "dreamdex" && privateKeyChanged)) {
+      if (
+        exchangeChanged ||
+        (targetExchangeName === "dreamdex" && privateKeyChanged) ||
+        (targetExchangeName === "alpaca" && alpacaCredsChanged)
+      ) {
         grid.setSwitchingSymbol(true);
         try {
           // If switching exchange or symbol, cancel all resting orders on the current exchange/pair first
@@ -415,28 +520,45 @@ async function main(): Promise<void> {
             ? s.binanceApiKey
             : grid.getRealBinanceApiKey();
 
+          const realAlpacaKey = (s.alpacaApiKey !== undefined && s.alpacaApiKey !== "******" && String(s.alpacaApiKey).trim() !== "")
+            ? String(s.alpacaApiKey).trim()
+            : (grid.getRealAlpacaApiKey?.() || config.alpacaApiKey);
+
+          const realAlpacaSecret = (s.alpacaApiSecret !== undefined && s.alpacaApiSecret !== "******" && String(s.alpacaApiSecret).trim() !== "")
+            ? String(s.alpacaApiSecret).trim()
+            : (grid.getRealAlpacaApiSecret?.() || config.alpacaApiSecret);
+
           exchange.destroy?.();
-          const newExchange = createExchangeClient({
-            exchange: targetExchangeName,
-            apiKey: realApiKey,
-            apiSecret: realApiSecret,
-            baseUrl: s.binanceBaseUrl || prevConfig.binanceBaseUrl,
-            privateKey: (realPrivateKey && realPrivateKey !== "******") ? realPrivateKey : undefined,
-            rpcUrl: s.dreamdexRpcUrl || prevConfig.dreamdexRpcUrl,
-            log: (msg) => log(`[${targetExchangeName}] ${msg}`),
+          const newExchange = buildExchangeAdapter(targetExchangeName, {
+            binanceApiKey: realApiKey,
+            binanceApiSecret: realApiSecret,
+            binanceBaseUrl: s.binanceBaseUrl || prevConfig.binanceBaseUrl,
+            dreamdexPrivateKey: (realPrivateKey && realPrivateKey !== "******") ? realPrivateKey : undefined,
+            dreamdexRpcUrl: s.dreamdexRpcUrl || prevConfig.dreamdexRpcUrl,
+            alpacaApiKey: realAlpacaKey,
+            alpacaApiSecret: realAlpacaSecret,
+            alpacaBaseUrl: s.alpacaBaseUrl || prevConfig.alpacaBaseUrl || config.alpacaBaseUrl,
+            alpacaDataUrl: s.alpacaDataUrl || prevConfig.alpacaDataUrl || config.alpacaDataUrl,
           });
           await newExchange.syncTime();
           exchange = newExchange;
 
-          // If switching to dreamdex and symbol is still a Binance symbol like ETHFDUSD, suggest/switch to SOMI
-          let targetSymbol = (s.symbol || prevConfig.symbol || "BTCUSDT").toUpperCase().replace(/[\/\-_:]/g, "");
+          // Map default symbol appropriately when switching exchanges
+          let targetSymbol = (s.symbol || prevConfig.symbol || (targetExchangeName === "alpaca" ? "AAPL" : "BTCUSDT")).toUpperCase().replace(/[\/\-_:]/g, "");
           if (targetExchangeName === "dreamdex" && (targetSymbol.includes("FDUSD") || targetSymbol.includes("USDT") || targetSymbol === "BTCUSDT")) {
             targetSymbol = "SOMI";
+          } else if (targetExchangeName === "alpaca") {
+            const cleanedStock = normalizeStockSymbol(targetSymbol);
+            if (!cleanedStock || cleanedStock.endsWith("USDT") || cleanedStock.endsWith("FDUSD") || cleanedStock.endsWith("USDSO") || cleanedStock === "SOMI") {
+              targetSymbol = "AAPL";
+            } else {
+              targetSymbol = cleanedStock;
+            }
           }
 
           const nextInfo = await exchange.getExchangeInfo(targetSymbol);
-          if (exchange.exchangeName === "binance" && nextInfo.status && nextInfo.status !== "TRADING") {
-            throw new Error(`Symbol ${nextInfo.symbol} is currently suspended/halted by Binance (Status: ${nextInfo.status}). Cannot trade.`);
+          if ((exchange.exchangeName === "binance" || exchange.exchangeName === "alpaca") && nextInfo.status && nextInfo.status !== "TRADING") {
+            throw new Error(`Symbol ${nextInfo.symbol} is currently suspended/halted by ${exchange.exchangeName} (Status: ${nextInfo.status}). Cannot trade.`);
           }
           symbolInfo = nextInfo;
           await initFeeds(nextInfo.symbol);
@@ -473,8 +595,8 @@ async function main(): Promise<void> {
         try {
           // Validate symbol on exchange first before cancelling existing orders
           const nextInfo = await exchange.getExchangeInfo(nextSymbolStr);
-          if (exchange.exchangeName === "binance" && nextInfo.status && nextInfo.status !== "TRADING") {
-            throw new Error(`Symbol ${nextInfo.symbol} is currently suspended/halted by Binance (Status: ${nextInfo.status}). Cannot trade.`);
+          if ((exchange.exchangeName === "binance" || exchange.exchangeName === "alpaca") && nextInfo.status && nextInfo.status !== "TRADING") {
+            throw new Error(`Symbol ${nextInfo.symbol} is currently suspended/halted by ${exchange.exchangeName} (Status: ${nextInfo.status}). Cannot trade.`);
           }
           // Cancel all resting orders on the old pair (and sweep any orphan quote-locking orders) before switching
           await grid.prepareForSymbolSwitch(nextInfo.symbol);
@@ -482,7 +604,9 @@ async function main(): Promise<void> {
           await initFeeds(nextInfo.symbol);
           grid.updateSymbolInfo(nextInfo, atrSource!);
           grid.getDatabase().setSetting("symbol", nextInfo.symbol);
-          grid.getDatabase().setSetting("binanceSymbol", nextInfo.symbol.toLowerCase());
+          if (exchange.exchangeName === "binance") {
+            grid.getDatabase().setSetting("binanceSymbol", nextInfo.symbol.toLowerCase());
+          }
           wireFeedsToGrid();
           // Immediately refresh unlocked wallet balances & open orders before the first tick on the new pair
           await grid.refreshWalletBalances();
@@ -529,6 +653,8 @@ async function main(): Promise<void> {
           if (cleanS.binanceApiKey === "******") delete cleanS.binanceApiKey;
           if (cleanS.binanceApiSecret === "******") delete cleanS.binanceApiSecret;
           if (cleanS.dreamdexPrivateKey === "******") delete cleanS.dreamdexPrivateKey;
+          if (cleanS.alpacaApiKey === "******") delete cleanS.alpacaApiKey;
+          if (cleanS.alpacaApiSecret === "******") delete cleanS.alpacaApiSecret;
           const mergedConfig = {
             ...currentConfig,
             ...cleanS,
@@ -536,6 +662,8 @@ async function main(): Promise<void> {
             binanceApiKey: grid.getRealBinanceApiKey() || config.binanceApiKey,
             binanceApiSecret: grid.getRealBinanceApiSecret() || config.binanceApiSecret,
             dreamdexPrivateKey: grid.getRealDreamdexPrivateKey() || config.dreamdexPrivateKey,
+            alpacaApiKey: grid.getRealAlpacaApiKey?.() || config.alpacaApiKey,
+            alpacaApiSecret: grid.getRealAlpacaApiSecret?.() || config.alpacaApiSecret,
           };
           config.strategyType = targetStrategyType;
           await initFeeds(symbolInfo.symbol);
@@ -552,6 +680,7 @@ async function main(): Promise<void> {
             localTrendEngine,
             htfDowEngine,
           });
+          gridRef = grid;
           grid.updateRuntimeSettings(s);
           grid.getDatabase().setSetting("strategyType", targetStrategyType);
           wireFeedsToGrid();
@@ -631,33 +760,13 @@ async function main(): Promise<void> {
         const tf = s.dowTimeframe ?? res.dowTimeframe ?? config.dowTimeframe;
         const microTf = s.tradingTimeframe ?? res.tradingTimeframe ?? config.tradingTimeframe ?? "5m";
         try {
-          const candleSym = resolveBinanceCandleSymbol(symbolInfo.symbol);
-          const symLower = candleSym.toLowerCase();
-
           if ((s.dowTimeframe && s.dowTimeframe !== prevTf) || (s.initialCandleCount && s.initialCandleCount !== prevInitial)) {
-            await macroDowEngine.loadHigherTimeframeCandles(
-              candleSym,
-              tf,
-              config.binanceBaseUrl,
-              log,
-              fetchLimit,
-              true,
-            );
+            await loadEngineCandlesForExchange(macroDowEngine, symbolInfo.symbol, tf, fetchLimit);
             dashboard.setInitialCandles(macroDowEngine.getCandles());
             log(`🔄 Reloaded ${fetchLimit} candles (${tf}) following settings update`);
 
             macroFeed?.stop();
-            macroFeed = new BinanceAtrFeed(
-              {
-                symbol: symLower,
-                interval: tf,
-                wsBase: config.binanceWsBase,
-                staleMs: config.binanceStaleMs,
-                initialCandleCount: fetchLimit,
-              },
-              config.atrLookback,
-              (msg) => log(`[macro ${tf}] ${msg}`),
-            );
+            macroFeed = createCandleFeedForExchange(symbolInfo.symbol, tf, fetchLimit, `macro ${tf}`);
             macroFeed.onCandle((candle, isClosed) => {
               macroDowEngine.addCandle(candle);
               dashboard.addCandle(candle, isClosed);
@@ -672,28 +781,11 @@ async function main(): Promise<void> {
           }
 
           if ((s.tradingTimeframe && s.tradingTimeframe !== prevTradingTf) || (s.initialCandleCount && s.initialCandleCount !== prevInitial)) {
-            await localTrendEngine.loadHigherTimeframeCandles(
-              candleSym,
-              microTf,
-              config.binanceBaseUrl,
-              log,
-              fetchLimit,
-              true,
-            );
+            await loadEngineCandlesForExchange(localTrendEngine, symbolInfo.symbol, microTf, fetchLimit);
             log(`🔄 Reloaded ${fetchLimit} micro candles (${microTf}) following settings update`);
 
             tradingFeed?.stop();
-            tradingFeed = new BinanceAtrFeed(
-              {
-                symbol: symLower,
-                interval: microTf,
-                wsBase: config.binanceWsBase,
-                staleMs: config.binanceStaleMs,
-                initialCandleCount: fetchLimit,
-              },
-              config.atrLookback,
-              (msg) => log(`[trading ${microTf}] ${msg}`),
-            );
+            tradingFeed = createCandleFeedForExchange(symbolInfo.symbol, microTf, fetchLimit, `trading ${microTf}`);
             tradingFeed.onCandle((candle, isClosed) => {
               if (isClosed) {
                 localTrendEngine.addCandle(candle);
@@ -701,34 +793,17 @@ async function main(): Promise<void> {
             });
             tradingFeed.start();
             grid.atrSource = tradingFeed;
-            log(`🔄 Re-subscribed WebSocket Kline streams to micro timeframe: ${microTf}`);
+            log(`🔄 Re-subscribed market stream to micro timeframe: ${microTf}`);
           }
 
           if (s.htfTimeframe && s.htfTimeframe !== prevHtfTf) {
             const htfTf = s.htfTimeframe ?? config.htfTimeframe;
-            await htfDowEngine.loadHigherTimeframeCandles(
-              candleSym,
-              htfTf,
-              config.binanceBaseUrl,
-              log,
-              300,
-              true,
-            );
+            await loadEngineCandlesForExchange(htfDowEngine, symbolInfo.symbol, htfTf, 300);
             dashboard?.setInitialHtfCandles(htfDowEngine.getCandles());
             log(`🔄 Reloaded HTF candles (${htfTf}) following settings update`);
 
             htfFeed?.stop();
-            htfFeed = new BinanceAtrFeed(
-              {
-                symbol: symLower,
-                interval: htfTf,
-                wsBase: config.binanceWsBase,
-                staleMs: config.binanceStaleMs,
-                initialCandleCount: 300,
-              },
-              config.atrLookback,
-              (msg) => log(`[htf ${htfTf}] ${msg}`),
-            );
+            htfFeed = createCandleFeedForExchange(symbolInfo.symbol, htfTf, 300, `htf ${htfTf}`);
             htfFeed.onCandle((candle, isClosed) => {
               if (isClosed) {
                 htfDowEngine.addCandle(candle);
@@ -737,7 +812,7 @@ async function main(): Promise<void> {
               }
             });
             htfFeed.start();
-            log(`🔄 Re-subscribed WebSocket Kline streams to HTF timeframe: ${htfTf}`);
+            log(`🔄 Re-subscribed market stream to HTF timeframe: ${htfTf}`);
           }
         } catch (err) {
           log(`⚠️ Failed to reload candles on settings update: ${(err as Error).message}`);
@@ -886,10 +961,32 @@ async function main(): Promise<void> {
   });
 
   let lastIdleCheckTime = Date.now();
+  let alpacaMarketClosedLogged = false;
 
   while (!stop) {
+    let tickSleepOverrideMs = 0;
     try {
-      await grid.tick();
+      const loopCfg = grid.getRuntimeConfig();
+      if (exchange.exchangeName === "alpaca" && !loopCfg.dryRun && !loopCfg.alpacaIgnoreMarketHours && exchange.hasCredentials()) {
+        const clock = await exchange.getMarketClock?.();
+        if (clock && !clock.isOpen) {
+          if (!alpacaMarketClosedLogged) {
+            log(`⏸️ [ALPACA MARKET CLOSED] US Equities market is closed (next open: ${clock.nextOpen}). Holding live order execution until market opens.`);
+            alpacaMarketClosedLogged = true;
+          }
+          grid.emitTelemetryTick();
+          tickSleepOverrideMs = 15_000;
+        } else if (clock?.isOpen && alpacaMarketClosedLogged) {
+          log(`🔔 [ALPACA MARKET OPEN] US Equities market is now OPEN — resuming live ticks.`);
+          alpacaMarketClosedLogged = false;
+        }
+      } else {
+        alpacaMarketClosedLogged = false;
+      }
+
+      if (tickSleepOverrideMs === 0) {
+        await grid.tick();
+      }
       // Periodic Idle Cash Check (every 60s) for Auto-Rotation
       if (Date.now() - lastIdleCheckTime >= 60_000) {
         lastIdleCheckTime = Date.now();
@@ -930,7 +1027,7 @@ async function main(): Promise<void> {
     } catch (err) {
       log("tick error", (err as Error).message);
     }
-    const loopInterval = grid.getIntervalMs();
+    const loopInterval = tickSleepOverrideMs > 0 ? tickSleepOverrideMs : grid.getIntervalMs();
     await interruptibleSleep(loopInterval > 0 ? loopInterval : 1000);
   }
 

@@ -13,12 +13,42 @@ import {
   PlaceOrderParams,
   ExchangeTrade,
 } from "../types.js";
+import { normalizeStockSymbol, parseAlpacaSnapshotToBook } from "./feed.js";
 
 export interface AlpacaClientOptions {
   apiKey?: string;
   apiSecret?: string;
   baseUrl?: string;
   dataUrl?: string;
+}
+
+export interface AlpacaMarketClock {
+  timestamp: string;
+  isOpen: boolean;
+  nextOpen: string;
+  nextClose: string;
+}
+
+function mapAlpacaOrderStatus(rawStatus?: string): ExchangeOrderResult["status"] {
+  const s = (rawStatus || "").toLowerCase();
+  if (s === "filled") return "FILLED";
+  if (s === "partially_filled") return "PARTIALLY_FILLED";
+  if (s === "new" || s === "accepted" || s === "pending_new") return "NEW";
+  if (s === "canceled" || s === "pending_cancel") return "CANCELED";
+  if (s === "expired") return "EXPIRED";
+  if (s === "rejected") return "REJECTED";
+  return "NEW";
+}
+
+function formatAlpacaQty(qty: number): string {
+  const rounded = Math.round(qty * 10_000) / 10_000;
+  return String(rounded > 0 ? rounded : qty);
+}
+
+function formatAlpacaPrice(price: number): string {
+  const decimals = price >= 1 ? 2 : 4;
+  const factor = 10 ** decimals;
+  return (Math.round(price * factor) / factor).toFixed(decimals);
 }
 
 export class AlpacaClient implements IExchangeClient {
@@ -32,30 +62,65 @@ export class AlpacaClient implements IExchangeClient {
   private apiSecret: string;
   private baseUrl: string;
   private dataUrl: string;
+  private cachedClock?: { clock: AlpacaMarketClock; fetchedAt: number };
 
   constructor(opts: AlpacaClientOptions = {}) {
-    this.apiKey = opts.apiKey || process.env.ALPACA_API_KEY || "PKYAVG2YEWF3SWIPPJT3C42TVG";
-    this.apiSecret = opts.apiSecret || process.env.ALPACA_API_SECRET || "2boZiaaqiLDfDEM9XSULbXq2iW69B9WcAEPu234MeuN2";
-    this.baseUrl = opts.baseUrl || process.env.ALPACA_BASE_URL || "https://paper-api.alpaca.markets";
-    this.dataUrl = opts.dataUrl || process.env.ALPACA_DATA_URL || "https://data.alpaca.markets";
+    this.apiKey = (opts.apiKey || process.env.ALPACA_API_KEY || "").trim();
+    this.apiSecret = (opts.apiSecret || process.env.ALPACA_API_SECRET || "").trim();
+    this.baseUrl = (opts.baseUrl || process.env.ALPACA_BASE_URL || "https://paper-api.alpaca.markets").replace(/\/+$/, "");
+    this.dataUrl = (opts.dataUrl || process.env.ALPACA_DATA_URL || "https://data.alpaca.markets").replace(/\/+$/, "");
   }
 
   public hasCredentials(): boolean {
     return Boolean(this.apiKey && this.apiSecret);
   }
 
-  public updateCredentials(apiKey: string, apiSecret: string, baseUrl?: string): void {
-    this.apiKey = apiKey;
-    this.apiSecret = apiSecret;
-    if (baseUrl) this.baseUrl = baseUrl;
+  public updateCredentials(apiKey: string, apiSecret: string, baseUrl?: string, dataUrl?: string): void {
+    this.apiKey = apiKey.trim();
+    this.apiSecret = apiSecret.trim();
+    if (baseUrl) this.baseUrl = baseUrl.replace(/\/+$/, "");
+    if (dataUrl) this.dataUrl = dataUrl.replace(/\/+$/, "");
+    this.cachedClock = undefined;
   }
 
-  public getCredentials(): { apiKey: string; apiSecret: string } {
-    return { apiKey: this.apiKey, apiSecret: this.apiSecret };
+  public getCredentials(): { apiKey: string; apiSecret: string; baseUrl: string; dataUrl: string } {
+    return {
+      apiKey: this.apiKey,
+      apiSecret: this.apiSecret,
+      baseUrl: this.baseUrl,
+      dataUrl: this.dataUrl,
+    };
   }
 
   public async syncTime(): Promise<number> {
     return Date.now();
+  }
+
+  public async getMarketClock(forceRefresh = false): Promise<AlpacaMarketClock | undefined> {
+    if (!this.hasCredentials()) return undefined;
+    if (!forceRefresh && this.cachedClock && Date.now() - this.cachedClock.fetchedAt < 15_000) {
+      return this.cachedClock.clock;
+    }
+    try {
+      const res = await fetch(`${this.baseUrl}/v2/clock`, { headers: this.getHeaders() });
+      if (!res.ok) return undefined;
+      const data = (await res.json()) as {
+        timestamp: string;
+        is_open: boolean;
+        next_open: string;
+        next_close: string;
+      };
+      const clock: AlpacaMarketClock = {
+        timestamp: data.timestamp,
+        isOpen: Boolean(data.is_open),
+        nextOpen: data.next_open,
+        nextClose: data.next_close,
+      };
+      this.cachedClock = { clock, fetchedAt: Date.now() };
+      return clock;
+    } catch {
+      return undefined;
+    }
   }
 
   private getHeaders(): Record<string, string> {
@@ -67,24 +132,26 @@ export class AlpacaClient implements IExchangeClient {
   }
 
   public async getExchangeInfo(symbol: string): Promise<ExchangeSymbolInfo> {
-    const cleanSym = symbol.toUpperCase().replace(/USD$/, "");
+    const cleanSym = normalizeStockSymbol(symbol);
     try {
       const res = await fetch(`${this.baseUrl}/v2/assets/${cleanSym}`, {
         headers: this.getHeaders(),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const asset = await res.json();
+      const isTradable = asset.status === "active" && asset.tradable !== false;
+      const fractionable = Boolean(asset.fractionable);
       return {
         symbol: cleanSym,
-        status: asset.status === "active" ? "TRADING" : "HALTED",
+        status: isTradable ? "TRADING" : "HALTED",
         baseAsset: cleanSym,
         quoteAsset: "USD",
         baseAssetPrecision: 4,
         quotePrecision: 2,
-        minQty: asset.fractionable ? 0.0001 : 1,
+        minQty: fractionable ? 0.0001 : 1,
         maxQty: 1000000,
-        stepSize: asset.fractionable ? 0.0001 : 1,
-        qtyPrecision: asset.fractionable ? 4 : 0,
+        stepSize: fractionable ? 0.0001 : 1,
+        qtyPrecision: fractionable ? 4 : 0,
         minPrice: 0.01,
         maxPrice: 1000000,
         tickSize: 0.01,
@@ -113,7 +180,7 @@ export class AlpacaClient implements IExchangeClient {
   }
 
   public async getAccountBalances(symbol: string): Promise<ExchangeAccountBalances> {
-    const cleanSym = symbol.toUpperCase().replace(/USD$/, "");
+    const cleanSym = normalizeStockSymbol(symbol);
 
     // 1. Fetch cash & equity from Account
     const accRes = await fetch(`${this.baseUrl}/v2/account`, { headers: this.getHeaders() });
@@ -133,15 +200,19 @@ export class AlpacaClient implements IExchangeClient {
       if (posRes.ok) {
         const pos = await posRes.json();
         baseQty = parseFloat(pos.qty) || 0;
-        allBalances[cleanSym] = { free: baseQty, locked: 0 };
+        const availQty = pos.qty_available !== undefined ? parseFloat(pos.qty_available) || 0 : baseQty;
+        allBalances[cleanSym] = { free: availQty, locked: Math.max(0, baseQty - availQty) };
       }
     } catch {}
+
+    const baseFree = allBalances[cleanSym]?.free ?? baseQty;
+    const baseLocked = allBalances[cleanSym]?.locked ?? 0;
 
     return {
       baseAsset: cleanSym,
       quoteAsset: "USD",
-      baseFree: baseQty,
-      baseLocked: 0,
+      baseFree,
+      baseLocked,
       baseTotal: baseQty,
       quoteFree: quoteCash,
       quoteLocked: Math.max(0, quoteEquity - quoteCash),
@@ -153,7 +224,7 @@ export class AlpacaClient implements IExchangeClient {
   public async getOpenOrders(symbol?: string): Promise<ExchangeOpenOrder[]> {
     let url = `${this.baseUrl}/v2/orders?status=open&limit=100`;
     if (symbol) {
-      const cleanSym = symbol.toUpperCase().replace(/USD$/, "");
+      const cleanSym = normalizeStockSymbol(symbol);
       url += `&symbols=${cleanSym}`;
     }
 
@@ -169,7 +240,7 @@ export class AlpacaClient implements IExchangeClient {
       origQty: parseFloat(o.qty) || 0,
       executedQty: parseFloat(o.filled_qty) || 0,
       cummulativeQuoteQty: parseFloat(o.filled_avg_price || 0) * parseFloat(o.filled_qty || 0),
-      status: o.status === "new" ? "NEW" : (o.status === "partially_filled" ? "PARTIALLY_FILLED" : o.status.toUpperCase()),
+      status: mapAlpacaOrderStatus(o.status),
       timeInForce: o.time_in_force?.toUpperCase() || "DAY",
       type: o.type?.toUpperCase() || "LIMIT",
       side: o.side?.toUpperCase() === "BUY" ? "BUY" : "SELL",
@@ -183,66 +254,58 @@ export class AlpacaClient implements IExchangeClient {
     const res = await fetch(`${this.baseUrl}/v2/orders/${orderId}`, { headers: this.getHeaders() });
     if (!res.ok) throw new Error(`Failed to fetch order ${orderId}: HTTP ${res.status}`);
     const o = await res.json();
+    const status = mapAlpacaOrderStatus(o.status);
+    const submittedSec = Math.floor(new Date(o.submitted_at).getTime() / 1000);
+    const updatedSec = Math.floor(new Date(o.updated_at || o.submitted_at).getTime() / 1000);
 
     return {
       symbol: o.symbol,
       orderId: o.id,
       clientOrderId: o.client_order_id,
-      transactTime: Math.floor(new Date(o.submitted_at).getTime() / 1000),
-      price: parseFloat(o.limit_price) || 0,
+      price: parseFloat(o.limit_price || o.filled_avg_price) || 0,
       origQty: parseFloat(o.qty) || 0,
       executedQty: parseFloat(o.filled_qty) || 0,
       cummulativeQuoteQty: parseFloat(o.filled_avg_price || 0) * parseFloat(o.filled_qty || 0),
-      status: o.status === "filled" ? "FILLED" : (o.status === "canceled" ? "CANCELED" : o.status.toUpperCase()),
+      status,
       timeInForce: o.time_in_force?.toUpperCase() || "DAY",
       type: o.type?.toUpperCase() || "LIMIT",
       side: o.side?.toUpperCase() === "BUY" ? "BUY" : "SELL",
+      time: submittedSec,
+      updateTime: updatedSec,
+      isWorking: status === "NEW" || status === "PARTIALLY_FILLED",
     };
   }
 
   public async getTopOfBook(symbol: string): Promise<ExchangeTopOfBook | undefined> {
-    const cleanSym = symbol.toUpperCase().replace(/USD$/, "");
+    const cleanSym = normalizeStockSymbol(symbol);
     try {
-      const res = await fetch(`${this.dataUrl}/v2/stocks/${cleanSym}/quotes/latest?feed=iex`, {
+      const res = await fetch(`${this.dataUrl}/v2/stocks/${cleanSym}/snapshot?feed=iex`, {
         headers: this.getHeaders(),
       });
       if (!res.ok) return undefined;
-      const data = await res.json();
-      const q = data.quote;
-      if (!q) return undefined;
-
-      const bestBid = q.bp ?? 0;
-      const bestAsk = q.ap ?? 0;
-      const mid = (bestBid > 0 && bestAsk > 0) ? (bestBid + bestAsk) / 2 : (bestBid || bestAsk);
-
-      return {
-        bestBid,
-        bestAsk,
-        mid,
-        bidQty: q.bs ?? 100,
-        askQty: q.as ?? 100,
-        time: Math.floor(new Date(q.t).getTime() / 1000),
-      };
+      const snap = await res.json();
+      return parseAlpacaSnapshotToBook(snap);
     } catch {
       return undefined;
     }
   }
 
   public async placeOrder(params: PlaceOrderParams): Promise<ExchangeOrderResult> {
-    const cleanSym = params.symbol.toUpperCase().replace(/USD$/, "");
+    const cleanSym = normalizeStockSymbol(params.symbol);
     const side = params.side.toLowerCase();
     const type = params.type.toLowerCase().includes("limit") ? "limit" : "market";
 
+    // Alpaca supports fractional shares for BOTH market & limit only with time_in_force: "day"
     const body: Record<string, any> = {
       symbol: cleanSym,
-      qty: String(params.qty),
+      qty: formatAlpacaQty(params.qty),
       side,
       type,
       time_in_force: "day",
     };
 
     if (type === "limit" && params.price) {
-      body.limit_price = String(params.price);
+      body.limit_price = formatAlpacaPrice(params.price);
     }
     if (params.clientOrderId) {
       body.client_order_id = params.clientOrderId;
@@ -265,11 +328,11 @@ export class AlpacaClient implements IExchangeClient {
       orderId: o.id,
       clientOrderId: o.client_order_id,
       transactTime: Math.floor(new Date(o.submitted_at).getTime() / 1000),
-      price: parseFloat(o.limit_price) || params.price || 0,
+      price: parseFloat(o.limit_price || o.filled_avg_price) || params.price || 0,
       origQty: parseFloat(o.qty) || params.qty,
       executedQty: parseFloat(o.filled_qty) || 0,
       cummulativeQuoteQty: parseFloat(o.filled_avg_price || 0) * parseFloat(o.filled_qty || 0),
-      status: o.status === "filled" ? "FILLED" : (o.status === "new" ? "NEW" : o.status.toUpperCase()),
+      status: mapAlpacaOrderStatus(o.status),
       timeInForce: o.time_in_force?.toUpperCase() || "DAY",
       type: o.type?.toUpperCase() || "LIMIT",
       side: params.side,
@@ -288,6 +351,15 @@ export class AlpacaClient implements IExchangeClient {
   }
 
   public async cancelAllOpenOrders(symbol?: string): Promise<any> {
+    if (symbol) {
+      const open = await this.getOpenOrders(symbol);
+      if (open.length === 0) return { success: true, canceledCount: 0 };
+      const results = await Promise.allSettled(
+        open.map((o) => this.cancelOrder(symbol, o.orderId)),
+      );
+      const canceledCount = results.filter((r) => r.status === "fulfilled").length;
+      return { success: canceledCount === open.length, canceledCount };
+    }
     const res = await fetch(`${this.baseUrl}/v2/orders`, {
       method: "DELETE",
       headers: this.getHeaders(),
@@ -296,13 +368,14 @@ export class AlpacaClient implements IExchangeClient {
   }
 
   public async getMyTrades(symbol?: string, limit = 50): Promise<ExchangeTrade[]> {
-    let url = `${this.baseUrl}/v2/account/activities/FILL?direction=desc&page_size=${limit}`;
+    const cleanFilter = symbol ? normalizeStockSymbol(symbol) : undefined;
+    const url = `${this.baseUrl}/v2/account/activities/FILL?direction=desc&page_size=${limit}`;
     const res = await fetch(url, { headers: this.getHeaders() });
     if (!res.ok) return [];
     const activities = await res.json();
 
     return activities
-      .filter((a: any) => (!symbol || a.symbol === symbol.toUpperCase().replace(/USD$/, "")))
+      .filter((a: any) => !cleanFilter || a.symbol === cleanFilter)
       .map((a: any, idx: number) => ({
         symbol: a.symbol,
         id: a.id || idx,

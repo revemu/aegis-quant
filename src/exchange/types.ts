@@ -141,8 +141,9 @@ export interface IExchangeClient {
   placeOrder(params: PlaceOrderParams): Promise<ExchangeOrderResult>;
   cancelOrder(symbol: string, orderId: string | number): Promise<any>;
   cancelAllOpenOrders(symbol: string): Promise<any>;
-  updateCredentials(apiKey: string, apiSecret: string, baseUrl?: string): void;
+  updateCredentials(apiKey: string, apiSecret: string, baseUrl?: string, dataUrl?: string): void;
   getCredentials?(): { apiKey: string; apiSecret: string };
+  getMarketClock?(forceRefresh?: boolean): Promise<{ timestamp: string; isOpen: boolean; nextOpen: string; nextClose: string } | undefined>;
   getTransactionFee?(txHash: string): Promise<number | undefined>;
   getRecentOrders?(symbol: string, limit?: number): Promise<ExchangeOpenOrder[]>;
   getMyTrades?(symbol: string, limit?: number): Promise<ExchangeTrade[]>;

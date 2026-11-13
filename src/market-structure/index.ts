@@ -436,6 +436,11 @@ export class DowStructureEngine {
     });
   }
 
+  public setCandles(candles: Candle[], clearExisting = true): void {
+    const next = clearExisting ? candles.slice() : [...this.candleManager.getCandles(), ...candles];
+    this.candleManager.setCandles(next, () => this.recalculateSwings());
+  }
+
   public async loadHigherTimeframeCandles(
     symbol: string,
     timeframe: string = "1h",

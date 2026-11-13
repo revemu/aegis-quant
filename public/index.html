@@ -1553,11 +1553,12 @@
               <div class="form-group">
                 <label for="cfg_exchange">
                   เลือกกระดานเทรด (Active Exchange)
-                  <span class="help-tip" title="สลับระหว่าง Binance Spot (CEX) และ DreamDEX on Somnia (DEX)">ℹ️</span>
+                  <span class="help-tip" title="สลับระหว่าง Binance Spot (CEX), DreamDEX on Somnia (DEX) และ Alpaca US Stocks (0% Commission)">ℹ️</span>
                 </label>
                 <select id="cfg_exchange" class="form-select">
                   <option value="binance">🟡 Binance Spot (CEX)</option>
                   <option value="dreamdex">🟣 DreamDEX on Somnia (DEX)</option>
+                  <option value="alpaca">🇺🇸 Alpaca US Stocks (0% Commission)</option>
                 </select>
               </div>
 
@@ -1669,6 +1670,49 @@
                   <input type="number" id="cfg_orderExpireHours" step="1" min="1" max="72" placeholder="24" />
                   <span class="unit">ชม.</span>
                 </div>
+              </div>
+            </div>
+
+            <!-- Alpaca US Equities Credentials Group -->
+            <div class="alpaca-fields-group settings-grid" style="display: none; grid-template-columns: 1fr 1fr; gap: 12px;">
+              <div class="form-group">
+                <label for="cfg_alpacaApiKey">Alpaca API Key ID</label>
+                <div class="input-with-unit">
+                  <input type="text" id="cfg_alpacaApiKey" placeholder="ใส่ Alpaca API Key ID..." autocomplete="off" />
+                  <span class="unit">KEY</span>
+                </div>
+              </div>
+
+              <div class="form-group">
+                <label for="cfg_alpacaApiSecret">Alpaca API Secret Key</label>
+                <div class="input-with-unit">
+                  <input type="password" id="cfg_alpacaApiSecret" placeholder="ใส่ Alpaca API Secret..." autocomplete="off" />
+                  <span class="unit">SECRET</span>
+                </div>
+              </div>
+
+              <div class="form-group">
+                <label for="cfg_alpacaBaseUrl">โหมดบัญชี Alpaca (Environment)</label>
+                <select id="cfg_alpacaBaseUrl" class="form-select">
+                  <option value="https://paper-api.alpaca.markets">🧪 Paper Trading (paper-api.alpaca.markets)</option>
+                  <option value="https://api.alpaca.markets">🟢 Live Trading (api.alpaca.markets)</option>
+                </select>
+              </div>
+
+              <div class="form-group">
+                <label for="cfg_alpacaDataUrl">Alpaca Market Data API URL</label>
+                <input type="text" id="cfg_alpacaDataUrl" placeholder="https://data.alpaca.markets" />
+              </div>
+
+              <div class="form-group switch-group" style="grid-column: 1 / -1;">
+                <div class="switch-label-group">
+                  <span class="switch-title">⏰ ข้ามการตรวจเวลาตลาดสหรัฐฯ (Ignore US Market Hours)</span>
+                  <span class="switch-desc">ปิด (OFF) = พักการส่งคำสั่งเทรดอัตโนมัติเมื่อตลาด NYSE/NASDAQ ปิด | เปิด (ON) = ส่งคำสั่งทดสอบแม้ตลาดปิด</span>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" id="cfg_alpacaIgnoreMarketHours" />
+                  <span class="slider"></span>
+                </label>
               </div>
             </div>
           </div>

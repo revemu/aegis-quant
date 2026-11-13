@@ -1437,6 +1437,8 @@ export class DashboardServer {
       if (masked.binanceApiKey) masked.binanceApiKey = "******";
       if (masked.binanceApiSecret) masked.binanceApiSecret = "******";
       if (masked.dreamdexPrivateKey) masked.dreamdexPrivateKey = "******";
+      if (masked.alpacaApiKey) masked.alpacaApiKey = "******";
+      if (masked.alpacaApiSecret) masked.alpacaApiSecret = "******";
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(masked));
       return;

@@ -221,6 +221,16 @@ export class SwingTraderStrategy implements IStrategy {
     return (s && s !== "******") ? s : process.env.BINANCE_API_SECRET;
   }
 
+  public getRealAlpacaApiKey(): string | undefined {
+    const k = this.cfg.alpacaApiKey;
+    return (k && k !== "******") ? k : process.env.ALPACA_API_KEY;
+  }
+
+  public getRealAlpacaApiSecret(): string | undefined {
+    const s = this.cfg.alpacaApiSecret;
+    return (s && s !== "******") ? s : process.env.ALPACA_API_SECRET;
+  }
+
   public getRuntimeConfig(): any {
     return {
       ...this.cfg,
@@ -230,6 +240,8 @@ export class SwingTraderStrategy implements IStrategy {
       binanceApiKey: this.cfg.binanceApiKey ? "******" : "",
       binanceApiSecret: this.cfg.binanceApiSecret ? "******" : "",
       dreamdexPrivateKey: this.cfg.dreamdexPrivateKey ? "******" : "",
+      alpacaApiKey: this.cfg.alpacaApiKey ? "******" : "",
+      alpacaApiSecret: this.cfg.alpacaApiSecret ? "******" : "",
       swingMinRiskReward: this.cfg.swingMinRiskReward ?? 2.0,
       swingStopLossBufferPct: this.cfg.swingStopLossBufferPct ?? 0.5,
       swingMaxPositionPct: this.cfg.swingMaxPositionPct ?? 60.0,
@@ -249,6 +261,8 @@ export class SwingTraderStrategy implements IStrategy {
     if (cleanSettings.binanceApiKey === "******") delete cleanSettings.binanceApiKey;
     if (cleanSettings.binanceApiSecret === "******") delete cleanSettings.binanceApiSecret;
     if (cleanSettings.dreamdexPrivateKey === "******") delete cleanSettings.dreamdexPrivateKey;
+    if (cleanSettings.alpacaApiKey === "******") delete cleanSettings.alpacaApiKey;
+    if (cleanSettings.alpacaApiSecret === "******") delete cleanSettings.alpacaApiSecret;
     if (!cleanSettings.symbol && this.symbolInfo?.symbol) {
       cleanSettings.symbol = this.symbolInfo.symbol;
     }
@@ -258,6 +272,8 @@ export class SwingTraderStrategy implements IStrategy {
       if (toPersist.binanceApiKey === "******") delete toPersist.binanceApiKey;
       if (toPersist.binanceApiSecret === "******") delete toPersist.binanceApiSecret;
       if (toPersist.dreamdexPrivateKey === "******") delete toPersist.dreamdexPrivateKey;
+      if (toPersist.alpacaApiKey === "******") delete toPersist.alpacaApiKey;
+      if (toPersist.alpacaApiSecret === "******") delete toPersist.alpacaApiSecret;
       this.db.setSettings(toPersist);
     } catch (e: any) {
       this.log(`[SwingTrader] Save settings error: ${e}`);

@@ -390,6 +390,14 @@ export class MaFanTradingStrategy implements IStrategy {
     return this.cfg.binanceApiSecret;
   }
 
+  public getRealAlpacaApiKey(): string | undefined {
+    return this.cfg.alpacaApiKey;
+  }
+
+  public getRealAlpacaApiSecret(): string | undefined {
+    return this.cfg.alpacaApiSecret;
+  }
+
   public getDatabase(): BotDatabase {
     return this.db;
   }
@@ -413,6 +421,30 @@ export class MaFanTradingStrategy implements IStrategy {
       this.maFan.symbol = clean;
     }
     if (s.exchange) this.cfg.exchange = s.exchange;
+    if (s.alpacaApiKey !== undefined && s.alpacaApiKey !== "******" && String(s.alpacaApiKey).trim() !== "") {
+      this.cfg.alpacaApiKey = String(s.alpacaApiKey).trim();
+    }
+    if (s.alpacaApiSecret !== undefined && s.alpacaApiSecret !== "******" && String(s.alpacaApiSecret).trim() !== "") {
+      this.cfg.alpacaApiSecret = String(s.alpacaApiSecret).trim();
+    }
+    if (s.alpacaBaseUrl !== undefined && String(s.alpacaBaseUrl).trim() !== "") {
+      this.cfg.alpacaBaseUrl = String(s.alpacaBaseUrl).trim();
+    }
+    if (s.alpacaDataUrl !== undefined && String(s.alpacaDataUrl).trim() !== "") {
+      this.cfg.alpacaDataUrl = String(s.alpacaDataUrl).trim();
+    }
+    if (s.alpacaIgnoreMarketHours !== undefined) {
+      this.cfg.alpacaIgnoreMarketHours = Boolean(s.alpacaIgnoreMarketHours);
+    }
+    if (s.binanceApiKey !== undefined && s.binanceApiKey !== "******" && String(s.binanceApiKey).trim() !== "") {
+      this.cfg.binanceApiKey = String(s.binanceApiKey).trim();
+    }
+    if (s.binanceApiSecret !== undefined && s.binanceApiSecret !== "******" && String(s.binanceApiSecret).trim() !== "") {
+      this.cfg.binanceApiSecret = String(s.binanceApiSecret).trim();
+    }
+    if (s.dreamdexPrivateKey !== undefined && s.dreamdexPrivateKey !== "******" && String(s.dreamdexPrivateKey).trim() !== "") {
+      this.cfg.dreamdexPrivateKey = String(s.dreamdexPrivateKey).trim();
+    }
     if (s.dryRun !== undefined) {
       this.cfg.dryRun = s.dryRun;
       this.maFan.config.isDryRun = s.dryRun;

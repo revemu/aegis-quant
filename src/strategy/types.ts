@@ -245,6 +245,8 @@ export interface IStrategy {
   getRealDreamdexPrivateKey(): string | undefined;
   getRealBinanceApiKey(): string | undefined;
   getRealBinanceApiSecret(): string | undefined;
+  getRealAlpacaApiKey?(): string | undefined;
+  getRealAlpacaApiSecret?(): string | undefined;
   getDatabase(): BotDatabase;
   getRuntimeConfig(): any;
   updateRuntimeSettings(s: any): any;
