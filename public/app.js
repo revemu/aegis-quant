@@ -1296,9 +1296,310 @@
     return v === "ma_ribbon" || v === "ma_fan";
   }
 
+  function isPortfolioType(st, mode) {
+    const v = st || mode;
+    return v === "ma_fan_portfolio";
+  }
+
+  let latestMarketClock = null;
+  let lastInspectedPortfolioSymbol = "";
+  let portfolioTradeScopeAll = true;
+  let lastActiveExchange = "binance";
+
+  function formatCountdown(targetIso) {
+    if (!targetIso) return "";
+    const diffMs = Math.max(0, new Date(targetIso).getTime() - Date.now());
+    const totalSec = Math.floor(diffMs / 1000);
+    const hrs = Math.floor(totalSec / 3600);
+    const mins = Math.floor((totalSec % 3600) / 60);
+    const secs = totalSec % 60;
+    return `${String(hrs).padStart(2, "0")}:${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+  }
+
+  function updateMarketClockBadge() {
+    const elClock = document.getElementById("marketClockBadge");
+    if (!elClock) return;
+    if (!latestMarketClock) {
+      elClock.style.display = "none";
+      return;
+    }
+    elClock.style.display = "inline-flex";
+    const isOpen = Boolean(latestMarketClock.isOpen);
+    elClock.className = `market-clock-pill ${isOpen ? "market-open" : "market-closed"}`;
+    const timerStr = formatCountdown(isOpen ? latestMarketClock.nextClose : latestMarketClock.nextOpen);
+    elClock.textContent = isOpen
+      ? `🟢 🇺🇸 US OPEN • ปิดใน ${timerStr}`
+      : `🔴 🇺🇸 US CLOSED • เปิดใน ${timerStr}`;
+  }
+
+  setInterval(() => {
+    if (latestMarketClock) updateMarketClockBadge();
+  }, 1000);
+
+  async function inspectPortfolioSymbol(symbol) {
+    if (!symbol) return;
+    lastInspectedPortfolioSymbol = symbol;
+    try {
+      const res = await fetch(`${API_BASE}/api/portfolio/inspect`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol }),
+      });
+      const payload = await res.json();
+      if (payload && payload.success) {
+        if (Array.isArray(payload.candles) && payload.candles.length > 0) {
+          updateCandles(payload.candles);
+          if (currentActiveTimeframe === "15m") {
+            updateMaFanRibbonLines(payload.candles);
+          }
+        }
+        if (Array.isArray(payload.htfCandles) && payload.htfCandles.length > 0) {
+          updateHtfCandles(payload.htfCandles);
+        }
+        await refreshFrontPageState();
+        if (!portfolioTradeScopeAll) loadTradeManagerData();
+      }
+    } catch (err) {
+      console.warn("inspectPortfolioSymbol error:", err);
+    }
+  }
+
+  async function closePortfolioSlotAction(slotIndex, symbol) {
+    if (!confirm(`ยืนยันการขายปิด Slot ${slotIndex + 1} (${symbol}) ที่ราคาตลาดทันทีหรือไม่?`)) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/portfolio/close-slot`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slotIndex }),
+      });
+      const out = await res.json();
+      if (out.success) {
+        showToast({ title: `CLOSED SLOT ${slotIndex + 1} (${symbol})`, desc: "ส่งคำสั่งขายปิด Slot เรียบร้อยแล้ว", action: "TAKE_PROFIT" });
+        await refreshFrontPageState();
+        loadTradeManagerData();
+      } else {
+        showToast({ title: "CLOSE SLOT FAILED", desc: out.error || "ไม่สามารถปิด Slot ได้", action: "CUT" });
+      }
+    } catch (err) {
+      showToast({ title: "CLOSE SLOT ERROR", desc: err.message, action: "CUT" });
+    }
+  }
+
+  function updatePortfolioUI(data) {
+    const pf = data.portfolio;
+    const elBar = document.getElementById("portfolioSlotsBar");
+    const elPanel = document.getElementById("portfolioSidebarPanel");
+    if (!pf) {
+      if (elBar) elBar.style.display = "none";
+      if (elPanel) elPanel.style.display = "none";
+      return;
+    }
+
+    const maxSlots = pf.maxSlots || 3;
+    const activeSlots = Array.isArray(pf.slots) ? pf.slots : [];
+    const radar = Array.isArray(pf.radar) ? pf.radar : [];
+    const macro = pf.macro || {};
+    const inspected = pf.inspectedSymbol || data.symbol || "";
+
+    if (inspected && lastInspectedPortfolioSymbol && inspected !== lastInspectedPortfolioSymbol) {
+      lastInspectedPortfolioSymbol = inspected;
+    }
+
+    if (elBar) {
+      elBar.style.display = "grid";
+      const cardsHtml = [];
+      for (let i = 0; i < maxSlots; i++) {
+        const slot = activeSlots.find((s) => s.slotIndex === i);
+        if (slot) {
+          const isInspected = slot.symbol === inspected;
+          const pnl = Number(slot.unrealizedPnl || 0);
+          const pnlPct = Number(slot.unrealizedPct || 0);
+          const pnlColor = pnl >= 0 ? "#4ade80" : "#f87171";
+          const sign = pnl >= 0 ? "+" : "-";
+          const sl = Number(slot.stopLossPrice || 0);
+          const tp1 = Number(slot.tp1TargetPrice || slot.emas?.ema200 || 0);
+          const cur = Number(slot.currentPrice || slot.entryPrice || 0);
+          let progPct = 50;
+          if (tp1 > sl && sl > 0) {
+            progPct = Math.max(4, Math.min(100, ((cur - sl) / (tp1 - sl)) * 100));
+          }
+          const stageTag = slot.tp1Done
+            ? "✅ TP1 Hit • Runner"
+            : slot.beLocked
+              ? "🛡️ BE Locked"
+              : "⏳ Hunting EMA200";
+          cardsHtml.push(`
+            <div class="pf-slot-card ${isInspected ? "pf-slot-active" : ""}" data-pf-sym="${slot.symbol}">
+              <div class="pf-slot-top">
+                <div class="pf-slot-title-row">
+                  <span class="pf-slot-badge">SLOT ${i + 1}</span>
+                  <span class="pf-slot-symbol">${slot.symbol}</span>
+                </div>
+                <span class="pf-slot-pnl" style="color:${pnlColor};">${sign}$${Math.abs(pnl).toFixed(2)} (${pnl >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%)</span>
+              </div>
+              <div class="pf-slot-metrics">
+                <div>ทุนเฉลี่ย<span class="pf-slot-metric-val">$${fmtPrice(slot.entryPrice)}</span></div>
+                <div>ราคาล่าสุด<span class="pf-slot-metric-val">$${fmtPrice(cur)}</span></div>
+                <div>จำนวน / งบ<span class="pf-slot-metric-val">${Number(slot.qty || 0).toFixed(3)} ($${Number(slot.marketValue || 0).toFixed(0)})</span></div>
+              </div>
+              <div class="pf-slot-progress-wrap">
+                <div class="pf-slot-progress-bar">
+                  <div class="pf-slot-progress-fill" style="width:${progPct.toFixed(0)}%;"></div>
+                </div>
+              </div>
+              <div class="pf-slot-footer">
+                <span class="pf-slot-status-tag">${stageTag} • TP1 $${fmtPrice(tp1)}</span>
+                <button type="button" class="pf-btn-close-slot" data-close-slot="${i}" data-close-sym="${slot.symbol}">🛑 ปิด Slot</button>
+              </div>
+            </div>
+          `);
+        } else {
+          const nextCand = radar.find((r) => !activeSlots.some((s) => s.symbol === r.symbol));
+          const emptyHint = macro.isSitOut
+            ? `🛡️ Macro Sit-Out (${macro.benchmarkSymbol || "SPY"})`
+            : nextCand
+              ? `ถัดไป: ${nextCand.symbol} (${nextCand.stage === "PULLBACK_READY" ? "⚡ READY" : `Score ${Number(nextCand.score || 0).toFixed(1)}`})`
+              : `กำลังสแกน ${macro.universeCount || 49} ตัว...`;
+          cardsHtml.push(`
+            <div class="pf-slot-card pf-slot-empty">
+              <div class="pf-slot-top">
+                <div class="pf-slot-title-row">
+                  <span class="pf-slot-badge" style="background:rgba(148,163,184,0.12); color:#94a3b8; border-color:rgba(148,163,184,0.25);">SLOT ${i + 1}</span>
+                  <span class="pf-slot-symbol" style="color:#64748b; font-size:14px;">ว่าง (Standby Cash)</span>
+                </div>
+                <span style="font-size:11px; color:#64748b;">งบ ~${Math.round(100 / maxSlots)}%</span>
+              </div>
+              <div style="font-size:11px; color:#94a3b8; margin-top:4px;">${emptyHint}</div>
+              <div style="font-size:10px; color:#64748b;">รอ EMA4 Pullback + 1H RSI ≥ 40 + Vol ≥ 1.3x</div>
+            </div>
+          `);
+        }
+      }
+      elBar.innerHTML = cardsHtml.join("");
+      elBar.querySelectorAll(".pf-slot-card[data-pf-sym]").forEach((card) => {
+        card.addEventListener("click", (e) => {
+          if (e.target.closest(".pf-btn-close-slot")) return;
+          const sym = card.getAttribute("data-pf-sym");
+          if (sym) inspectPortfolioSymbol(sym);
+        });
+      });
+      elBar.querySelectorAll(".pf-btn-close-slot").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const idx = Number(btn.getAttribute("data-close-slot"));
+          const sym = btn.getAttribute("data-close-sym") || "";
+          if (Number.isFinite(idx)) closePortfolioSlotAction(idx, sym);
+        });
+      });
+    }
+
+    if (elPanel) {
+      elPanel.style.display = "flex";
+      const elMacroBanner = document.getElementById("pfMacroBanner");
+      const elMacroTitle = document.getElementById("pfMacroTitle");
+      const elMacroSub = document.getElementById("pfMacroSub");
+      if (elMacroBanner) {
+        elMacroBanner.className = `pf-macro-banner ${macro.isSitOut ? "is-sitout" : ""}`;
+      }
+      if (elMacroTitle) {
+        elMacroTitle.textContent = macro.isSitOut
+          ? `🛡️ Macro Sit-Out: หยุดซื้อใหม่ชั่วคราว (${macro.benchmarkSymbol || "SPY"})`
+          : `🟢 Macro Filter: ${macro.benchmarkSymbol || "SPY"} ผ่านเกณฑ์เปิดรับสัญญาณ`;
+      }
+      if (elMacroSub) {
+        elMacroSub.textContent = macro.reason || `Universe ${macro.universeCount || 0} ตัว`;
+      }
+
+      const inspectedRadar = radar.find((r) => r.symbol === inspected) || radar[0];
+      const inspectedSlot = activeSlots.find((s) => s.symbol === inspected);
+      const elChkTitle = document.getElementById("pfChecklistTitle");
+      const elChkStage = document.getElementById("pfChecklistStage");
+      const elChkGrid = document.getElementById("pfChecklistGrid");
+
+      if (elChkTitle) elChkTitle.textContent = `🔎 สัญญาณ: ${inspected || "--"}`;
+      if (elChkStage) {
+        elChkStage.textContent = inspectedSlot
+          ? `HOLDING SLOT ${inspectedSlot.slotIndex + 1}`
+          : (inspectedRadar?.stage || "SCANNING");
+      }
+
+      if (elChkGrid) {
+        if (inspectedRadar) {
+          const checks = [
+            { label: "Bottom Fan", ok: inspectedRadar.hadBottomFan },
+            { label: "EMA4 Hook", ok: inspectedRadar.waitingPullback || inspectedRadar.stage === "PULLBACK_READY" },
+            { label: "1H RSI ≥ 40", ok: (inspectedRadar.htfRsi || 0) >= 40, val: Number(inspectedRadar.htfRsi || 0).toFixed(0) },
+            { label: "Vol ≥ 1.3x", ok: (inspectedRadar.volRatio12 || 0) >= 1.3, val: `${Number(inspectedRadar.volRatio12 || 0).toFixed(2)}x` },
+            { label: "RS 24h ≥ -1%", ok: (inspectedRadar.relStrength24h || 0) >= -1.0, val: `${Number(inspectedRadar.relStrength24h || 0).toFixed(1)}%` },
+            { label: "Score", ok: (inspectedRadar.score || 0) > 0, val: Number(inspectedRadar.score || 0).toFixed(1) },
+          ];
+          elChkGrid.innerHTML = checks.map((c) => `
+            <div class="pf-chk-item ${c.ok ? "is-pass" : "is-fail"}">
+              <span>${c.ok ? "✅" : "⏳"} ${c.label}</span>
+              <strong>${c.val !== undefined ? c.val : (c.ok ? "PASS" : "WAIT")}</strong>
+            </div>
+          `).join("");
+        } else {
+          elChkGrid.innerHTML = '<div class="pf-chk-empty">คลิกดู Slot หรือรายชื่อในเรดาร์</div>';
+        }
+      }
+
+      const elRadarCount = document.getElementById("pfRadarCount");
+      const elRadarList = document.getElementById("pfRadarList");
+      if (elRadarCount) elRadarCount.textContent = `${radar.length} / ${macro.universeCount || radar.length} ตัว`;
+      if (elRadarList) {
+        if (radar.length === 0) {
+          elRadarList.innerHTML = '<div class="pf-chk-empty">กำลังซิงค์แท่งเทียน 15m/1h ของ Universe...</div>';
+        } else {
+          elRadarList.innerHTML = radar.map((item) => {
+            const isHeld = activeSlots.some((s) => s.symbol === item.symbol);
+            const stageCls = isHeld
+              ? "pf-stage-held"
+              : item.stage === "PULLBACK_READY"
+                ? "pf-stage-ready"
+                : item.stage === "WAITING_PULLBACK"
+                  ? "pf-stage-wait"
+                  : "pf-stage-watch";
+            const stageLbl = isHeld
+              ? "HELD"
+              : item.stage === "PULLBACK_READY"
+                ? "READY"
+                : item.stage === "WAITING_PULLBACK"
+                  ? "PULLBACK"
+                  : "WATCH";
+            const dist200 = Number(item.distToEma200Pct || 0);
+            return `
+              <div class="pf-radar-row ${item.symbol === inspected ? "is-inspected" : ""}" data-radar-sym="${item.symbol}" title="คลิกเพื่อดูกราฟและ EMA 6 เส้นของ ${item.symbol}">
+                <div class="pf-radar-left">
+                  <span class="pf-radar-sym">${item.symbol}</span>
+                  <span class="pf-radar-stage ${stageCls}">${stageLbl}</span>
+                </div>
+                <div class="pf-radar-right">
+                  <div style="color:#e2e8f0; font-weight:700;">$${fmtPrice(item.livePrice)}</div>
+                  <div style="color:#94a3b8; font-size:10px;">Sc ${Number(item.score || 0).toFixed(1)} • E200 ${dist200 >= 0 ? "+" : ""}${dist200.toFixed(1)}%</div>
+                </div>
+              </div>
+            `;
+          }).join("");
+
+          elRadarList.querySelectorAll(".pf-radar-row[data-radar-sym]").forEach((row) => {
+            row.addEventListener("click", () => {
+              const sym = row.getAttribute("data-radar-sym");
+              if (sym) inspectPortfolioSymbol(sym);
+            });
+          });
+        }
+      }
+    }
+  }
+
   function updateMaFanRibbonLines(candles) {
     if (!ema4Series || !ema8Series || !ema16Series || !ema25Series || !ema75Series || !ema200Series) return;
-    const isMaFanMode = isMaRibbonType(latestGridData?.strategyType, latestGridData?.strategyMode) || isMaRibbonType(document.getElementById("cfg_strategyType")?.value);
+    const isMaFanMode =
+      isMaRibbonType(latestGridData?.strategyType, latestGridData?.strategyMode) ||
+      isPortfolioType(latestGridData?.strategyType, latestGridData?.strategyMode) ||
+      isMaRibbonType(document.getElementById("cfg_strategyType")?.value) ||
+      isPortfolioType(document.getElementById("cfg_strategyType")?.value);
 
     const elLegendMaRow = document.getElementById("legendMaRow");
     const elLegendDowRow = document.getElementById("legendDowRow");
@@ -2236,6 +2537,20 @@
     const elVerticalLadder = document.getElementById("verticalLadderMeter");
     const elSwingPlanCard = document.getElementById("swingTradePlanCard");
     const elMaFanPlanCard = document.getElementById("maFanPlanCard");
+    const elPortfolioPanel = document.getElementById("portfolioSidebarPanel");
+    const elPortfolioBar = document.getElementById("portfolioSlotsBar");
+
+    if (isPortfolioType(data.strategyType, data.strategyMode)) {
+      if (elGridTitle) elGridTitle.textContent = "💼 พอร์ต MA-Fan (3 Slots & Scanner)";
+      if (elVerticalLadder) elVerticalLadder.style.display = "none";
+      if (elSwingPlanCard) elSwingPlanCard.style.display = "none";
+      if (elMaFanPlanCard) elMaFanPlanCard.style.display = "none";
+      updatePortfolioUI(data);
+      return;
+    } else {
+      if (elPortfolioPanel) elPortfolioPanel.style.display = "none";
+      if (elPortfolioBar) elPortfolioBar.style.display = "none";
+    }
 
     if (data.strategyType === "swing_trade") {
       if (elGridTitle) elGridTitle.textContent = "🏹 แผนและการวิ่งของราคา (Swing Targets)";
@@ -2897,28 +3212,62 @@
     const rawSymbol = data.symbol || (data.binanceSymbol ? `${data.binanceSymbol.toUpperCase()}` : "SOMI:USDso");
     const displaySymbol = rawSymbol.replace(":", " / ").toUpperCase();
     const isMaFan = isMaRibbonType(data.strategyType, data.strategyMode);
+    const isPortfolio = isPortfolioType(data.strategyType, data.strategyMode);
     const execTf = (data.executionTimeframe || "5m").toUpperCase();
     const supTf = (data.supervisorTimeframe || data.htfRegime?.timeframe || "15m").toUpperCase();
     const macroTf = (data.dowTimeframe || "15m").toUpperCase();
     const tradeTf = (data.tradingTimeframe || "15m").toUpperCase();
-    const activeChartTf = isMaFan ? execTf : macroTf;
+    const activeChartTf = (isMaFan || isPortfolio) ? execTf : macroTf;
 
     if (elNavSymbolBadge) elNavSymbolBadge.textContent = displaySymbol;
-    if (elChartSymbolBadge) elChartSymbolBadge.textContent = displaySymbol;
+    if (elChartSymbolBadge) elChartSymbolBadge.textContent = isPortfolio ? `🔎 ${displaySymbol}` : displaySymbol;
     if (elLegendSymbol) elLegendSymbol.textContent = displaySymbol;
     if (elLegendTf) elLegendTf.textContent = activeChartTf;
     if (elLegendLivePrice && data.mid !== undefined) elLegendLivePrice.textContent = `$${fmtPrice(data.mid)}`;
 
+    // Live Exchange Sync Button Labels & Portfolio Scope Toggle
+    const exNameGlobal = (data.exchange || "binance").toLowerCase();
+    lastActiveExchange = exNameGlobal;
+    const elBtnLtSyncText = document.getElementById("btnLtSyncText");
+    const elBtnLtSyncBtn = document.getElementById("btnLtSyncBinance");
+    const elBtnLtScope = document.getElementById("btnLtScopeToggle");
+    if (elBtnLtSyncBtn) {
+      elBtnLtSyncBtn.style.display = exNameGlobal === "dreamdex" ? "none" : "";
+    }
+    if (elBtnLtSyncText) {
+      elBtnLtSyncText.textContent = exNameGlobal === "alpaca" ? "🔄 Reconcile จาก Alpaca" : "🔄 Reconcile จาก Binance";
+    }
+    if (elTmBtnSyncExchange && !elTmBtnSyncExchange.disabled) {
+      elTmBtnSyncExchange.innerHTML = exNameGlobal === "alpaca"
+        ? "<span>🔄 Reconcile จาก Alpaca</span>"
+        : "<span>🔄 Reconcile จาก Binance</span>";
+    }
+    if (elBtnLtScope) {
+      elBtnLtScope.style.display = isPortfolio ? "" : "none";
+      elBtnLtScope.textContent = portfolioTradeScopeAll ? "📦 ทุก Slot (ALL)" : `🔎 เฉพาะ ${displaySymbol}`;
+    }
+
+    // US Market Clock Pill
+    if (data.marketClock !== undefined) {
+      latestMarketClock = data.marketClock || null;
+      updateMarketClockBadge();
+    } else if (exNameGlobal !== "alpaca") {
+      latestMarketClock = null;
+      updateMarketClockBadge();
+    }
+
     // Top Brand Logo Badge (Exchange indicator)
     const elLogoBadge = document.getElementById("logoBadge");
     if (elLogoBadge) {
-      const exName = (data.exchange || "").toLowerCase();
+      const exName = exNameGlobal;
       const isDreamdex = exName === "dreamdex" || rawSymbol.includes(":") || rawSymbol.includes("USDSO");
       const isAlpaca = exName === "alpaca";
       let stratSuffix = "GRID";
-      if (data.strategyType === "swing_trade" || (data.strategyName && data.strategyName.includes("Swing"))) {
+      if (isPortfolio) {
+        stratSuffix = "PORTFOLIO";
+      } else if (data.strategyType === "swing_trade" || (data.strategyName && data.strategyName.includes("Swing"))) {
         stratSuffix = "SWING";
-      } else if (isMaRibbonType(data.strategyType, data.strategyMode)) {
+      } else if (isMaFan) {
         stratSuffix = "MA-RIBBON";
       }
       elLogoBadge.textContent = isAlpaca
@@ -2926,14 +3275,21 @@
         : (isDreamdex ? `DREAMDEX ${stratSuffix}` : `BINANCE ${stratSuffix}`);
     }
 
-    // Dry Run vs Live Trading Mode Badge
+    // Dry Run vs Alpaca Paper vs Live Trading Mode Badge
     if (data.dryRun !== undefined && elDryRunBadge) {
+      const isAlpacaPaper = exNameGlobal === "alpaca" && String(data.alpacaBaseUrl || "").toLowerCase().includes("paper");
       if (data.dryRun) {
         elDryRunBadge.textContent = "🟡 โหมดจำลอง (DRY RUN)";
         elDryRunBadge.className = "dry-badge";
         elDryRunBadge.style.background = "rgba(245, 158, 11, 0.16)";
         elDryRunBadge.style.color = "#fbbf24";
         elDryRunBadge.style.borderColor = "rgba(245, 158, 11, 0.4)";
+      } else if (isAlpacaPaper) {
+        elDryRunBadge.textContent = "🔵 ALPACA PAPER";
+        elDryRunBadge.className = "dry-badge";
+        elDryRunBadge.style.background = "rgba(56, 189, 248, 0.16)";
+        elDryRunBadge.style.color = "#38bdf8";
+        elDryRunBadge.style.borderColor = "rgba(56, 189, 248, 0.45)";
       } else {
         elDryRunBadge.textContent = "🟢 โหมดเทรดจริง (LIVE)";
         elDryRunBadge.className = "dry-badge live-badge";
@@ -2953,19 +3309,19 @@
     }
 
     // Timeframe Badge & Subtitle
-    if (isMaRibbonType(data.strategyType, data.strategyMode)) {
-      const execTf = (data.executionTimeframe || "5m").toUpperCase();
-      const supTf = (data.supervisorTimeframe || data.htfRegime?.timeframe || "15m").toUpperCase();
+    if (isPortfolio || isMaFan) {
+      const execTfLabel = (data.executionTimeframe || (isPortfolio ? "15m" : "5m")).toUpperCase();
+      const supTfLabel = (data.supervisorTimeframe || data.htfRegime?.timeframe || (isPortfolio ? "1h" : "15m")).toUpperCase();
       if (elTimeframeBadge) {
-        elTimeframeBadge.textContent = `EXEC: ${execTf} • HTF SUPERVISOR: ${supTf}`;
+        elTimeframeBadge.textContent = `EXEC: ${execTfLabel} • HTF FILTER: ${supTfLabel}`;
       }
       if (elChartTimeframeSub) {
-        elChartTimeframeSub.textContent = `(${execTf} Execution Candles)`;
+        elChartTimeframeSub.textContent = `(${execTfLabel} Execution Candles)`;
       }
       const btnTf15m = document.getElementById("btnTf15m");
       const btnTf4h = document.getElementById("btnTf4h");
-      if (btnTf15m && btnTf15m.textContent !== execTf) btnTf15m.textContent = execTf;
-      if (btnTf4h && btnTf4h.textContent !== `${supTf} (HTF)`) btnTf4h.textContent = `${supTf} (HTF)`;
+      if (btnTf15m && btnTf15m.textContent !== execTfLabel) btnTf15m.textContent = execTfLabel;
+      if (btnTf4h && btnTf4h.textContent !== `${supTfLabel} (HTF)`) btnTf4h.textContent = `${supTfLabel} (HTF)`;
     } else if (data.dowTimeframe && data.tradingTimeframe) {
       const macroTf = data.dowTimeframe.toUpperCase();
       const tradeTf = data.tradingTimeframe.toUpperCase();
@@ -3052,7 +3408,18 @@
     const btnToggleHtfLines = document.getElementById("btnToggleHtfLines");
     const btnToggleWave = document.getElementById("btnToggleWave");
 
-    if (isMaFan) {
+    if (isPortfolio && data.portfolio) {
+      if (elChannelStatusPill) elChannelStatusPill.style.display = "none";
+      if (elMafanStatusPill) {
+        elMafanStatusPill.style.display = "inline-flex";
+        if (elMafanStatusText) {
+          const pf = data.portfolio;
+          elMafanStatusText.textContent = `🚀 ${pf.usedSlots || 0}/${pf.maxSlots || 3} Slots • Universe: ${pf.macro?.universeCount || 0} • ${pf.macro?.isSitOut ? "🛡️ Sit-Out" : "🟢 Macro OK"}`;
+        }
+      }
+      if (btnToggleHtfLines) btnToggleHtfLines.style.display = "none";
+      if (btnToggleWave) btnToggleWave.style.display = "none";
+    } else if (isMaFan) {
       if (elChannelStatusPill) elChannelStatusPill.style.display = "none";
       if (elMafanStatusPill) {
         elMafanStatusPill.style.display = "inline-flex";
@@ -3438,8 +3805,10 @@
       elLiveBotStatusText.style.color = isPaused ? "#f59e0b" : "#38bdf8";
     }
     if (elLiveBotStatusSub) {
-      const mode = isMaRibbonType(data.strategyType, data.strategyMode) ? "MA-RIBBON" : "DYNAMIC GRID";
-      elLiveBotStatusSub.textContent = `${mode} • ${data.executionTimeframe || "5m"}`;
+      const mode = isPortfolio
+        ? "MA-FAN PORTFOLIO"
+        : (isMaFan ? "MA-RIBBON" : (data.strategyType === "swing_trade" ? "SWING TRADE" : "DYNAMIC GRID"));
+      elLiveBotStatusSub.textContent = `${mode} • ${data.executionTimeframe || data.dowTimeframe || "15m"}`;
     }
 
     if (elPosCurrentHold) {
@@ -3573,7 +3942,7 @@
 
     // ── Update Price Lines on Chart ──────────────────────────────────────────
     if (candleSeries) {
-      const isSwingMode = data.strategyType === "swing_trade";
+      const isSwingMode = data.strategyType === "swing_trade" || isMaFan || isPortfolio;
 
       // 1. 100% Upper Bound (Full Exit) - Solid Fuchsia / Magenta (Grid Mode Only)
       if (!isSwingMode && data.upperBound && data.bottomBound) {
@@ -3877,6 +4246,65 @@
             lineStyle: LightweightCharts.LineStyle.Solid,
             axisLabelVisible: true,
             title: pos.isBreakevenLocked ? "🛡️ Breakeven" : "🔴 Stop Loss",
+          });
+        } else if (lineMfSl) {
+          try { candleSeries.removePriceLine(lineMfSl); } catch (_) {}
+          lineMfSl = null;
+        }
+      } else if (isPortfolio && data.portfolio) {
+        // Clear grid & swing lines
+        while (gridZoneLevelLines.length > 0) {
+          const l = gridZoneLevelLines.pop();
+          if (l) try { candleSeries.removePriceLine(l); } catch (_) {}
+        }
+        if (lineSwingEntry) { try { candleSeries.removePriceLine(lineSwingEntry); } catch (_) {} lineSwingEntry = null; }
+        if (lineSwingTp1) { try { candleSeries.removePriceLine(lineSwingTp1); } catch (_) {} lineSwingTp1 = null; }
+        if (lineSwingTp2) { try { candleSeries.removePriceLine(lineSwingTp2); } catch (_) {} lineSwingTp2 = null; }
+        if (lineSwingSl) { try { candleSeries.removePriceLine(lineSwingSl); } catch (_) {} lineSwingSl = null; }
+        if (lineSwingNextEntry) { try { candleSeries.removePriceLine(lineSwingNextEntry); } catch (_) {} lineSwingNextEntry = null; }
+        if (lineMfTp2) { try { candleSeries.removePriceLine(lineMfTp2); } catch (_) {} lineMfTp2 = null; }
+
+        const pf = data.portfolio;
+        const inspectedSym = pf.inspectedSymbol || data.symbol;
+        const slot = (pf.slots || []).find((s) => s.symbol === inspectedSym);
+        const tp1Target = slot?.tp1TargetPrice || pf.inspectedEmas?.ema200 || 0;
+
+        if (slot && slot.entryPrice > 0) {
+          lineMfEntry = setPriceLine(lineMfEntry, {
+            price: slot.entryPrice,
+            color: "#10b981",
+            lineWidth: 2,
+            lineStyle: LightweightCharts.LineStyle.Solid,
+            axisLabelVisible: true,
+            title: `🟢 Entry (${slot.symbol})`,
+          });
+        } else if (lineMfEntry) {
+          try { candleSeries.removePriceLine(lineMfEntry); } catch (_) {}
+          lineMfEntry = null;
+        }
+
+        if (tp1Target > 0) {
+          lineMfTp1 = setPriceLine(lineMfTp1, {
+            price: tp1Target,
+            color: "#06b6d4",
+            lineWidth: 1.5,
+            lineStyle: LightweightCharts.LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: "🎯 TP1 (EMA200)",
+          });
+        } else if (lineMfTp1) {
+          try { candleSeries.removePriceLine(lineMfTp1); } catch (_) {}
+          lineMfTp1 = null;
+        }
+
+        if (slot && slot.stopLossPrice > 0) {
+          lineMfSl = setPriceLine(lineMfSl, {
+            price: slot.stopLossPrice,
+            color: slot.beLocked ? "#3b82f6" : "#ef4444",
+            lineWidth: 2,
+            lineStyle: LightweightCharts.LineStyle.Solid,
+            axisLabelVisible: true,
+            title: slot.beLocked ? "🛡️ BE Lock" : "🔴 Disaster SL",
           });
         } else if (lineMfSl) {
           try { candleSeries.removePriceLine(lineMfSl); } catch (_) {}
@@ -5374,11 +5802,32 @@
     const btnApi = document.getElementById("tabBtnApi");
     const btnSwing = document.getElementById("tabBtnSwing");
     const btnMaFan = document.getElementById("tabBtnMaFan");
+    const btnPortfolio = document.getElementById("tabBtnPortfolio");
 
     const gridBtns = [btnExec, btnStruct, btnRisk];
     let primaryTabId = "tab-execution";
 
-    if (isMaRibbonType(stratType)) {
+    if (isPortfolioType(stratType)) {
+      primaryTabId = "tab-portfolio";
+
+      if (btnPortfolio) {
+        btnPortfolio.style.display = "inline-flex";
+        btnPortfolio.style.order = "-1";
+        btnPortfolio.textContent = "🚀 MA-Fan Portfolio (3 Slots) ⭐ (ใช้งานอยู่)";
+        btnPortfolio.style.borderColor = "#38bdf8";
+        btnPortfolio.style.color = "#7dd3fc";
+      }
+
+      gridBtns.forEach((b) => { if (b) b.style.display = "none"; });
+      if (btnSwing) btnSwing.style.display = "none";
+      if (btnMaFan) btnMaFan.style.display = "none";
+
+      if (btnApi) {
+        btnApi.style.display = "inline-flex";
+        btnApi.style.order = "1";
+        btnApi.textContent = "🔌 กระดานเทรด & ระบบ";
+      }
+    } else if (isMaRibbonType(stratType)) {
       primaryTabId = "tab-ma-fan";
 
       // 1. Move MA-Ribbon tab to front and highlight
@@ -5393,6 +5842,7 @@
       // 2. Hide other strategy tabs
       gridBtns.forEach((b) => { if (b) b.style.display = "none"; });
       if (btnSwing) btnSwing.style.display = "none";
+      if (btnPortfolio) btnPortfolio.style.display = "none";
 
       // 3. Keep API tab visible
       if (btnApi) {
@@ -5416,6 +5866,7 @@
       // 2. Hide other strategy tabs
       gridBtns.forEach((b) => { if (b) b.style.display = "none"; });
       if (btnMaFan) btnMaFan.style.display = "none";
+      if (btnPortfolio) btnPortfolio.style.display = "none";
 
       // 3. Keep API tab visible
       if (btnApi) {
@@ -5441,6 +5892,7 @@
       // 2. Hide other strategy tabs
       if (btnSwing) btnSwing.style.display = "none";
       if (btnMaFan) btnMaFan.style.display = "none";
+      if (btnPortfolio) btnPortfolio.style.display = "none";
     }
 
     const btnRotation = document.getElementById("tabBtnRotation");
@@ -5519,7 +5971,12 @@
       }
       setVal("cfg_symbol", resolvedSym);
       setVal("cfg_exchange", data.exchange || "binance");
-      setVal("cfg_strategyType", isMaRibbonType(data.strategyType) ? "ma_ribbon" : (data.strategyType || "dynamic_grid"));
+      setVal(
+        "cfg_strategyType",
+        isPortfolioType(data.strategyType)
+          ? "ma_fan_portfolio"
+          : (isMaRibbonType(data.strategyType) ? "ma_ribbon" : (data.strategyType || "dynamic_grid")),
+      );
       renderTopSymbolOptions(currentExchange, data.symbol || defaultSym);
       updateExchangeFieldsVisibility(currentExchange);
       setVal("cfg_binanceApiKey", data.binanceApiKey || "");
@@ -5674,6 +6131,26 @@
       setCheck("cfg_maFanUpsideFloor", data.maFanUpsideFloor !== false);
       setCheck("cfg_maFanCircuitBreaker", data.maFanCircuitBreaker !== false);
       setVal("cfg_maFanBreakevenFeeBufferPct", data.maFanBreakevenFeeBufferPct ?? 0.05);
+
+      // MA-Fan Multi-Slot Portfolio settings
+      setVal("cfg_portfolioMaxSlots", data.portfolioMaxSlots ?? 3);
+      setVal("cfg_portfolioUniversePreset", data.portfolioUniversePreset || "us_top49");
+      setVal("cfg_portfolioMaxBudgetUsd", data.portfolioMaxBudgetUsd ?? 0);
+      setVal("cfg_portfolioRankBy", data.portfolioRankBy || "COMPOSITE_QUALITY");
+      setVal(
+        "cfg_portfolioCustomWhitelist",
+        Array.isArray(data.portfolioCustomWhitelist) ? data.portfolioCustomWhitelist.join(", ") : "",
+      );
+      setVal(
+        "cfg_portfolioBlacklist",
+        Array.isArray(data.portfolioBlacklist) ? data.portfolioBlacklist.join(", ") : "",
+      );
+      setVal("cfg_portfolioTp1TargetMode", data.portfolioTp1TargetMode || "EMA200");
+      setVal("cfg_portfolioDisasterSlPct", data.portfolioDisasterSlPct ?? 3.5);
+      setVal("cfg_portfolioSitOutMode", data.portfolioSitOutMode || "dual");
+      setVal("cfg_portfolioMaxHoldHours", data.portfolioMaxHoldHours ?? 0);
+      setCheck("cfg_portfolioPartialTpAtEma200", data.portfolioPartialTpAtEma200 !== false);
+      setCheck("cfg_portfolioLockBreakevenAtEma200", data.portfolioLockBreakevenAtEma200 !== false);
 
       const maColors = getMaFanColors();
       setVal("cfg_maColor4", maColors.c4);
@@ -5975,6 +6452,30 @@
       maFanUpsideFloor: Boolean(document.getElementById("cfg_maFanUpsideFloor")?.checked),
       maFanCircuitBreaker: Boolean(document.getElementById("cfg_maFanCircuitBreaker")?.checked),
       maFanBreakevenFeeBufferPct: parseFloat(document.getElementById("cfg_maFanBreakevenFeeBufferPct")?.value) || 0.05,
+
+      // MA-Fan Multi-Slot Portfolio Strategy
+      portfolioMaxSlots: parseInt(document.getElementById("cfg_portfolioMaxSlots")?.value || "3", 10) || 3,
+      portfolioUniversePreset: document.getElementById("cfg_portfolioUniversePreset")?.value || "us_top49",
+      portfolioMaxBudgetUsd: parseFloat(document.getElementById("cfg_portfolioMaxBudgetUsd")?.value || "0") || 0,
+      portfolioRankBy: document.getElementById("cfg_portfolioRankBy")?.value || "COMPOSITE_QUALITY",
+      portfolioCustomWhitelist: (document.getElementById("cfg_portfolioCustomWhitelist")?.value || "")
+        .split(/[,\s]+/)
+        .map((s) => s.trim().toUpperCase())
+        .filter(Boolean),
+      portfolioBlacklist: (document.getElementById("cfg_portfolioBlacklist")?.value || "")
+        .split(/[,\s]+/)
+        .map((s) => s.trim().toUpperCase())
+        .filter(Boolean),
+      portfolioTp1TargetMode: document.getElementById("cfg_portfolioTp1TargetMode")?.value || "EMA200",
+      portfolioDisasterSlPct: parseFloat(document.getElementById("cfg_portfolioDisasterSlPct")?.value || "3.5") || 3.5,
+      portfolioSitOutMode: document.getElementById("cfg_portfolioSitOutMode")?.value || "dual",
+      portfolioMaxHoldHours: parseFloat(document.getElementById("cfg_portfolioMaxHoldHours")?.value || "0") || 0,
+      portfolioPartialTpAtEma200: document.getElementById("cfg_portfolioPartialTpAtEma200")
+        ? Boolean(document.getElementById("cfg_portfolioPartialTpAtEma200").checked)
+        : true,
+      portfolioLockBreakevenAtEma200: document.getElementById("cfg_portfolioLockBreakevenAtEma200")
+        ? Boolean(document.getElementById("cfg_portfolioLockBreakevenAtEma200").checked)
+        : true,
     };
 
     const newMaColors = {
@@ -6767,7 +7268,9 @@
       if (elTmTradesTbody) {
         elTmTradesTbody.innerHTML = '<tr><td colspan="8" class="tm-empty-row">🔄 กำลังโหลดข้อมูลล่าสุดจากฐานข้อมูล...</td></tr>';
       }
-      const symParam = activeSymbol ? encodeURIComponent(activeSymbol) : "";
+      const isPfActive = isPortfolioType(latestGridData?.strategyType, latestGridData?.strategyMode);
+      const effectiveSym = isPfActive && portfolioTradeScopeAll ? "ALL" : activeSymbol;
+      const symParam = effectiveSym ? encodeURIComponent(effectiveSym) : "";
       const res = await fetch(`${API_BASE}/api/db/trade-manager${symParam ? `?symbol=${symParam}` : ""}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
@@ -7021,7 +7524,9 @@
       if (elTmRoundsTbody && (!tmRounds || tmRounds.length === 0)) {
         elTmRoundsTbody.innerHTML = '<tr><td colspan="9" class="tm-empty-row">🔄 กำลังคำนวณและโหลดสรุปรอบการซื้อขาย...</td></tr>';
       }
-      const symParam = activeSymbol ? encodeURIComponent(activeSymbol) : "";
+      const isPfActive = isPortfolioType(latestGridData?.strategyType, latestGridData?.strategyMode);
+      const effectiveSym = isPfActive && portfolioTradeScopeAll ? "ALL" : activeSymbol;
+      const symParam = effectiveSym ? encodeURIComponent(effectiveSym) : "";
       const res = await fetch(`${API_BASE}/api/db/rounds${symParam ? `?symbol=${symParam}` : ""}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
@@ -7770,21 +8275,22 @@
   if (elTmBtnSyncExchange) {
     elTmBtnSyncExchange.addEventListener("click", async () => {
       const origText = elTmBtnSyncExchange.innerHTML;
+      const exLabel = lastActiveExchange === "alpaca" ? "Alpaca" : "Binance";
       try {
         elTmBtnSyncExchange.disabled = true;
-        elTmBtnSyncExchange.innerHTML = "<span>🔄 กำลังดึงประวัติจาก Binance...</span>";
+        elTmBtnSyncExchange.innerHTML = `<span>🔄 กำลังดึงประวัติจาก ${exLabel}...</span>`;
         const res = await fetch(`${API_BASE}/api/db/trades/sync-exchange`, { method: "POST" });
         const data = await res.json();
         if (data.success) {
           await refreshFrontPageState();
           loadTradeManagerData();
           showToast({
-            title: "RECONCILED WITH BINANCE",
+            title: `RECONCILED WITH ${exLabel.toUpperCase()}`,
             desc: `กระทบยอดสำเร็จ! ซิงค์ ${data.synced || 0} รายการ (ลบรายการ Manual เก่า ${data.purged || 0} รายการ)`,
             action: "TAKE_PROFIT",
           });
         } else {
-          showToast({ title: "SYNC FAILED", desc: data.error || "ไม่สามารถดึงข้อมูลจาก Binance ได้", action: "CUT" });
+          showToast({ title: "SYNC FAILED", desc: data.error || `ไม่สามารถดึงข้อมูลจาก ${exLabel} ได้`, action: "CUT" });
         }
       } catch (err) {
         showToast({ title: "SYNC ERROR", desc: err.message, action: "CUT" });
@@ -7907,6 +8413,18 @@
 
   const elBtnLtSyncBinance = document.getElementById("btnLtSyncBinance");
   const elBtnLtAddTrade = document.getElementById("btnLtAddTrade");
+  const elBtnLtScopeToggle = document.getElementById("btnLtScopeToggle");
+
+  if (elBtnLtScopeToggle) {
+    elBtnLtScopeToggle.addEventListener("click", () => {
+      portfolioTradeScopeAll = !portfolioTradeScopeAll;
+      elBtnLtScopeToggle.classList.toggle("active", portfolioTradeScopeAll);
+      elBtnLtScopeToggle.textContent = portfolioTradeScopeAll
+        ? "📦 ทุก Slot (ALL)"
+        : `🔎 เฉพาะ ${activeSymbol || "--"}`;
+      loadTradeManagerData();
+    });
+  }
 
   function switchLtTab(target) {
     const tabs = [
@@ -7978,7 +8496,8 @@
         } else if (o.action === "CUT" || o.action === "CUT_LOSS" || o.type === "STOP_LOSS") {
           actBadge = `<span class="badge-exit badge-act-sl">🔴 Stop Loss</span>`;
         } else if (o.reason?.includes("Binance Account Trade") || (o.reason?.includes("Binance") && (!o.action || o.action === "BUY_FILL" || o.action === "SELL_FILL"))) {
-          actBadge = `<span class="badge-exit" style="background:rgba(245,158,11,0.2); color:#fbbf24; border:1px solid rgba(245,158,11,0.4);">⚡ Binance Trade</span>`;
+          const exBadgeLbl = lastActiveExchange === "alpaca" ? "⚡ Alpaca Trade" : "⚡ Exchange Trade";
+          actBadge = `<span class="badge-exit" style="background:rgba(245,158,11,0.2); color:#fbbf24; border:1px solid rgba(245,158,11,0.4);">${exBadgeLbl}</span>`;
         }
 
         const timeVal = o.fillTime || o.time || o.placedTime || o.timestamp || Date.now();
@@ -7986,6 +8505,9 @@
         const timeStr = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")} ${d.getDate()}/${d.getMonth() + 1}`;
 
         const baseSym = o.baseAsset || (o.symbol ? o.symbol.split(/[:\-_]/)[0] : activeBaseAsset) || "BASE";
+        const symPill = o.symbol
+          ? `<span style="font-size:10px; font-weight:700; padding:1px 5px; border-radius:4px; background:rgba(56,189,248,0.14); color:#7dd3fc; margin-right:4px;">${o.symbol}</span>`
+          : "";
         const priceNum = Number(o.fillPrice || o.price || 0);
         const qtyNum = Number(o.executedQty || o.qty || o.quantity || 0);
         const notionalNum = Number(o.notionalQuote || o.notionalUsdso || priceNum * qtyNum);
@@ -8003,7 +8525,7 @@
           <tr data-time="${timeVal}" class="live-trade-row" title="คลิกเพื่อเลื่อนกราฟไปยังจุดซื้อขายนี้">
             <td style="color:#94a3b8;">${tmTrades.length - idx}</td>
             <td style="color:#cbd5e1;">${timeStr}</td>
-            <td>${sideBadge}</td>
+            <td>${symPill}${sideBadge}</td>
             <td style="font-weight:700;">$${fmtPrice(priceNum)}</td>
             <td>${qtyNum.toLocaleString(undefined, { maximumFractionDigits: 4 })} <span style="font-size:10px; color:#64748b;">${baseSym}</span></td>
             <td>$${notionalNum.toFixed(2)}</td>
@@ -8053,10 +8575,13 @@
         const pnl = Number(r.grossPnlQuote || r.grossPnlUsdso || 0);
         const pnlPct = Number(r.grossPnlPct || 0);
         const pColor = pnl >= 0 ? "#4ade80" : "#f87171";
+        const rSymBadge = r.symbol
+          ? `<span style="font-size:10px; font-weight:700; padding:1px 5px; border-radius:4px; background:rgba(56,189,248,0.14); color:#7dd3fc; margin-left:4px;">${r.symbol}</span>`
+          : "";
 
         return `
           <tr data-time="${r.startTime}" class="live-round-row" title="คลิกเพื่อเลื่อนกราฟไปยังรอบเทรดนี้">
-            <td style="font-weight:700;">#${r.roundNumber}</td>
+            <td style="font-weight:700;">#${r.roundNumber}${rSymBadge}</td>
             <td>${statusBadge}</td>
             <td>${startStr}</td>
             <td>${endStr}</td>

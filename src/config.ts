@@ -404,6 +404,36 @@ export const defaultStrategyConfig = {
   ] as string[],
   /** When true, pauses altcoin rotation and holds 100% Cash when BTC is in macro breakdown (> 1.2% below 24h SMA or dumping > 2% in 4h). Default true. */
   rotationEnableBtcMacroGate: true,
+
+  // ── MA-Fan Multi-Slot Portfolio Strategy ("ma_fan_portfolio") ──────────
+  /** Maximum concurrent held portfolio slots (default 3 from walk-forward backtest). */
+  portfolioMaxSlots: 3,
+  /** Universe preset for portfolio scanning: "us_top49" (full 49 blue-chips/ETFs), "us_top25" (core 25), or "custom". */
+  portfolioUniversePreset: "us_top49" as "us_top49" | "us_top25" | "custom",
+  /** Maximum number of liquid pairs fetched into the live portfolio scanner. */
+  portfolioMaxUniversePairs: 49,
+  /** Optional custom ticker whitelist (used when preset === "custom", or overrides auto-universe if non-empty). */
+  portfolioCustomWhitelist: [] as string[],
+  /** Tickers excluded from portfolio entry scanning. */
+  portfolioBlacklist: [] as string[],
+  /** Portfolio TP1 target mode: "EMA200" (backtest winner), "EMA75", "EMA25", or "none". */
+  portfolioTp1TargetMode: "EMA200" as "EMA25" | "EMA75" | "EMA200" | "none",
+  /** Partial 50% take-profit when reaching TP1 target in profit (>= +0.8%). */
+  portfolioPartialTpAtEma200: true,
+  /** Lock stop-loss at breakeven (+0.25%) once TP1 target is reached. */
+  portfolioLockBreakevenAtEma200: true,
+  /** Hard calibrated disaster stop-loss percentage below entry (default 3.5%). */
+  portfolioDisasterSlPct: 3.5,
+  /** Macro sit-out benchmark guard: "dual" (recommended), "btc1d", "btc4h", or "off". */
+  portfolioSitOutMode: "dual" as "off" | "btc1d" | "btc4h" | "dual",
+  /** Candidate ranking priority when multiple setups trigger on the same 15m bar. */
+  portfolioRankBy: "COMPOSITE_QUALITY" as "COMPOSITE_QUALITY" | "RSI15",
+  /** Optional max hold hours per slot (0 = disabled). */
+  portfolioMaxHoldHours: 0,
+  /** Max total capital allocated across all portfolio slots in USD/Quote (0 = use full free wallet cash). */
+  portfolioMaxBudgetUsd: 0,
+  /** Active symbol currently inspected on the main chart in portfolio mode. */
+  portfolioInspectedSymbol: "",
 };
 
 /**
@@ -585,6 +615,36 @@ export function loadConfigFromDatabase(): typeof defaultStrategyConfig {
       if (saved.rotationEnableBtcMacroGate !== undefined) {
         merged.rotationEnableBtcMacroGate = Boolean(saved.rotationEnableBtcMacroGate);
       }
+      if (saved.portfolioMaxSlots !== undefined) {
+        merged.portfolioMaxSlots = Math.max(1, Math.min(5, Number(saved.portfolioMaxSlots) || 3));
+      }
+      if (["us_top49", "us_top25", "custom"].includes(saved.portfolioUniversePreset)) {
+        merged.portfolioUniversePreset = saved.portfolioUniversePreset;
+      }
+      if (saved.portfolioMaxUniversePairs !== undefined) {
+        merged.portfolioMaxUniversePairs = Math.max(5, Math.min(60, Number(saved.portfolioMaxUniversePairs) || 49));
+      }
+      if (Array.isArray(saved.portfolioCustomWhitelist)) {
+        merged.portfolioCustomWhitelist = saved.portfolioCustomWhitelist.map((s: any) => String(s).toUpperCase().trim()).filter(Boolean);
+      }
+      if (Array.isArray(saved.portfolioBlacklist)) {
+        merged.portfolioBlacklist = saved.portfolioBlacklist.map((s: any) => String(s).toUpperCase().trim()).filter(Boolean);
+      }
+      if (["EMA25", "EMA75", "EMA200", "none"].includes(saved.portfolioTp1TargetMode)) {
+        merged.portfolioTp1TargetMode = saved.portfolioTp1TargetMode;
+      }
+      if (saved.portfolioPartialTpAtEma200 !== undefined) merged.portfolioPartialTpAtEma200 = Boolean(saved.portfolioPartialTpAtEma200);
+      if (saved.portfolioLockBreakevenAtEma200 !== undefined) merged.portfolioLockBreakevenAtEma200 = Boolean(saved.portfolioLockBreakevenAtEma200);
+      if (saved.portfolioDisasterSlPct !== undefined) merged.portfolioDisasterSlPct = Math.max(0, Number(saved.portfolioDisasterSlPct));
+      if (["off", "btc1d", "btc4h", "dual"].includes(saved.portfolioSitOutMode)) {
+        merged.portfolioSitOutMode = saved.portfolioSitOutMode;
+      }
+      if (saved.portfolioRankBy === "RSI15" || saved.portfolioRankBy === "COMPOSITE_QUALITY") {
+        merged.portfolioRankBy = saved.portfolioRankBy;
+      }
+      if (saved.portfolioMaxHoldHours !== undefined) merged.portfolioMaxHoldHours = Math.max(0, Number(saved.portfolioMaxHoldHours) || 0);
+      if (saved.portfolioMaxBudgetUsd !== undefined) merged.portfolioMaxBudgetUsd = Math.max(0, Number(saved.portfolioMaxBudgetUsd) || 0);
+      if (typeof saved.portfolioInspectedSymbol === "string") merged.portfolioInspectedSymbol = saved.portfolioInspectedSymbol.toUpperCase().trim();
       return merged;
     }
   } catch {

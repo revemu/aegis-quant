@@ -200,13 +200,21 @@ export interface IStrategyHost {
   getTotalPortfolioValueQuote(refP: number): number;
 }
 
-export type StrategyType = "dynamic_grid" | "swing_trade" | "ma_ribbon";
+export type StrategyType = "dynamic_grid" | "swing_trade" | "ma_ribbon" | "ma_fan_portfolio";
 
 /** Normalize persisted or legacy strategy type aliases ("ma_fan" -> "ma_ribbon"). */
 export function normalizeStrategyType(raw?: unknown): StrategyType {
   if (raw === "swing_trade") return "swing_trade";
+  if (raw === "ma_fan_portfolio" || raw === "portfolio_ma_fan") return "ma_fan_portfolio";
   if (raw === "ma_ribbon" || raw === "ma_fan") return "ma_ribbon";
   return "dynamic_grid";
+}
+
+export interface MarketClockInfo {
+  isOpen: boolean;
+  nextOpen?: string;
+  nextClose?: string;
+  timestamp?: string;
 }
 
 export interface StrategyContext {
@@ -252,7 +260,7 @@ export interface IStrategy {
   updateRuntimeSettings(s: any): any;
   setPaused(paused: boolean): boolean;
   getIsPaused(): boolean;
-  setMarketClosed?(closed: boolean): void;
+  setMarketClosed?(closed: boolean, marketClock?: MarketClockInfo): void;
   cancelAllOrdersUser(): Promise<{ cancelledCount: number; }>;
   sellAllUser(): Promise<{ success: boolean; soldQty: number; price: number; error?: string; }>;
   resetBotState(opts?: any): Promise<{ success: boolean; }>;
@@ -260,6 +268,13 @@ export interface IStrategy {
   reloadState(): void;
   getRecentOrders(): any[];
   saveState(immediate?: boolean): void;
+
+  // Optional Multi-Slot Portfolio Helpers
+  inspectSymbol?(symbol: string): Promise<any>;
+  closeSlot?(slotIndex: number): Promise<any>;
+  getChartCandles?(): Candle[];
+  getHtfChartCandles?(): Candle[];
+  getPortfolioRadarSnapshot?(): any;
 
   // Portfolio & Balances
   lastFlatCashTime?: number;

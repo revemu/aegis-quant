@@ -38,6 +38,7 @@ function formatTimestamp(d = new Date()): string {
 }
 
 function getStrategyLogTag(): string {
+  if (config.strategyType === "ma_fan_portfolio") return "ma-fan-portfolio";
   if (config.strategyType === "ma_ribbon") return "ma-ribbon";
   if (config.strategyType === "swing_trade") return "swing-trade";
   return "dynamic-grid";
@@ -480,6 +481,14 @@ async function main(): Promise<void> {
       const isHoldingPosition = !isDust && heldAmount >= minQty && grid.getLots().length > 0;
 
       if (symbolChanged || exchangeChanged) {
+        // In Portfolio mode, changing "symbol" on the same exchange switches which ticker the chart inspects (never blocked by held slots!)
+        if (symbolChanged && !exchangeChanged && grid.strategyType === "ma_fan_portfolio") {
+          const payload = await grid.inspectSymbol?.(normNextSymbol);
+          if (payload?.candles?.length) dashboard.setInitialCandles(payload.candles);
+          if (payload?.htfCandles?.length) dashboard.setInitialHtfCandles(payload.htfCandles);
+          wakeSleep?.();
+          return grid.getRuntimeConfig();
+        }
         if (isHoldingPosition) {
           const lotCount = grid.getLots().length;
           const baseName = symbolInfo?.baseAsset || "tokens";
@@ -712,6 +721,11 @@ async function main(): Promise<void> {
           });
           await grid.syncOnChainOrders();
           await grid.refreshWalletBalances();
+          if (targetStrategyType === "ma_fan_portfolio") {
+            await grid.tick().catch(() => {});
+            const portCandles = grid.getChartCandles?.();
+            if (portCandles?.length) dashboard.setInitialCandles(portCandles);
+          }
           dashboard.setInitialOrders(grid.getRecentOrders());
           grid.emitTelemetryTick();
           wakeSleep?.();
@@ -886,8 +900,9 @@ async function main(): Promise<void> {
       const cfg = grid.getRuntimeConfig();
       const currentSym = cfg.symbol || activeSymbol;
       let res: { success: boolean; synced: number; purged?: number; error?: string };
-      if (exchange.exchangeName === "binance") {
-        res = await grid.getDatabase().syncRecentTradesFromBinance(exchange, currentSym);
+      if (exchange.exchangeName === "binance" || exchange.exchangeName === "alpaca") {
+        const targetSym = grid.strategyType === "ma_fan_portfolio" ? "ALL" : currentSym;
+        res = await grid.getDatabase().syncRecentTradesFromExchange(exchange, targetSym);
       } else {
         res = { success: false, synced: 0, error: `Trade reconciliation not supported for exchange: ${exchange.exchangeName}` };
       }
@@ -897,6 +912,21 @@ async function main(): Promise<void> {
       grid.saveState(true);
       grid.emitTelemetryTick();
       return res;
+    },
+    onInspectPortfolioSymbol: async (sym: string) => {
+      if (grid.inspectSymbol) {
+        return await grid.inspectSymbol(sym);
+      }
+      return { candles: macroDowEngine.getCandles(), htfCandles: htfDowEngine.getCandles() };
+    },
+    onClosePortfolioSlot: async (slotIndex: number) => {
+      if (grid.closeSlot) {
+        return await grid.closeSlot(slotIndex);
+      }
+      return { success: false, error: "Slot closing only available in MA-Fan Portfolio mode" };
+    },
+    getPortfolioRadar: () => {
+      return grid.getPortfolioRadarSnapshot?.() || null;
     },
   });
 
@@ -909,8 +939,10 @@ async function main(): Promise<void> {
 
   if (macroFeed) {
     macroFeed.onCandle((candle, isClosed) => {
-      macroDowEngine.addCandle(candle);
-      dashboard.addCandle(candle, isClosed);
+      if (grid.strategyType !== "ma_fan_portfolio") {
+        macroDowEngine.addCandle(candle);
+        dashboard.addCandle(candle, isClosed);
+      }
       if (isClosed) {
         grid.onCandleClosed(candle);
         wakeSleep?.();
@@ -970,24 +1002,31 @@ async function main(): Promise<void> {
   let alpacaMarketClosedLogged = false;
 
   async function syncAlpacaMarketClock(loopCfg: Record<string, any>): Promise<boolean> {
-    if (exchange.exchangeName === "alpaca" && !loopCfg.dryRun && !loopCfg.alpacaIgnoreMarketHours && exchange.hasCredentials()) {
+    if (exchange.exchangeName === "alpaca" && exchange.hasCredentials()) {
       const clock = await exchange.getMarketClock?.();
+      const shouldSuspendLive = !loopCfg.dryRun && !loopCfg.alpacaIgnoreMarketHours;
       if (clock && !clock.isOpen) {
-        if (!alpacaMarketClosedLogged) {
-          log(`⏸️ [ALPACA MARKET CLOSED] US Equities market is closed (next open: ${clock.nextOpen}). Holding live order execution until market opens (monitoring chart active).`);
-          alpacaMarketClosedLogged = true;
+        if (shouldSuspendLive) {
+          if (!alpacaMarketClosedLogged) {
+            log(`⏸️ [ALPACA MARKET CLOSED] US Equities market is closed (next open: ${clock.nextOpen}). Holding live order execution until market opens (monitoring chart active).`);
+            alpacaMarketClosedLogged = true;
+          }
+          grid.setMarketClosed?.(true, clock);
+          return true;
         }
-        grid.setMarketClosed?.(true);
-        return true;
+        grid.setMarketClosed?.(false, clock);
+        return false;
       }
       if (clock?.isOpen && alpacaMarketClosedLogged) {
         log(`🔔 [ALPACA MARKET OPEN] US Equities market is now OPEN — resuming live execution.`);
         alpacaMarketClosedLogged = false;
       }
+      grid.setMarketClosed?.(false, clock);
+      return false;
     } else {
       alpacaMarketClosedLogged = false;
     }
-    grid.setMarketClosed?.(false);
+    grid.setMarketClosed?.(false, undefined);
     return false;
   }
 
@@ -995,6 +1034,10 @@ async function main(): Promise<void> {
   await Promise.resolve(tradingFeed?.start());
   await syncAlpacaMarketClock(grid.getRuntimeConfig());
   await grid.tick().catch((err) => log(`initial tick error: ${(err as Error).message}`));
+  if (grid.strategyType === "ma_fan_portfolio") {
+    const portCandles = grid.getChartCandles?.();
+    if (portCandles?.length) dashboard.setInitialCandles(portCandles);
+  }
 
   while (!stop) {
     let tickSleepOverrideMs = 0;

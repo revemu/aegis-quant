@@ -9683,3 +9683,30 @@ When investigating live production behavior, debugging issues, or analyzing trad
      - ให้ `pollOnce()` ส่ง `{ ...book, time: Date.now() }` เป็น milliseconds สอดคล้องกับ `BinanceBookTickerFeed` หลังคำนวณอายุ quote จริงเพื่อลดความถี่ polling นอกเวลาตลาด
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.73`** ใน `package.json` และ `src/version.ts`
+
+---
+
+## 319. v0.3.0.74 — Live MA-Fan Multi-Slot Portfolio Strategy, Adaptive 3-Slot UI & Parity Fixes (`src/strategy/ma-fan-portfolio/*`, `src/exchange/alpaca/*`, `src/db.ts`, `src/server.ts`, `src/index.ts`, `public/*`)
+
+- **เพิ่มกลยุทธ์ Live Multi-Slot Portfolio (`strategyType: "ma_fan_portfolio"`) ตรงตามผลทดสอบ Backtest 100%**:
+  1. **Module ใหม่ `src/strategy/ma-fan-portfolio/` (`types.ts`, `universe.ts`, `index.ts`)**:
+     - Implement `MaFanPortfolioStrategy implements IStrategy` และลงทะเบียนใน `src/strategy/factory.ts` (`createStrategy`).
+     - รองรับสแกนหุ้นสหรัฐฯ `us_top49` (49 US Mega-Caps & ETFs ตาม `TOP_US_STOCK_UNIVERSE` ใน `src/backtest-service.ts`), `us_top25` (25 ตัวสภาพคล่องสูงสุด), และ `custom` Watchlist พร้อม `portfolioBlacklist`.
+     - คำนวณแท่งเทียนคู่ `15m` (`EMA 4/8/16/25/75/200`, `RSI(14)`, `MACD Histogram`) และ `1h` (`RSI(14) >= 40`) แบบ Multi-Symbol ผ่าน `fetchAlpacaMultiSnapshots` / `fetchAlpacaMultiBars` (Alpaca) และ Binance REST fallback.
+     - ตรรกะเข้า-ออกตรงตาม `runMaFanPortfolioSimulation`: `Bottom Fan -> 8/16 Cross -> EMA4 Pullback`, `buyVolRatio12 >= 1.3`, `relStrength24h >= -1.0%`, `COMPOSITE_QUALITY` Ranker, ถือสูงสุด `maxSlots = 3` (แบ่งงบ ~1/3 ต่อ Slot), `TP1 = EMA200` (+0.8% floor) พร้อม `Partial TP 50%` และ `Lock Breakeven (+0.25%)`, `FULL_BULLISH_FAN` exit (หรือ TP1 เมื่อ `EMA200 < EMA75`), `Disaster SL 3.5%` และ Macro Sit-Out Guard (`SPY` สำหรับ Alpaca / `BTCUSDT` สำหรับ Binance; โหมด `dual` `4H >= EMA75 && 1D >= EMA25` / `4h_only` / `daily_only` / `off`).
+  2. **Adapter, DB & Server Endpoints (`src/exchange/alpaca/client.ts`, `src/exchange/alpaca/feed.ts`, `src/db.ts`, `src/server.ts`, `src/index.ts`, `src/config.ts`)**:
+     - เพิ่ม `getAllPositions()` ใน `AlpacaClient`, `fetchAlpacaMultiSnapshots()` & `fetchAlpacaMultiBars()` ใน `src/exchange/alpaca/feed.ts`, และการแนบ `marketClock` (`isOpen`, `nextOpen`, `nextClose`) ใน `syncAlpacaMarketClock`.
+     - อัปเกรด `BotDatabase` (`getTrades`, `getOrderActivity`, `getTradeRounds`, `syncRecentTradesFromExchange`) ให้รองรับคีย์ `"ALL"` / `"__PORTFOLIO__"` และ Reconcile ประวัติเทรดจริงจากทั้ง Binance และ Alpaca (แปลงเวลา Unix seconds เป็น ms อัตโนมัติ).
+     - เพิ่ม Portfolio APIs ใน `src/server.ts`: `GET /api/portfolio/radar`, `POST/GET /api/portfolio/inspect`, `POST /api/portfolio/close-slot`.
+- **Dashboard UI Adaptive 3-Slot & UI Parity Fixes (`public/index.html`, `public/style.css`, `public/app.js`)**:
+  1. **Adaptive Layout สำหรับ `ma_fan_portfolio`**:
+     - แถบ `#portfolioSlotsBar` แสดง 3 ช่องถือครอง (`SLOT 1`–`SLOT 3`) พร้อม Entry, Live Price, Qty, Unrealized PnL, แถบความคืบหน้า `SL -> Entry -> TP1 EMA200`, ปุ่ม `🛑 ปิด Slot`, และสลับ Inspect กราฟ + เส้น EMA 6 เส้น + เส้น Entry/TP1/SL ได้ทันทีเมื่อคลิกที่ Slot หรือแถวใน `#portfolioSidebarPanel` (Macro Guard Banner + Signal Checklist + Live Universe Scanner Radar).
+     - คงหน้า Grid Ladder (`#verticalLadderMeter`), Swing Trade และ MA-Ribbon เดิมไว้อย่างครบถ้วนเมื่อเลือกใช้กลยุทธ์นั้นๆ.
+  2. **UI Parity & Usability Fixes**:
+     - `#dryRunBadge`: แยกสถานะชัดเจนระหว่าง `🟡 โหมดจำลอง (DRY RUN)`, `🔵 ALPACA PAPER`, และ `🟢 โหมดเทรดจริง (LIVE)`.
+     - `#marketClockBadge`: นับถอยหลังเปิด-ปิดตลาด US (`🟢 🇺🇸 US OPEN • ปิดใน HH:MM:SS` / `🔴 🇺🇸 US CLOSED • เปิดใน HH:MM:SS`) แบบเรียลไทม์ทุก 1 วินาที.
+     - `#liveBotStatusSub`: แสดงโหมดจริงและ Timeframe จริง (`MA-FAN PORTFOLIO • 15m`, `MA-RIBBON • ...`, `DYNAMIC GRID • ...`) แทนค่า `"5m"` เดิม.
+     - `#btnLtSyncBinance` / `#tmBtnSyncExchange` และ Trade Log: ปรับป้ายปุ่ม Reconcile ตามกระดาน (`Alpaca` vs `Binance`) พร้อมปุ่มสลับขอบเขต `📦 ทุก Slot (ALL)` / `🔎 เฉพาะ <SYMBOL>` และป้าย Ticker บนแถวประวัติ.
+     - หน้าตั้งค่า (`Settings Modal`): เพิ่มตัวเลือก `🚀 MA-Fan Portfolio` ใน `#cfg_strategyType` และแท็บ `#tab-portfolio` (`tabBtnPortfolio`).
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.74`** ใน `package.json` และ `src/version.ts`

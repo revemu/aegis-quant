@@ -221,6 +221,38 @@ export class AlpacaClient implements IExchangeClient {
     };
   }
 
+  public async getAllPositions(): Promise<Array<{
+    symbol: string;
+    qty: number;
+    qtyAvailable: number;
+    avgEntryPrice: number;
+    currentPrice: number;
+    marketValue: number;
+    unrealizedPnl: number;
+    unrealizedPnlPct: number;
+  }>> {
+    const res = await fetch(`${this.baseUrl}/v2/positions`, { headers: this.getHeaders() });
+    if (!res.ok) throw new Error(`Failed to fetch Alpaca positions: HTTP ${res.status}`);
+    const list = (await res.json()) as any[];
+    if (!Array.isArray(list)) return [];
+    return list
+      .map((p) => {
+        const qty = parseFloat(p.qty) || 0;
+        const qtyAvailable = p.qty_available !== undefined ? parseFloat(p.qty_available) || 0 : qty;
+        return {
+          symbol: normalizeStockSymbol(String(p.symbol || "")),
+          qty,
+          qtyAvailable,
+          avgEntryPrice: parseFloat(p.avg_entry_price) || 0,
+          currentPrice: parseFloat(p.current_price) || 0,
+          marketValue: parseFloat(p.market_value) || 0,
+          unrealizedPnl: parseFloat(p.unrealized_pl) || 0,
+          unrealizedPnlPct: (parseFloat(p.unrealized_plpc) || 0) * 100,
+        };
+      })
+      .filter((p) => p.symbol && p.qty > 0);
+  }
+
   public async getOpenOrders(symbol?: string): Promise<ExchangeOpenOrder[]> {
     let url = `${this.baseUrl}/v2/orders?status=open&limit=100`;
     if (symbol) {

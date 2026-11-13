@@ -21,7 +21,7 @@ import type { AtrSource } from "../types.js";
 import { type DowStructureEngine, type DowStructure, type GridZone, type Candle, VolumeProfileEngine, type VolumeProfileResult } from "../market-structure.js";
 import { BotDatabase, getDatabase, type StrategyStateRecord, type TradeRecord, type OrderActivityRecord, type GasLogRecord, type LockedChannel } from "../db.js";
 
-import type { Lot, OpenOrder, StrategyEvent, GridPersistedState, ConfirmedChannelState, IStrategyHost, IStrategy, StrategyType, GridReadinessInfo } from "./types.js";
+import type { Lot, OpenOrder, StrategyEvent, GridPersistedState, ConfirmedChannelState, IStrategyHost, IStrategy, StrategyType, GridReadinessInfo, MarketClockInfo } from "./types.js";
 import { LotTracker } from "./lot-tracker.js";
 import { RiskManager } from "./risk-manager.js";
 import { BuyOrderSynchronizer } from "./buy-sync.js";
@@ -2313,8 +2313,11 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
     return this.isPaused;
   }
 
-  public setMarketClosed(closed: boolean): void {
+  private marketClock?: MarketClockInfo;
+
+  public setMarketClosed(closed: boolean, marketClock?: MarketClockInfo): void {
     this.isMarketClosed = closed;
+    if (marketClock) this.marketClock = marketClock;
   }
 
   public async cancelAllOrdersUser(): Promise<{ cancelledCount: number }> {
@@ -2689,6 +2692,12 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
         baseAsset: this.symbolInfo.baseAsset,
         quoteAsset: this.symbolInfo.quoteAsset,
         isMarketClosed: this.isMarketClosed,
+        marketClock: this.marketClock,
+        strategyType: this.strategyType,
+        strategyMode: this.strategyType,
+        executionTimeframe: this.cfg.dowTimeframe || "15m",
+        dryRun: Boolean(this.cfg.dryRun),
+        alpacaBaseUrl: this.cfg.alpacaBaseUrl,
         avgEntry,
         lots: this.lots,
         openOrders: this.openOrders,
@@ -2707,7 +2716,6 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
         freeTradingSomiBalance: Math.max(0, this.walletBaseBalance - this.getEffectiveGasReserveBase()),
         gasReserveSomi: this.getEffectiveGasReserveBase(),
         minGasReserveSomi: this.getEffectiveGasReserveSomi(),
-        dryRun: this.cfg.dryRun,
       },
     });
   }
@@ -4798,6 +4806,12 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
         symbol: this.symbol,
         symbolStatus: this.symbolInfo.status || "TRADING",
         isMarketClosed: this.isMarketClosed,
+        marketClock: this.marketClock,
+        strategyType: this.strategyType,
+        strategyMode: this.strategyType,
+        executionTimeframe: this.cfg.dowTimeframe || "15m",
+        dryRun: Boolean(this.cfg.dryRun),
+        alpacaBaseUrl: this.cfg.alpacaBaseUrl,
         exchange: this.binance.exchangeName,
         binanceSymbol: this.cfg.binanceSymbol,
         baseAsset: this.symbolInfo.baseAsset,

@@ -45,7 +45,8 @@
 
         <!-- Unified System Mode & Connection Status Pills -->
         <div class="nav-system-pills">
-          <div class="dry-badge" id="dryRunBadge" title="โหมดการส่งคำสั่งเทรดของบอท (เงินจริง vs จำลอง)">🟡 โหมดจำลอง (DRY RUN)</div>
+          <div class="dry-badge" id="dryRunBadge" title="โหมดการส่งคำสั่งเทรดของบอท (เงินจริง vs Paper vs จำลอง)">🟡 โหมดจำลอง (DRY RUN)</div>
+          <div class="market-clock-pill" id="marketClockBadge" style="display: none;" title="เวลาเปิด-ปิดตลาดหุ้นสหรัฐฯ (NYSE/NASDAQ Regular Session)">🇺🇸 US MARKET</div>
           <div class="status-pill connected" id="connectionStatus" title="สถานะการเชื่อมต่อข้อมูลหน้าเว็บและความเร็วรอบประมวลผลของบอท">
             <span class="dot"></span>
             <span id="connectionText">ออนไลน์</span>
@@ -188,6 +189,9 @@
       </div>
     </section>
 
+    <!-- ═══════════════════ Portfolio 3-Slot Bar (Visible in ma_fan_portfolio mode) ═══════════════════ -->
+    <section class="portfolio-slots-strip" id="portfolioSlotsBar" style="display: none;"></section>
+
     <!-- ═══════════════════ Full-Width Main Workspace (Clean Studio Style) ═══════════════════ -->
     <div class="dashboard-grid">
 
@@ -326,6 +330,7 @@
           <span class="trades-hint">💡 คลิกที่แถวไม้เทรดเพื่อเลื่อนกราฟ (Scroll) และดูจุดซื้อ-ขายบนแท่งเทียน</span>
         </div>
         <div class="trades-header-controls" style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+          <button class="filter-btn active" id="btnLtScopeToggle" style="display: none; border-color: rgba(56, 189, 248, 0.5); color: #38bdf8;" title="สลับดูประวัติรวมทุกตัวในพอร์ต หรือเฉพาะตัวที่เปิดกราฟอยู่">📦 ทุก Slot (ALL)</button>
           <div class="trades-filter">
             <button class="filter-btn active" id="btnLtTabFills" data-target="fills">⚡ ประวัติเทรด (<span id="ltCntFills">0</span>)</button>
             <button class="filter-btn" id="btnLtTabRounds" data-target="rounds">🔄 สรุปรอบเทรด (<span id="ltCntRounds">0</span>)</button>
@@ -333,8 +338,8 @@
             <button class="filter-btn" id="btnLtTabLots" data-target="lots">📦 ไม้ที่ถือ (<span id="ltCntLots">0</span>)</button>
           </div>
           <div style="display: flex; gap: 6px;">
-            <button class="btn btn-warning btn-sm" id="btnLtSyncBinance" title="ดึงประวัติการจับคู่คำสั่งจริงจาก Binance REST API มา Reconcile อัตโนมัติ" style="background: rgba(245, 158, 11, 0.2); border: 1px solid rgba(245, 158, 11, 0.5); color: #fbbf24; font-size: 11px; padding: 4px 8px;">
-              <span>🔄 Reconcile จาก Binance</span>
+            <button class="btn btn-warning btn-sm" id="btnLtSyncBinance" title="ดึงประวัติการจับคู่คำสั่งจริงจากกระดานเทรดมา Reconcile อัตโนมัติ" style="background: rgba(245, 158, 11, 0.2); border: 1px solid rgba(245, 158, 11, 0.5); color: #fbbf24; font-size: 11px; padding: 4px 8px;">
+              <span id="btnLtSyncText">🔄 Reconcile จากกระดาน</span>
             </button>
             <button class="btn btn-primary btn-sm" id="btnLtAddTrade" style="font-size: 11px; padding: 4px 8px;">
               <span>➕ เพิ่ม Trade Fill</span>
@@ -683,6 +688,34 @@
               </div>
             </div>
           </div>
+
+          <!-- ── Portfolio Sidebar Panel: Inspected Checklist + Universe Radar (Displayed when strategyType === 'ma_fan_portfolio') ── -->
+          <div class="portfolio-sidebar-panel" id="portfolioSidebarPanel" style="display: none;">
+            <div class="pf-macro-banner" id="pfMacroBanner">
+              <div class="pf-macro-title" id="pfMacroTitle">🛡️ Macro Filter (SPY): Checking...</div>
+              <div class="pf-macro-sub" id="pfMacroSub">4H vs EMA75 • 1D vs EMA25</div>
+            </div>
+
+            <div class="pf-section-block">
+              <div class="pf-block-header">
+                <span id="pfChecklistTitle">🔎 เช็คลิสต์สัญญาณ: --</span>
+                <span class="pf-stage-pill" id="pfChecklistStage">--</span>
+              </div>
+              <div class="pf-checklist-grid" id="pfChecklistGrid">
+                <div class="pf-chk-empty">กำลังรอข้อมูล EMA 15m &amp; 1h...</div>
+              </div>
+            </div>
+
+            <div class="pf-section-block pf-radar-block">
+              <div class="pf-block-header">
+                <span>📡 เรดาร์สแกน Universe</span>
+                <span class="pf-radar-count" id="pfRadarCount">0 ตัว</span>
+              </div>
+              <div class="pf-radar-list" id="pfRadarList">
+                <div class="pf-chk-empty">กำลังสแกนหุ้น...</div>
+              </div>
+            </div>
+          </div>
         </div>
 
         
@@ -718,6 +751,7 @@
           <button class="tab-btn" id="tabBtnApi" data-tab="tab-api">🔌 กระดานเทรด &amp; ระบบ</button>
           <button class="tab-btn" id="tabBtnSwing" data-tab="tab-swing">🏹 สวิงเทรด (Swing Trade)</button>
           <button class="tab-btn" id="tabBtnMaFan" data-tab="tab-ma-fan">🎀 MA-Ribbon</button>
+          <button class="tab-btn" id="tabBtnPortfolio" data-tab="tab-portfolio">🚀 MA-Fan Portfolio (3 Slots)</button>
           <button class="tab-btn" id="tabBtnRotation" data-tab="tab-rotation">🔄 สลับคู่เหรียญ (Auto Rotation)</button>
         </div>
 
@@ -1568,6 +1602,7 @@
                   <span class="help-tip" title="เลือกรูปแบบกลยุทธ์: Dynamic Grid (วางกริดเก็บรอบถี่) หรือ Swing Trade (ดักรอบคลื่น R:R สูง)">ℹ️</span>
                 </label>
                 <select id="cfg_strategyType" class="form-select">
+                  <option value="ma_fan_portfolio">🚀 MA-Fan Portfolio (ถือ 3 ตัว • 15m Pullback — ชนะ Backtest)</option>
                   <option value="dynamic_grid">⚙️ Dynamic Grid (เทรดเก็บรอบกริด)</option>
                   <option value="ma_ribbon">🎀 MA-Ribbon (แถบริบบิ้น EMA ดักสแน็ป/เกาะเทรนด์)</option>
                   <option value="swing_trade">🎯 Swing Trade (สไนเปอร์รอบคลื่น R:R)</option>
@@ -2336,6 +2371,122 @@
                 <tbody id="rotationScanResultsBody">
                 </tbody>
               </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- ═══════════════════ TAB 7: MA-Fan Multi-Slot Portfolio ═══════════════════ -->
+        <div class="tab-pane" id="tab-portfolio">
+          <div class="cfg-section-card">
+            <div class="cfg-section-header">
+              <span class="cfg-section-title">🚀 โครงสร้างพอร์ต &amp; กลุ่มหุ้น/เหรียญ (Portfolio Slots &amp; Universe)</span>
+              <span class="cfg-section-desc">ใช้ตรรกะเดียวกับ Backtest Multi-Slot (15m EMA4 Pullback + 1h RSI Filter)</span>
+            </div>
+            <div class="settings-grid">
+              <div class="form-group">
+                <label for="cfg_portfolioMaxSlots">จำนวนช่องถือพร้อมกัน (Max Concurrent Slots)</label>
+                <input type="number" id="cfg_portfolioMaxSlots" min="1" max="5" step="1" />
+              </div>
+
+              <div class="form-group">
+                <label for="cfg_portfolioUniversePreset">ชุดหุ้น / เหรียญที่สแกน (Universe Preset)</label>
+                <select id="cfg_portfolioUniversePreset" class="form-select">
+                  <option value="us_top49">🇺🇸 Top 49 US Mega-Caps &amp; ETFs (เหมือน Backtest 100%)</option>
+                  <option value="us_top25">💎 Top 25 Liquid Mega-Caps (คัดเฉพาะตัวสภาพคล่องสูงสุด)</option>
+                  <option value="custom">🎯 Custom Watchlist (กำหนดรายชื่อเอง)</option>
+                </select>
+              </div>
+
+              <div class="form-group">
+                <label for="cfg_portfolioMaxBudgetUsd">งบพอร์ตสูงสุด ($ USD | 0 = ใช้เงินในพอร์ตทั้งหมด)</label>
+                <div class="input-with-unit">
+                  <input type="number" id="cfg_portfolioMaxBudgetUsd" min="0" max="10000000" step="100" />
+                  <span class="unit">$</span>
+                </div>
+              </div>
+
+              <div class="form-group">
+                <label for="cfg_portfolioRankBy">การจัดอันดับคัดเข้า Slot (Candidate Ranker)</label>
+                <select id="cfg_portfolioRankBy" class="form-select">
+                  <option value="COMPOSITE_QUALITY">🏆 Composite Quality (เหมือน Backtest แนะนำ)</option>
+                  <option value="REL_STRENGTH">💪 Relative Strength 24h สูงสุด</option>
+                  <option value="RSI_LOWEST">🌊 RSI ต่ำสุด (Oversold Hook)</option>
+                </select>
+              </div>
+
+              <div class="form-group" style="grid-column: 1 / -1;">
+                <label for="cfg_portfolioCustomWhitelist">Custom Watchlist / หุ้นที่เจาะจง (คั่นด้วยจุลภาค เช่น AAPL, MSFT, NVDA, TSLA)</label>
+                <input type="text" id="cfg_portfolioCustomWhitelist" class="form-input" placeholder="AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA, SPY, QQQ" />
+              </div>
+
+              <div class="form-group" style="grid-column: 1 / -1;">
+                <label for="cfg_portfolioBlacklist">Blacklist (รายชื่อที่ห้ามเข้าเทรด คั่นด้วยจุลภาค)</label>
+                <input type="text" id="cfg_portfolioBlacklist" class="form-input" placeholder="เช่น T, PFE" />
+              </div>
+            </div>
+          </div>
+
+          <div class="cfg-section-card">
+            <div class="cfg-section-header">
+              <span class="cfg-section-title">🎯 จุดขาย Take Profit, Stop Loss &amp; Macro Guard</span>
+              <span class="cfg-section-desc">ตั้งค่าระยะขาย EMA200, Lock Breakeven, Disaster SL และตัวกรองตลาดใหญ่</span>
+            </div>
+            <div class="settings-grid">
+              <div class="form-group">
+                <label for="cfg_portfolioTp1TargetMode">เป้าหมาย TP1 (Primary Profit Target)</label>
+                <select id="cfg_portfolioTp1TargetMode" class="form-select">
+                  <option value="EMA200">🎯 EMA 200 (ตามผลทดสอบ Backtest)</option>
+                  <option value="EMA75">⚡ EMA 75 (ขายไวขึ้น)</option>
+                </select>
+              </div>
+
+              <div class="form-group">
+                <label for="cfg_portfolioDisasterSlPct">Disaster Stop Loss (%)</label>
+                <div class="input-with-unit">
+                  <input type="number" id="cfg_portfolioDisasterSlPct" min="0.5" max="15" step="0.25" />
+                  <span class="unit">%</span>
+                </div>
+              </div>
+
+              <div class="form-group">
+                <label for="cfg_portfolioSitOutMode">Macro Sit-Out Filter (SPY / BTC Benchmark)</label>
+                <select id="cfg_portfolioSitOutMode" class="form-select">
+                  <option value="dual">🛡️ Dual Guard (4H ≥ EMA75 &amp; 1D ≥ EMA25)</option>
+                  <option value="4h_only">📊 4H Only (4H ≥ EMA75)</option>
+                  <option value="daily_only">📅 Daily Only (1D ≥ EMA25)</option>
+                  <option value="off">🔥 ปิด (Off — เข้าทุกจังหวะ ไม่สนตลาดใหญ่)</option>
+                </select>
+              </div>
+
+              <div class="form-group">
+                <label for="cfg_portfolioMaxHoldHours">Max Hold Hours (0 = ไม่จำกัดเวลา)</label>
+                <div class="input-with-unit">
+                  <input type="number" id="cfg_portfolioMaxHoldHours" min="0" max="720" step="4" />
+                  <span class="unit">ชม.</span>
+                </div>
+              </div>
+
+              <div class="form-group switch-group">
+                <div class="switch-label-group">
+                  <span class="switch-title">✂️ แบ่งขาย 50% ที่ TP1 (Partial TP @ EMA200)</span>
+                  <span class="switch-desc">ขายครึ่งไม้เมื่อแตะ EMA200 อีกครึ่งรันต่อจน Full Bullish Fan</span>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" id="cfg_portfolioPartialTpAtEma200" />
+                  <span class="slider"></span>
+                </label>
+              </div>
+
+              <div class="form-group switch-group">
+                <div class="switch-label-group">
+                  <span class="switch-title">🔒 เลื่อน SL บังทุนเมื่อถึง TP1 (Lock Breakeven)</span>
+                  <span class="switch-desc">ยก Stop Loss มาที่ Entry + 0.25% อัตโนมัติหลังชน EMA200</span>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" id="cfg_portfolioLockBreakevenAtEma200" />
+                  <span class="slider"></span>
+                </label>
+              </div>
             </div>
           </div>
         </div>

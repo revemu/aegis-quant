@@ -34,6 +34,9 @@ export interface DashboardServerOptions {
   onSyncExchangeTrades?: () => Promise<{ success: boolean; synced: number; purged?: number; error?: string }>;
   getRotationStatus?: () => any;
   onTriggerRotationScan?: (opts?: { forceRotate?: boolean; quoteAsset?: string }) => Promise<any>;
+  onInspectPortfolioSymbol?: (symbol: string) => Promise<any>;
+  onClosePortfolioSlot?: (slotIndex: number) => Promise<any>;
+  getPortfolioRadar?: () => any;
   maxCandles?: number;
 }
 
@@ -307,20 +310,33 @@ export class DashboardServer {
 
     // Snapshot state
     if (pathname === "/api/state") {
-      const activeSymbol = this.opts.getSettings ? (this.opts.getSettings().symbol || "") : "";
-      const filteredOrders = activeSymbol
-        ? this.recentOrders.filter((o) => !o.symbol || this.db.matchesSymbol(o, activeSymbol))
-        : this.recentOrders;
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          versionInfo: APP_VERSION_INFO,
-          candles: this.candles,
-          htfCandles: this.htfCandles,
-          orders: filteredOrders.slice(0, 150),
-          latestTick: this.latestTick,
-        }),
-      );
+      (async () => {
+        try {
+          const settings = this.opts.getSettings ? this.opts.getSettings() : {};
+          const activeSymbol = settings.symbol || "";
+          const isPortfolioMode = normalizeStrategyType(settings.strategyType || settings.strategyMode) === "ma_fan_portfolio";
+          const filteredOrders = isPortfolioMode || !activeSymbol
+            ? this.recentOrders
+            : this.recentOrders.filter((o) => !o.symbol || this.db.matchesSymbol(o, activeSymbol));
+          const portfolioInspect = isPortfolioMode && this.opts.onInspectPortfolioSymbol
+            ? await this.opts.onInspectPortfolioSymbol(activeSymbol || this.latestTick?.portfolio?.inspectedSymbol || "").catch(() => null)
+            : null;
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              versionInfo: APP_VERSION_INFO,
+              candles: portfolioInspect?.candles?.length ? portfolioInspect.candles : this.candles,
+              htfCandles: portfolioInspect?.htfCandles?.length ? portfolioInspect.htfCandles : this.htfCandles,
+              orders: filteredOrders.slice(0, 150),
+              latestTick: this.latestTick,
+              portfolioInspect,
+            }),
+          );
+        } catch (e: any) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: (e as Error).message }));
+        }
+      })();
       return;
     }
 
@@ -334,7 +350,9 @@ export class DashboardServer {
     // Database: Trades History API
     if (pathname === "/api/db/trades") {
       const limit = parseInt(parsedUrl.searchParams.get("limit") || "5000", 10);
-      const symbolParam = parsedUrl.searchParams.get("symbol") || this.opts.getSettings?.().symbol || undefined;
+      const settings = this.opts.getSettings?.() || {};
+      const isPortfolioMode = normalizeStrategyType(settings.strategyType || settings.strategyMode) === "ma_fan_portfolio";
+      const symbolParam = parsedUrl.searchParams.get("symbol") || (isPortfolioMode ? "ALL" : settings.symbol) || undefined;
       const trades = this.db.getTrades(limit, symbolParam);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(trades));
@@ -344,7 +362,9 @@ export class DashboardServer {
     // Database: Order Activity History API
     if (pathname === "/api/db/orders") {
       const limit = parseInt(parsedUrl.searchParams.get("limit") || "5000", 10);
-      const symbolParam = parsedUrl.searchParams.get("symbol") || this.opts.getSettings?.().symbol || undefined;
+      const settings = this.opts.getSettings?.() || {};
+      const isPortfolioMode = normalizeStrategyType(settings.strategyType || settings.strategyMode) === "ma_fan_portfolio";
+      const symbolParam = parsedUrl.searchParams.get("symbol") || (isPortfolioMode ? "ALL" : settings.symbol) || undefined;
       const orders = this.db.getOrderActivity(limit, symbolParam);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(orders));
@@ -363,9 +383,11 @@ export class DashboardServer {
 
     // Database: Trade Rounds Summary API (Buy Accumulation & Sell Distribution Cycles)
     if (pathname === "/api/db/rounds") {
+      const settings = this.opts.getSettings?.() || {};
+      const isPortfolioMode = normalizeStrategyType(settings.strategyType || settings.strategyMode) === "ma_fan_portfolio";
       let symbolParam = parsedUrl.searchParams.get("symbol") || undefined;
-      if (!symbolParam && this.opts.getSettings) {
-        symbolParam = this.opts.getSettings().symbol;
+      if (!symbolParam) {
+        symbolParam = isPortfolioMode ? "ALL" : settings.symbol;
       }
       const roundsData = this.db.getTradeRounds(symbolParam);
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -375,13 +397,17 @@ export class DashboardServer {
 
     // Database: Trade & Lot Manager Overview API
     if (pathname === "/api/db/trade-manager") {
+      const settings = this.opts.getSettings?.() || {};
+      const isPortfolioMode = normalizeStrategyType(settings.strategyType || settings.strategyMode) === "ma_fan_portfolio";
       let symbolParam = parsedUrl.searchParams.get("symbol") || undefined;
-      if (!symbolParam && this.opts.getSettings) {
-        symbolParam = this.opts.getSettings().symbol;
+      if (!symbolParam) {
+        symbolParam = isPortfolioMode ? "ALL" : settings.symbol;
       }
       const trades = this.db.getTrades(5000, symbolParam);
-      const allOrders = this.db.getOrders(5000, { symbol: symbolParam });
-      const state = this.db.getState(symbolParam);
+      const allOrders = symbolParam === "ALL"
+        ? this.db.getOrders(5000)
+        : this.db.getOrders(5000, { symbol: symbolParam });
+      const state = this.db.getState(isPortfolioMode ? "__PORTFOLIO__" : symbolParam);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
@@ -763,6 +789,66 @@ export class DashboardServer {
           res.end(JSON.stringify({ error: (e as Error).message }));
         }
       })();
+      return;
+    }
+
+    // Portfolio Mode APIs: Radar, Inspect Symbol, Close Slot
+    if (pathname === "/api/portfolio/radar" && req.method === "GET") {
+      const radar = this.opts.getPortfolioRadar ? this.opts.getPortfolioRadar() : null;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: Boolean(radar), ...(radar || {}) }));
+      return;
+    }
+
+    if (pathname === "/api/portfolio/inspect" && (req.method === "POST" || req.method === "GET")) {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", async () => {
+        try {
+          const parsed = body ? JSON.parse(body) : {};
+          const sym = String(parsed.symbol || parsedUrl.searchParams.get("symbol") || "").trim();
+          if (!this.opts.onInspectPortfolioSymbol) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ success: false, error: "Portfolio inspect not available" }));
+            return;
+          }
+          const payload = await this.opts.onInspectPortfolioSymbol(sym);
+          if (payload?.candles?.length) {
+            this.setInitialCandles(payload.candles);
+          }
+          if (payload?.htfCandles?.length) {
+            this.setInitialHtfCandles(payload.htfCandles);
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: true, ...payload }));
+        } catch (e: any) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, error: (e as Error).message }));
+        }
+      });
+      return;
+    }
+
+    if (pathname === "/api/portfolio/close-slot" && req.method === "POST") {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", async () => {
+        try {
+          const parsed = body ? JSON.parse(body) : {};
+          const slotIndex = Number(parsed.slotIndex);
+          if (!this.opts.onClosePortfolioSlot || !Number.isFinite(slotIndex)) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ success: false, error: "Invalid slotIndex or handler missing" }));
+            return;
+          }
+          const result = await this.opts.onClosePortfolioSlot(slotIndex);
+          res.writeHead(result?.success === false ? 400 : 200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(result));
+        } catch (e: any) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, error: (e as Error).message }));
+        }
+      });
       return;
     }
 

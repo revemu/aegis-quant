@@ -499,3 +499,129 @@ export class AlpacaBookTickerFeed {
     }
   }
 }
+
+/**
+ * Fetch latest snapshots for multiple US equity tickers in a single batched Alpaca Data API v2 call.
+ */
+export async function fetchAlpacaMultiSnapshots(params: {
+  symbols: string[];
+  apiKey: string;
+  apiSecret: string;
+  dataUrl?: string;
+}): Promise<Map<string, BookTickerData>> {
+  const result = new Map<string, BookTickerData>();
+  const cleanSyms = Array.from(new Set(params.symbols.map(normalizeStockSymbol).filter(Boolean)));
+  if (cleanSyms.length === 0) return result;
+
+  const dataUrl = (params.dataUrl || "https://data.alpaca.markets").replace(/\/+$/, "");
+  const headers: Record<string, string> = {};
+  if (params.apiKey && params.apiSecret) {
+    headers["APCA-API-KEY-ID"] = params.apiKey;
+    headers["APCA-API-SECRET-KEY"] = params.apiSecret;
+  }
+
+  for (let i = 0; i < cleanSyms.length; i += 50) {
+    const chunk = cleanSyms.slice(i, i + 50);
+    const url = `${dataUrl}/v2/stocks/snapshots?symbols=${encodeURIComponent(chunk.join(","))}&feed=iex`;
+    const res = await fetch(url, { headers });
+    if (!res.ok) continue;
+    const payload = (await res.json()) as Record<string, Parameters<typeof parseAlpacaSnapshotToBook>[0]>;
+    if (!payload || typeof payload !== "object") continue;
+    for (const [sym, snap] of Object.entries(payload)) {
+      const book = parseAlpacaSnapshotToBook(snap);
+      if (book) {
+        result.set(normalizeStockSymbol(sym), { ...book, time: Date.now() });
+      }
+    }
+  }
+  return result;
+}
+
+/**
+ * Fetch recent OHLCV bars for multiple US equity tickers using batched Alpaca Data API v2 requests.
+ */
+export async function fetchAlpacaMultiBars(params: {
+  symbols: string[];
+  interval: string;
+  limit?: number;
+  apiKey: string;
+  apiSecret: string;
+  dataUrl?: string;
+}): Promise<Map<string, Candle[]>> {
+  const out = new Map<string, Candle[]>();
+  const cleanSyms = Array.from(new Set(params.symbols.map(normalizeStockSymbol).filter(Boolean)));
+  if (cleanSyms.length === 0) return out;
+
+  const { timeframe, aggregateHours } = mapIntervalToAlpacaTimeframe(params.interval);
+  const perSymLimit = Math.max(10, Math.min(params.limit ?? 280, 1000));
+  const intervalSec = intervalToSeconds(params.interval);
+  const nowSec = Math.floor(Date.now() / 1000);
+  const daysBack = estimateDaysBack(params.interval, perSymLimit * aggregateHours);
+  const startIso = new Date(Date.now() - daysBack * 86_400_000).toISOString().split(".")[0] + "Z";
+
+  const dataUrl = (params.dataUrl || "https://data.alpaca.markets").replace(/\/+$/, "");
+  const headers: Record<string, string> = {};
+  if (params.apiKey && params.apiSecret) {
+    headers["APCA-API-KEY-ID"] = params.apiKey;
+    headers["APCA-API-SECRET-KEY"] = params.apiSecret;
+  }
+
+  // Batch 8 symbols at a time so total bar limit (8 * 300 = 2400) fits cleanly within Alpaca 10,000 multi-bar cap
+  const batchSize = 8;
+  for (let i = 0; i < cleanSyms.length; i += batchSize) {
+    const chunk = cleanSyms.slice(i, i + batchSize);
+    const totalLimit = Math.min(10_000, chunk.length * perSymLimit * aggregateHours + 200);
+    const rawBySym = new Map<string, Array<{ t: string; o: number; h: number; l: number; c: number; v?: number }>>();
+    let pageToken: string | undefined;
+    let attempts = 0;
+
+    do {
+      let url = `${dataUrl}/v2/stocks/bars?symbols=${encodeURIComponent(chunk.join(","))}&timeframe=${timeframe}&start=${encodeURIComponent(startIso)}&limit=${totalLimit}&sort=desc&adjustment=all&feed=iex`;
+      if (pageToken) url += `&page_token=${encodeURIComponent(pageToken)}`;
+      const res = await fetch(url, { headers });
+      if (!res.ok) break;
+      const data = (await res.json()) as {
+        bars?: Record<string, Array<{ t: string; o: number; h: number; l: number; c: number; v?: number }>>;
+        next_page_token?: string | null;
+      };
+      if (data?.bars && typeof data.bars === "object") {
+        for (const [sym, arr] of Object.entries(data.bars)) {
+          if (!Array.isArray(arr)) continue;
+          const prev = rawBySym.get(sym) || [];
+          prev.push(...arr);
+          rawBySym.set(sym, prev);
+        }
+      }
+      pageToken = data?.next_page_token || undefined;
+      attempts++;
+    } while (pageToken && attempts < 6);
+
+    for (const [sym, rawBars] of rawBySym.entries()) {
+      let candles: Candle[] = rawBars
+        .slice()
+        .sort((a, b) => Date.parse(a.t) - Date.parse(b.t))
+        .map((b) => {
+          const tsSec = Math.floor(Date.parse(b.t) / 1000);
+          return {
+            time: tsSec,
+            open: Number(b.o),
+            high: Number(b.h),
+            low: Number(b.l),
+            close: Number(b.c),
+            volume: Number(b.v ?? 0),
+            isClosed: true,
+          };
+        })
+        .filter((c) => Number.isFinite(c.time) && Number.isFinite(c.close) && c.close > 0);
+
+      if (aggregateHours > 1) candles = aggregateFourHourBars(candles);
+      if (candles.length > 0) {
+        const last = candles[candles.length - 1]!;
+        if (last.time + intervalSec > nowSec) last.isClosed = false;
+      }
+      if (candles.length > perSymLimit) candles = candles.slice(-perSymLimit);
+      out.set(normalizeStockSymbol(sym), candles);
+    }
+  }
+  return out;
+}

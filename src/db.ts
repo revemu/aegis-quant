@@ -48,6 +48,29 @@ export interface LockedChannel {
   lockedAt: number;
 }
 
+export interface PortfolioSlotRecord {
+  slotIndex: number;
+  symbol: string;
+  entryTime: number;
+  entryIdx?: number;
+  entryPrice: number;
+  allocatedCapital: number;
+  stopLossPrice: number;
+  qty: number;
+  initialQty: number;
+  troughPrice: number;
+  peakPrice: number;
+  lastKnownPrice: number;
+  beLocked: boolean;
+  tp1Done: boolean;
+  realizedProceeds: number;
+  entryFeeQuote: number;
+  realizedExitFees: number;
+  activeBarsHeld: number;
+  tp1TargetPrice?: number;
+  entryReason?: string;
+}
+
 export interface StrategyStateRecord {
   lots: Lot[];
   openOrders: OpenOrder[];
@@ -108,6 +131,9 @@ export interface StrategyStateRecord {
   };
   soldSellIndices?: number[];
   maFanPosition?: any;
+  portfolioSlots?: PortfolioSlotRecord[];
+  portfolioCash?: number;
+  portfolioInitialCapital?: number;
   lastUpdated: number;
 }
 
@@ -1462,6 +1488,18 @@ export class BotDatabase {
     symbol: string,
     limit = 100,
   ): Promise<{ success: boolean; synced: number; purged: number; error?: string }> {
+    return this.syncRecentTradesFromExchange(exchangeClient, symbol, limit);
+  }
+
+  /**
+   * Reconciles historical fills from Binance or Alpaca REST API,
+   * purges corrupted manual entries, and recalculates accurate FIFO Realized PnL.
+   */
+  public async syncRecentTradesFromExchange(
+    exchangeClient: any,
+    symbol?: string,
+    limit = 100,
+  ): Promise<{ success: boolean; synced: number; purged: number; error?: string }> {
     if (!exchangeClient) {
       return { success: false, synced: 0, purged: 0, error: "Exchange client not provided" };
     }
@@ -1472,19 +1510,28 @@ export class BotDatabase {
       return { success: false, synced: 0, purged: 0, error: "Exchange credentials not configured" };
     }
 
+    const exName = String(exchangeClient.exchangeName || "binance").toLowerCase();
+    const exTitle = exName === "alpaca" ? "Alpaca" : "Binance";
+    const isPortfolioAll = !symbol || symbol === "ALL" || symbol === "__PORTFOLIO__";
+
     try {
-      const normSym = symbol.toUpperCase().replace(/[\/\-_:]/g, "");
-      const trades = await exchangeClient.getMyTrades(normSym, limit);
+      const normSym = isPortfolioAll ? "" : symbol.toUpperCase().replace(/[\/\-_:]/g, "");
+      const trades = await exchangeClient.getMyTrades(isPortfolioAll ? undefined : normSym, limit);
 
       if (!Array.isArray(trades) || trades.length === 0) {
-        this.log(`ℹ️ [syncRecentTradesFromBinance] No trades returned from Binance for ${normSym}`);
+        this.log(`ℹ️ [syncRecentTradesFromExchange] No trades returned from ${exTitle} for ${normSym || "ALL"}`);
         return { success: true, synced: 0, purged: 0 };
       }
 
-      this.log(`📥 [syncRecentTradesFromBinance] Received ${trades.length} trades from Binance for ${normSym}`);
+      this.log(`📥 [syncRecentTradesFromExchange] Received ${trades.length} trades from ${exTitle} for ${normSym || "ALL"}`);
+
+      const toMs = (raw: unknown): number => {
+        const n = Number(raw || 0);
+        return n > 0 && n < 1e12 ? n * 1000 : n;
+      };
 
       // Sort trades ascending by time
-      trades.sort((a: any, b: any) => Number(a.time) - Number(b.time));
+      trades.sort((a: any, b: any) => toMs(a.time) - toMs(b.time));
 
       let syncedCount = 0;
       let purgedCount = 0;
@@ -1493,7 +1540,7 @@ export class BotDatabase {
         this.data.orders = [];
       }
 
-      // 1. Purge corrupted manual records for this symbol (or records with blank symbol)
+      // 1. Purge corrupted manual records for target symbol (or records with blank symbol)
       this.data.orders = this.data.orders.filter((o) => {
         const isManual =
           (o.id && o.id.startsWith("manual_")) ||
@@ -1501,7 +1548,7 @@ export class BotDatabase {
           o.reason?.includes("Manual") ||
           o.levelDesc?.includes("Manual");
         if (isManual) {
-          if (!o.symbol || this.matchesSymbol(o, normSym)) {
+          if (!o.symbol || isPortfolioAll || this.matchesSymbol(o, normSym)) {
             purgedCount++;
             return false;
           }
@@ -1520,6 +1567,7 @@ export class BotDatabase {
           const isBot =
             o.reason &&
             !o.reason.includes("Binance Account Trade") &&
+            !o.reason.includes("Alpaca Account Trade") &&
             (o.action === "CUT" ||
               o.action === "TAKE_PROFIT" ||
               o.action === "SNIPE_BUY" ||
@@ -1536,23 +1584,27 @@ export class BotDatabase {
         if (o.tradeId) ordersByTradeId.set(o.tradeId.toString(), o);
       }
 
-      // 3. Reconcile or insert each Binance trade
+      const touchedSymbols = new Set<string>();
+
+      // 3. Reconcile or insert each exchange trade
       for (const t of trades) {
-        const tId = t.id.toString();
-        const oId = t.orderId.toString();
+        const tId = String(t.id ?? "");
+        const oId = String(t.orderId ?? "");
         const side: "BUY" | "SELL" = t.isBuyer ? "BUY" : "SELL";
         const price = Number(t.price);
         const qty = Number(t.qty);
         const quoteQty = Number(t.quoteQty || price * qty);
         const fee = Number(t.commission || 0);
-        const feeAsset = t.commissionAsset || "";
-        const time = Number(t.time);
+        const feeAsset = t.commissionAsset || (exName === "alpaca" ? "USD" : "");
+        const time = toMs(t.time);
+        const tradeSym = String(t.symbol || normSym || "UNKNOWN").toUpperCase().replace(/[\/\-_:]/g, "");
+        if (tradeSym) touchedSymbols.add(tradeSym);
 
         // Find existing order strictly by tradeId first (every execution fill has a unique tradeId)
         let existing = ordersByTradeId.get(tId);
 
         // If not found by tradeId, check if an existing order has the same oId BUT has NO tradeId assigned yet
-        if (!existing) {
+        if (!existing && oId) {
           const ord = ordersByOrderId.get(oId);
           if (ord && !ord.tradeId) {
             existing = ord;
@@ -1564,7 +1616,7 @@ export class BotDatabase {
           existing = this.data.orders.find((o) => {
             if (o.tradeId) return false;
             if (o.side !== side) return false;
-            if (!this.matchesSymbol(o, normSym)) return false;
+            if (!this.matchesSymbol(o, tradeSym)) return false;
             const timeDiff = Math.abs((o.fillTime || o.placedTime || o.time) - time);
             const priceDiff = Math.abs(o.price - price) / (price || 1);
             return timeDiff < 15000 && priceDiff < 0.01;
@@ -1574,6 +1626,7 @@ export class BotDatabase {
         if (existing) {
           existing.orderId = oId;
           existing.tradeId = tId;
+          existing.symbol = tradeSym;
           existing.status = "FILLED";
           existing.fillPrice = price;
           existing.fillTime = time;
@@ -1588,10 +1641,11 @@ export class BotDatabase {
             existing.action = side === "BUY" ? "BUY_FILL" : "SELL_FILL";
           }
           ordersByTradeId.set(tId, existing);
-          ordersByOrderId.set(oId, existing);
+          if (oId) ordersByOrderId.set(oId, existing);
           const isBot =
             existing.reason &&
             !existing.reason.includes("Binance Account Trade") &&
+            !existing.reason.includes("Alpaca Account Trade") &&
             (existing.action === "CUT" ||
               existing.action === "TAKE_PROFIT" ||
               existing.action === "SNIPE_BUY" ||
@@ -1601,14 +1655,13 @@ export class BotDatabase {
               (existing as any).type === "TP1_EMA25" ||
               (existing as any).type === "TP2_RUNNER" ||
               (existing as any).type === "BUY_HOOK");
-          if (isBot) {
+          if (isBot && oId) {
             botOrdersByOrderId.set(oId, existing);
           }
           syncedCount++;
         } else {
-          // If this is a subsequent partial fill for a known bot order, inherit bot action & reason
-          const parentOrder = botOrdersByOrderId.get(oId) || ordersByOrderId.get(oId);
-          const isBotOrder = parentOrder && parentOrder.reason && !parentOrder.reason.includes("Binance Account Trade");
+          const parentOrder = oId ? (botOrdersByOrderId.get(oId) || ordersByOrderId.get(oId)) : undefined;
+          const isBotOrder = parentOrder && parentOrder.reason && !parentOrder.reason.includes("Binance Account Trade") && !parentOrder.reason.includes("Alpaca Account Trade");
 
           const action = isBotOrder && parentOrder.action
             ? parentOrder.action
@@ -1616,18 +1669,25 @@ export class BotDatabase {
 
           const reason = isBotOrder && parentOrder.reason
             ? parentOrder.reason
-            : (side === "BUY" ? "Binance Account Trade (BUY)" : "Binance Account Trade (SELL)");
+            : `${exTitle} Account Trade (${side})`;
 
           const levelDesc = isBotOrder && parentOrder.levelDesc
             ? parentOrder.levelDesc
             : (side === "BUY" ? "Reconciled Buy Fill" : "Reconciled Sell Fill");
 
+          const quoteAsset = exName === "alpaca"
+            ? "USD"
+            : (tradeSym.endsWith("USDT") ? "USDT" : tradeSym.endsWith("FDUSD") ? "FDUSD" : "USDC");
+          const baseAsset = exName === "alpaca"
+            ? tradeSym
+            : tradeSym.replace(/(USDT|FDUSD|USDC|USDSO|BUSD)$/i, "");
+
           const newOrder: UnifiedOrderRecord = {
-            id: `bin_${time}_${tId}`,
+            id: `${exName.slice(0, 3)}_${time}_${tId}`,
             orderId: oId,
-            symbol: normSym,
-            baseAsset: normSym.replace(/(USDT|FDUSD|USDC|USDSO|BUSD)$/i, ""),
-            quoteAsset: normSym.endsWith("USDT") ? "USDT" : normSym.endsWith("FDUSD") ? "FDUSD" : "USDC",
+            symbol: tradeSym,
+            baseAsset,
+            quoteAsset,
             side,
             price,
             qty,
@@ -1658,8 +1718,8 @@ export class BotDatabase {
           }
           this.data.orders.unshift(newOrder);
           ordersByTradeId.set(tId, newOrder);
-          ordersByOrderId.set(oId, newOrder);
-          if (isBotOrder) {
+          if (oId) ordersByOrderId.set(oId, newOrder);
+          if (isBotOrder && oId) {
             botOrdersByOrderId.set(oId, newOrder);
           }
           syncedCount++;
@@ -1672,6 +1732,7 @@ export class BotDatabase {
           o.orderId &&
           o.reason &&
           !o.reason.includes("Binance Account Trade") &&
+          !o.reason.includes("Alpaca Account Trade") &&
           (o.action === "CUT" ||
             o.action === "TAKE_PROFIT" ||
             o.action === "SNIPE_BUY" ||
@@ -1688,7 +1749,7 @@ export class BotDatabase {
 
       let healedCount = 0;
       for (const o of this.data.orders) {
-        if (o.orderId && o.reason?.includes("Binance Account Trade")) {
+        if (o.orderId && (o.reason?.includes("Binance Account Trade") || o.reason?.includes("Alpaca Account Trade"))) {
           const parent = botOrdersByOrderId.get(o.orderId.toString());
           if (parent) {
             o.action = parent.action;
@@ -1704,23 +1765,29 @@ export class BotDatabase {
         }
       }
       if (healedCount > 0) {
-        this.log(`🛡️ [syncRecentTradesFromBinance] Auto-healed ${healedCount} split partial fill(s) to retain bot action/reason`);
+        this.log(`🛡️ [syncRecentTradesFromExchange] Auto-healed ${healedCount} split partial fill(s)`);
       }
 
       // Sort all orders descending by time so newest orders appear at top
       this.data.orders.sort((a, b) => (b.fillTime || b.placedTime || b.time) - (a.fillTime || a.placedTime || a.time));
 
-      // 4. Recalculate FIFO PnL
-      this.recalculateFifoPnlForSymbol(normSym);
+      // Recalculate FIFO PnL
+      if (normSym) {
+        this.recalculateFifoPnlForSymbol(normSym);
+      } else {
+        for (const s of touchedSymbols) {
+          this.recalculateFifoPnlForSymbol(s);
+        }
+      }
 
       this.log(
-        `✅ [syncRecentTradesFromBinance] Reconciled ${syncedCount} trade(s) from Binance, purged ${purgedCount} invalid manual record(s)`,
+        `✅ [syncRecentTradesFromExchange] Reconciled ${syncedCount} trade(s) from ${exTitle}, purged ${purgedCount} invalid manual record(s)`,
       );
       this.isDirty = true;
       this.flushSync();
       return { success: true, synced: syncedCount, purged: purgedCount };
     } catch (err: any) {
-      this.log(`❌ [syncRecentTradesFromBinance] failed: ${err.message}`);
+      this.log(`❌ [syncRecentTradesFromExchange] failed: ${err.message}`);
       return { success: false, synced: 0, purged: 0, error: err.message };
     }
   }
@@ -2353,7 +2420,7 @@ export class BotDatabase {
   public getTrades(limit = 5000, symbol?: string): UnifiedOrderRecord[] {
     let list = this.data.orders
       .filter((o) => o.status === "FILLED" || o.fillTime !== undefined || ["BUY_FILL", "SELL_FILL", "CUT", "TAKE_PROFIT", "SNIPE_BUY", "SNIPE_SELL"].includes(o.action));
-    if (symbol) {
+    if (symbol && symbol !== "ALL" && symbol !== "__PORTFOLIO__") {
       list = list.filter((o) => this.matchesSymbol(o, symbol));
     }
     return list.slice(0, limit);
@@ -2361,7 +2428,7 @@ export class BotDatabase {
 
   public getOrderActivity(limit = 5000, symbol?: string): UnifiedOrderRecord[] {
     let list = this.data.orders;
-    if (symbol) {
+    if (symbol && symbol !== "ALL" && symbol !== "__PORTFOLIO__") {
       list = list.filter((o) => this.matchesSymbol(o, symbol));
     }
     return list.slice(0, limit);
@@ -2369,6 +2436,68 @@ export class BotDatabase {
 
   public getTradeRounds(symbol?: string): TradeRoundsResult {
     const activeSym = symbol || this.data.settings?.symbol || this.data.state?.baseAsset;
+    if (activeSym === "ALL" || activeSym === "__PORTFOLIO__") {
+      const grouped = new Map<string, UnifiedOrderRecord[]>();
+      for (const o of this.data.orders) {
+        const sym = String(o.symbol || o.baseAsset || "UNKNOWN").toUpperCase().replace(/[\/\-_:]/g, "");
+        const arr = grouped.get(sym) || [];
+        arr.push(o);
+        grouped.set(sym, arr);
+      }
+      const allRounds: TradeRound[] = [];
+      for (const [sym, groupOrders] of grouped.entries()) {
+        const res = calculateTradeRounds(groupOrders, sym);
+        for (const r of res.rounds) {
+          allRounds.push({ ...r, symbol: sym } as any);
+        }
+      }
+      allRounds.sort((a, b) => (b.endTime || b.startTime || 0) - (a.endTime || a.startTime || 0));
+      allRounds.forEach((r, idx) => {
+        r.roundNumber = allRounds.length - idx;
+      });
+      const closed = allRounds.filter((r) => r.status === "CLOSED");
+      const wins = closed.filter((r) => (r.netPnlQuote ?? r.grossPnlQuote ?? 0) > 0);
+      const losses = closed.filter((r) => (r.netPnlQuote ?? r.grossPnlQuote ?? 0) <= 0);
+      const totalBoughtBase = allRounds.reduce((s, r) => s + (r.buyQty || 0), 0);
+      const totalBoughtQuote = allRounds.reduce((s, r) => s + (r.buyCostQuote || 0), 0);
+      const totalSoldBase = allRounds.reduce((s, r) => s + (r.sellQty || 0), 0);
+      const totalSoldQuote = allRounds.reduce((s, r) => s + (r.sellProceedsQuote || 0), 0);
+      const totalGrossPnlQuote = allRounds.reduce((s, r) => s + (r.grossPnlQuote || 0), 0);
+      const totalNetPnlQuote = allRounds.reduce((s, r) => s + (r.netPnlQuote ?? r.grossPnlQuote ?? 0), 0);
+      const totalFeeQuote = allRounds.reduce((s, r) => s + (r.totalFeeQuote || 0), 0);
+      const totalCreateGasQuote = allRounds.reduce((s, r) => s + (r.createGasQuote || 0), 0);
+      const totalCancelGasQuote = allRounds.reduce((s, r) => s + (r.cancelGasQuote || 0), 0);
+      const totalGasQuote = allRounds.reduce((s, r) => s + (r.totalGasQuote || 0), 0);
+      const totalGasUsdso = allRounds.reduce((s, r) => s + (r.totalGasUsdso || 0), 0);
+      return {
+        rounds: allRounds,
+        summary: {
+          totalRounds: allRounds.length,
+          closedRounds: closed.length,
+          openRounds: allRounds.filter((r) => r.status === "HOLDING").length,
+          winRounds: wins.length,
+          lossRounds: losses.length,
+          winRatePct: closed.length > 0 ? (wins.length / closed.length) * 100 : 100,
+          totalBoughtBase,
+          totalBoughtQuote,
+          avgBuyPriceOverall: totalBoughtBase > 0 ? totalBoughtQuote / totalBoughtBase : 0,
+          totalSoldBase,
+          totalSoldQuote,
+          avgSellPriceOverall: totalSoldBase > 0 ? totalSoldQuote / totalSoldBase : 0,
+          totalGrossPnlQuote,
+          totalGrossPnlUsdso: totalGrossPnlQuote,
+          totalCreateGasQuote,
+          totalCreateGasUsdso: totalCreateGasQuote,
+          totalCancelGasQuote,
+          totalCancelGasUsdso: totalCancelGasQuote,
+          totalGasQuote,
+          totalGasUsdso,
+          totalFeeQuote,
+          totalNetPnlQuote,
+          totalNetPnlUsdso: totalNetPnlQuote,
+        },
+      };
+    }
     return calculateTradeRounds(this.data.orders, activeSym);
   }
 

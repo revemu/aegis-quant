@@ -19,6 +19,7 @@ import type {
   StrategyEvent,
   Lot,
   OpenOrder,
+  MarketClockInfo,
 } from "../types.js";
 import type { SwingStrategyConfig } from "./config.js";
 import { SwingSignalDetector, type SwingSignalResult } from "./signals.js";
@@ -294,8 +295,11 @@ export class SwingTraderStrategy implements IStrategy {
     return this.isPaused;
   }
 
-  public setMarketClosed(closed: boolean): void {
+  private marketClock?: MarketClockInfo;
+
+  public setMarketClosed(closed: boolean, marketClock?: MarketClockInfo): void {
     this.isMarketClosed = closed;
+    if (marketClock) this.marketClock = marketClock;
   }
 
   public getEffectiveGasReserveBase(): number {
@@ -2023,6 +2027,10 @@ export class SwingTraderStrategy implements IStrategy {
       realizedPnl: this.realizedPnl,
       tradeRealizedPnl: this.realizedPnl,
       dryRun: Boolean(this.cfg.dryRun),
+      alpacaBaseUrl: this.cfg.alpacaBaseUrl,
+      isMarketClosed: this.isMarketClosed,
+      marketClock: this.marketClock,
+      executionTimeframe: this.cfg.dowTimeframe || "15m",
       isPaused: this.isPaused,
       strategyType: this.strategyType,
       strategyName: this.name,

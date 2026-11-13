@@ -17,6 +17,7 @@ import {
   type StrategyEvent,
   type Lot,
   type OpenOrder,
+  type MarketClockInfo,
 } from "../types.js";
 import { MaFanStrategy } from "./strategy.js";
 import { MaFanConfig } from "./types.js";
@@ -304,6 +305,8 @@ export class MaFanTradingStrategy implements IStrategy {
       baseHeld,
       inventoryUsdso: baseHeld * (this.currentMid || 0),
       dryRun: this.cfg.dryRun,
+      alpacaBaseUrl: this.cfg.alpacaBaseUrl,
+      marketClock: this.marketClock,
       time: Date.now(),
     };
 
@@ -548,8 +551,11 @@ export class MaFanTradingStrategy implements IStrategy {
     return this.maFan.getIsPaused();
   }
 
-  public setMarketClosed(closed: boolean): void {
+  private marketClock?: MarketClockInfo;
+
+  public setMarketClosed(closed: boolean, marketClock?: MarketClockInfo): void {
     this.maFan.setMarketClosed(closed);
+    if (marketClock) this.marketClock = marketClock;
   }
 
   public async cancelAllOrdersUser(): Promise<{ cancelledCount: number }> {
