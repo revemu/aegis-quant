@@ -7,6 +7,7 @@
 import type { Config } from "../../config.js";
 import type { IExchangeClient, ExchangeSymbolInfo } from "../../exchange/types.js";
 import { fetchAlpacaMultiSnapshots, normalizeStockSymbol } from "../../exchange/alpaca/feed.js";
+import { AlpacaPortfolioWsClient } from "../../exchange/alpaca/ws.js";
 import type { Candle } from "../../market-structure.js";
 import type { AtrSource } from "../../types.js";
 import { BotDatabase, getDatabase, type PortfolioSlotRecord, type UnifiedOrderRecord } from "../../db.js";
@@ -86,6 +87,14 @@ export class MaFanPortfolioStrategy implements IStrategy {
   private lastTelemetryEmitTs: number = 0;
   private universeFetchPromise: Promise<void> | null = null;
 
+  // Real-time Alpaca WebSocket hybrid stream (<= 30 symbols) & live chart sync
+  private alpacaWs?: AlpacaPortfolioWsClient;
+  private wsConnected: boolean = false;
+  private lastWsCredsKey: string = "";
+  private lastChartEmitTs: number = 0;
+  private lastSyncedClosed15mBySymbol = new Map<string, number>();
+  private lastSyncedClosed1hBySymbol = new Map<string, number>();
+
   constructor(context: StrategyContext) {
     this.exchange = context.exchange;
     this.symbolInfo = context.symbolInfo;
@@ -146,6 +155,152 @@ export class MaFanPortfolioStrategy implements IStrategy {
 
   public getIntervalMs(): number {
     return Math.max(500, this.cfg.intervalMs || 1000);
+  }
+
+  public stop(): void {
+    if (this.alpacaWs) {
+      this.alpacaWs.stop();
+      this.alpacaWs = undefined;
+    }
+    this.wsConnected = false;
+    this.lastWsCredsKey = "";
+  }
+
+  private ensureAlpacaWs(): void {
+    if (this.exchange.exchangeName !== "alpaca") {
+      if (this.alpacaWs) this.stop();
+      return;
+    }
+    const creds = this.resolveAlpacaCreds();
+    if (!creds.apiKey || !creds.apiSecret) return;
+
+    const credsKey = `${creds.apiKey}:${creds.dataUrl}`;
+    if (this.alpacaWs && this.lastWsCredsKey === credsKey) {
+      return;
+    }
+
+    this.alpacaWs?.stop();
+    this.lastWsCredsKey = credsKey;
+    this.alpacaWs = new AlpacaPortfolioWsClient({
+      apiKey: creds.apiKey,
+      apiSecret: creds.apiSecret,
+      dataUrl: creds.dataUrl,
+      onPriceUpdate: (sym, price, tsMs) => this.handleWsPriceUpdate(sym, price, tsMs),
+      onStatusChange: (connected) => {
+        this.wsConnected = connected;
+      },
+      log: (msg) => this.log(msg),
+    });
+    this.alpacaWs.start();
+    this.syncAlpacaWsSubscriptions();
+  }
+
+  private syncAlpacaWsSubscriptions(): void {
+    if (!this.alpacaWs) return;
+    // Strict priority order within Alpaca Basic 30-symbol limit:
+    // 1. Macro benchmark (SPY)
+    // 2. Active held slots (3 slots)
+    // 3. Currently inspected chart ticker
+    // 4. Radar candidates sorted by stage (PULLBACK_READY > WAITING_PULLBACK > BOTTOM_FAN > rest)
+    const ordered = [
+      this.benchmarkSymbol,
+      ...this.slots.map((s) => s.symbol),
+      this.inspectedSymbol,
+      ...this.radarList.map((r) => r.symbol),
+    ].filter(Boolean);
+    this.alpacaWs.setSymbols(ordered);
+  }
+
+  private updateCandleBarWithLivePrice(candles: Candle[], periodSec: number, price: number, tsMs: number): boolean {
+    if (!candles || candles.length === 0 || !Number.isFinite(price) || price <= 0) return false;
+    const sec = Math.floor(tsMs / 1000);
+    const bucketTime = Math.floor(sec / periodSec) * periodSec;
+    const last = candles[candles.length - 1];
+
+    if (last && last.time === bucketTime) {
+      const changed = price !== last.close || price > last.high || price < last.low;
+      last.high = Math.max(last.high, price);
+      last.low = Math.min(last.low, price);
+      last.close = price;
+      last.isClosed = false;
+      return changed;
+    }
+
+    if (!last || bucketTime > last.time) {
+      if (last && last.isClosed === false) {
+        last.isClosed = true;
+      }
+      candles.push({
+        time: bucketTime,
+        open: price,
+        high: price,
+        low: price,
+        close: price,
+        volume: 0,
+        isClosed: false,
+      });
+      if (candles.length > 400) candles.shift();
+      return true;
+    }
+    return false;
+  }
+
+  private emitInspectedChartCandles(opts: { force?: boolean; includeNewlyClosed?: boolean } = {}): void {
+    const now = Date.now();
+    if (!opts.force && now - this.lastChartEmitTs < 250) return;
+
+    const sym = this.inspectedSymbol || this.slots[0]?.symbol || this.radarList[0]?.symbol || "";
+    const ind = sym ? this.snapshots.get(sym) : undefined;
+    if (!ind) return;
+
+    this.lastChartEmitTs = now;
+
+    if (opts.includeNewlyClosed) {
+      if (ind.c15.length >= 2) {
+        const closed15 = ind.c15[ind.c15.length - 2]!;
+        if (closed15.isClosed !== false && closed15.time > (this.lastSyncedClosed15mBySymbol.get(sym) || 0)) {
+          this.lastSyncedClosed15mBySymbol.set(sym, closed15.time);
+          this.emit({ type: "candle", data: { candle: { ...closed15 }, isClosed: true } });
+        }
+      }
+      if (ind.c1h.length >= 2) {
+        const closed1h = ind.c1h[ind.c1h.length - 2]!;
+        if (closed1h.isClosed !== false && closed1h.time > (this.lastSyncedClosed1hBySymbol.get(sym) || 0)) {
+          this.lastSyncedClosed1hBySymbol.set(sym, closed1h.time);
+          this.emit({ type: "htf_candle", data: { candle: { ...closed1h }, isClosed: true } });
+        }
+      }
+    }
+
+    const latest15 = ind.c15[ind.c15.length - 1];
+    if (latest15) {
+      this.emit({ type: "candle", data: { candle: { ...latest15 }, isClosed: latest15.isClosed !== false } });
+    }
+    const latest1h = ind.c1h[ind.c1h.length - 1];
+    if (latest1h) {
+      this.emit({ type: "htf_candle", data: { candle: { ...latest1h }, isClosed: latest1h.isClosed !== false } });
+    }
+  }
+
+  private handleWsPriceUpdate(sym: string, price: number, tsMs: number): void {
+    const ind = this.snapshots.get(sym);
+    if (ind) {
+      ind.livePrice = price;
+      this.updateCandleBarWithLivePrice(ind.c15, 900, price, tsMs);
+      this.updateCandleBarWithLivePrice(ind.c1h, 3600, price, tsMs);
+    }
+    if (sym === this.benchmarkSymbol && this.benchmark15m.length > 0) {
+      this.updateCandleBarWithLivePrice(this.benchmark15m, 900, price, tsMs);
+    }
+
+    const isInspected = sym === this.inspectedSymbol;
+    const isHeldSlot = this.slots.some((s) => s.symbol === sym);
+    if (isInspected) {
+      this.emitInspectedChartCandles({ force: false });
+    }
+    if ((isInspected || isHeldSlot) && Date.now() - this.lastTelemetryEmitTs >= 400) {
+      this.emitTelemetryTick();
+    }
   }
 
   public onEvent(cb: (event: StrategyEvent) => void): void {
@@ -327,6 +482,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
   }
 
   public updateExchangeClient(newExchange: IExchangeClient, nextInfo: ExchangeSymbolInfo, atrSource: AtrSource): void {
+    this.stop();
     this.exchange = newExchange;
     this.symbolInfo = nextInfo;
     this.atrSource = atrSource;
@@ -335,6 +491,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
     this.radarList = [];
     this.lastUniverseFetchTs = 0;
     this.inspectedSymbol = this.resolveInitialInspectedSymbol();
+    this.ensureAlpacaWs();
     this.emitTelemetryTick();
   }
 
@@ -397,6 +554,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       }
     }
 
+    this.syncAlpacaWsSubscriptions();
     this.emitTelemetryTick();
     return this.getInspectPayload();
   }
@@ -628,6 +786,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
     try {
       const now = Date.now();
       const creds = this.resolveAlpacaCreds();
+      this.ensureAlpacaWs();
 
       // 1. Periodically refresh full Universe 15m + 1h bars (every 60s when open, 5m when market closed, or immediately on boot)
       const universeRefreshMs = this.isMarketClosed ? 300_000 : 60_000;
@@ -685,6 +844,13 @@ export class MaFanPortfolioStrategy implements IStrategy {
     this.benchmark15m = res.benchmark15m;
 
     for (const [sym, ind] of res.snapshots.entries()) {
+      const wsTickAt = this.alpacaWs?.getSymbolLastTickAt(sym) || 0;
+      const prevSnap = this.snapshots.get(sym);
+      if (wsTickAt > Date.now() - 15_000 && prevSnap && prevSnap.livePrice > 0) {
+        ind.livePrice = prevSnap.livePrice;
+        this.updateCandleBarWithLivePrice(ind.c15, 900, prevSnap.livePrice, wsTickAt);
+        this.updateCandleBarWithLivePrice(ind.c1h, 3600, prevSnap.livePrice, wsTickAt);
+      }
       this.snapshots.set(sym, ind);
     }
 
@@ -694,9 +860,12 @@ export class MaFanPortfolioStrategy implements IStrategy {
     }
 
     this.lastUniverseFetchTs = Date.now();
+    this.syncAlpacaWsSubscriptions();
+    this.emitInspectedChartCandles({ force: true, includeNewlyClosed: true });
   }
 
   private async refreshLiveQuotes(creds: { apiKey: string; apiSecret: string; dataUrl: string }): Promise<void> {
+    const nowMs = Date.now();
     if (this.exchange.exchangeName === "alpaca") {
       const watchSyms = Array.from(
         new Set([
@@ -706,13 +875,25 @@ export class MaFanPortfolioStrategy implements IStrategy {
           ...this.radarList.slice(0, 20).map((r) => r.symbol),
         ].filter(Boolean)),
       );
-      if (watchSyms.length === 0) return;
-      const snaps = await fetchAlpacaMultiSnapshots({ symbols: watchSyms, ...creds }).catch(() => new Map());
+      const wsHealthy = Boolean(this.alpacaWs?.isConnected());
+      const targetsToPoll = wsHealthy
+        ? watchSyms.filter((s) => nowMs - (this.alpacaWs?.getSymbolLastTickAt(s) || 0) >= 12_000)
+        : watchSyms;
+      if (targetsToPoll.length === 0) return;
+
+      const snaps = await fetchAlpacaMultiSnapshots({ symbols: targetsToPoll, ...creds }).catch(() => new Map());
+      let inspectedUpdated = false;
       for (const [sym, book] of snaps.entries()) {
         const ind = this.snapshots.get(sym);
         if (ind && book.mid > 0) {
           ind.livePrice = book.mid;
+          this.updateCandleBarWithLivePrice(ind.c15, 900, book.mid, nowMs);
+          this.updateCandleBarWithLivePrice(ind.c1h, 3600, book.mid, nowMs);
+          if (sym === this.inspectedSymbol) inspectedUpdated = true;
         }
+      }
+      if (inspectedUpdated) {
+        this.emitInspectedChartCandles({ force: true });
       }
       return;
     }
@@ -724,9 +905,18 @@ export class MaFanPortfolioStrategy implements IStrategy {
       if (!res.ok) return;
       const list = (await res.json()) as Array<{ symbol: string; price: string }>;
       const priceMap = new Map(list.map((p) => [p.symbol, parseFloat(p.price)]));
+      let inspectedUpdated = false;
       for (const [sym, ind] of this.snapshots.entries()) {
         const p = priceMap.get(sym);
-        if (p && p > 0) ind.livePrice = p;
+        if (p && p > 0) {
+          ind.livePrice = p;
+          this.updateCandleBarWithLivePrice(ind.c15, 900, p, nowMs);
+          this.updateCandleBarWithLivePrice(ind.c1h, 3600, p, nowMs);
+          if (sym === this.inspectedSymbol) inspectedUpdated = true;
+        }
+      }
+      if (inspectedUpdated) {
+        this.emitInspectedChartCandles({ force: true });
       }
     } catch {}
   }
@@ -990,6 +1180,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
     };
     newRadar.sort((a, b) => (stageWeight[b.stage] + b.score) - (stageWeight[a.stage] + a.score));
     this.radarList = newRadar;
+    this.syncAlpacaWsSubscriptions();
 
     // 3. Allocate Free Slots if Entries Ready & Allowed
     const maxSlots = this.getMaxSlots();
@@ -1466,6 +1657,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
         inspectedEmas: inspectedSlot?.emas || this.radarList.find((r) => r.symbol === inspectedSym) || null,
         tp1Mode: this.cfg.portfolioTp1TargetMode || "EMA200",
         disasterSlPct: Number(this.cfg.portfolioDisasterSlPct ?? 3.5),
+        wsConnected: this.wsConnected,
+        wsSubscribedCount: this.alpacaWs?.getSubscribedSymbols().length || 0,
       },
     };
 

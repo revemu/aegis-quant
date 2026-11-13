@@ -2128,6 +2128,49 @@
     }
   }
 
+  function upsertCandleInCache(cache, formatted) {
+    if (!Array.isArray(cache)) return;
+    const idx = cache.findIndex((c) => c.time === formatted.time);
+    if (idx >= 0) {
+      cache[idx] = formatted;
+    } else {
+      cache.push(formatted);
+      if (cache.length >= 2 && cache[cache.length - 2].time > formatted.time) {
+        cache.sort((a, b) => a.time - b.time);
+      }
+    }
+  }
+
+  function applyActiveSingleCandleUpdate(formatted, cacheArray, isPrimary) {
+    if (isPrimary) {
+      cachedCandlesMap.set(formatted.time, formatted);
+    }
+    if (!candleSeries) return;
+    try {
+      const isNewerOrCurrent = !latestCandleTime || formatted.time >= latestCandleTime;
+      if (isNewerOrCurrent) {
+        latestCandle = formatted;
+        latestCandleTime = Math.max(latestCandleTime, formatted.time);
+        renderOhlc(latestCandle);
+        candleSeries.update(formatted);
+      } else {
+        const cleanCandles = formatCandles(cacheArray);
+        if (cleanCandles.length > 0) {
+          candleSeries.setData(cleanCandles);
+          if (isPrimary) syncCachedCandlesMap(cleanCandles);
+          latestCandle = cleanCandles[cleanCandles.length - 1];
+          latestCandleTime = latestCandle.time;
+          renderOhlc(latestCandle);
+        }
+      }
+      updateOrderBadgesPositions();
+      updateSwingBadgesPositions();
+      updateMaFanRibbonLinesThrottled(cacheArray);
+    } catch (err) {
+      console.warn("Error updating single candle:", err);
+    }
+  }
+
   function updateSingleCandle(candle) {
     if (!candle || typeof candle.time !== "number") return;
     if (![candle.open, candle.high, candle.low, candle.close].every(Number.isFinite)) return;
@@ -2140,29 +2183,13 @@
       close: Number(candle.close),
     };
 
-    if (cachedPrimaryCandles) {
-      const idx = cachedPrimaryCandles.findIndex((c) => c.time === formatted.time);
-      if (idx >= 0) cachedPrimaryCandles[idx] = formatted;
-      else cachedPrimaryCandles.push(formatted);
-    }
+    upsertCandleInCache(cachedPrimaryCandles, formatted);
     pendingCandles = cachedPrimaryCandles;
-    cachedCandlesMap.set(formatted.time, formatted);
 
     if (currentActiveTimeframe === "15m") {
-      latestCandle = formatted;
-      renderOhlc(latestCandle);
-
-      if (candleSeries) {
-        try {
-          candleSeries.update(formatted);
-          latestCandleTime = Math.max(latestCandleTime, candle.time);
-          updateOrderBadgesPositions();
-          updateSwingBadgesPositions();
-          updateMaFanRibbonLinesThrottled(cachedPrimaryCandles);
-        } catch (err) {
-          console.warn("Error updating single candle:", err);
-        }
-      }
+      applyActiveSingleCandleUpdate(formatted, cachedPrimaryCandles, true);
+    } else {
+      cachedCandlesMap.set(formatted.time, formatted);
     }
   }
 
@@ -2178,27 +2205,10 @@
       close: Number(candle.close),
     };
 
-    if (cachedHtfCandles) {
-      const idx = cachedHtfCandles.findIndex((c) => c.time === formatted.time);
-      if (idx >= 0) cachedHtfCandles[idx] = formatted;
-      else cachedHtfCandles.push(formatted);
-    }
+    upsertCandleInCache(cachedHtfCandles, formatted);
 
     if (currentActiveTimeframe === "4h") {
-      latestCandle = formatted;
-      renderOhlc(latestCandle);
-
-      if (candleSeries) {
-        try {
-          candleSeries.update(formatted);
-          latestCandleTime = Math.max(latestCandleTime, candle.time);
-          updateOrderBadgesPositions();
-          updateSwingBadgesPositions();
-          updateMaFanRibbonLinesThrottled(cachedPrimaryCandles);
-        } catch (err) {
-          console.warn("Error updating single HTF candle:", err);
-        }
-      }
+      applyActiveSingleCandleUpdate(formatted, cachedHtfCandles, false);
     }
   }
 

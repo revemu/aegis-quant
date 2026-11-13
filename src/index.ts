@@ -299,7 +299,9 @@ async function main(): Promise<void> {
     htfFeed.onCandle((candle, isClosed) => {
       if (isClosed) {
         htfDowEngine.addCandle(candle);
-        dashboard?.addHtfCandle(candle, isClosed);
+        if (gridRef?.strategyType !== "ma_fan_portfolio") {
+          dashboard?.addHtfCandle(candle, isClosed);
+        }
         (grid as any).onHtfCandleClosed?.(candle);
       }
     });
@@ -662,6 +664,7 @@ async function main(): Promise<void> {
         log(`🔄 [STRATEGY SWITCH] Switching active strategy from ${prevConfig.strategyType || "dynamic_grid"} to ${nextStrat}...`);
         try {
           await grid.cancelAllOrdersUser();
+          grid.stop?.();
           const targetStrategyType = nextStrat;
           const currentConfig = grid.getRuntimeConfig();
           const cleanS = { ...s };
@@ -700,8 +703,10 @@ async function main(): Promise<void> {
           grid.getDatabase().setSetting("strategyType", targetStrategyType);
           wireFeedsToGrid();
           macroFeed?.onCandle((candle, isClosed) => {
-            macroDowEngine.addCandle(candle);
-            dashboard.addCandle(candle, isClosed);
+            if (grid.strategyType !== "ma_fan_portfolio") {
+              macroDowEngine.addCandle(candle);
+              dashboard.addCandle(candle, isClosed);
+            }
             if (isClosed) {
               grid.onCandleClosed(candle);
               wakeSleep?.();
@@ -710,21 +715,15 @@ async function main(): Promise<void> {
           macroFeed?.start();
           tradingFeed?.start();
           htfFeed?.start();
-          grid.onEvent((event) => {
-            if (event.type === "tick") {
-              dashboard.updateTick(event.data);
-            } else if (event.type === "order") {
-              dashboard.addOrder(event.data);
-            } else if (event.type === "order_gas") {
-              dashboard.updateOrderGas(event.data.txHash, event.data.gasFeeBase, event.data.gasFeeQuote);
-            }
-          });
+          wireStrategyEventsToDashboard(grid);
           await grid.syncOnChainOrders();
           await grid.refreshWalletBalances();
           if (targetStrategyType === "ma_fan_portfolio") {
             await grid.tick().catch(() => {});
             const portCandles = grid.getChartCandles?.();
             if (portCandles?.length) dashboard.setInitialCandles(portCandles);
+            const portHtfCandles = grid.getHtfChartCandles?.();
+            if (portHtfCandles?.length) dashboard.setInitialHtfCandles(portHtfCandles);
           }
           dashboard.setInitialOrders(grid.getRecentOrders());
           grid.emitTelemetryTick();
@@ -953,37 +952,48 @@ async function main(): Promise<void> {
   tradingFeed?.start();
   htfFeed?.start();
 
-  // Forward strategy events (ticks, buy/sell/cut executions, gas updates) to dashboard
-  grid.onEvent((event) => {
-    if (event.type === "tick") {
-      dashboard.updateTick(event.data);
-    } else if (event.type === "order") {
-      dashboard.addOrder(event.data);
-    } else if (event.type === "order_gas") {
-      dashboard.updateOrderGas(event.data.txHash, event.data.gasFeeBase, event.data.gasFeeQuote);
-    } else if (event.type === "position_flat") {
-      const cfg = grid.getRuntimeConfig();
-      if (cfg.enableAutoRotation && !grid.getIsPaused() && exchange.exchangeName === "binance") {
-        const currentSym = cfg.symbol || activeSymbol;
-        log(`🔄 [AUTO-ROTATION] Detected position flat (cycle closed) -> Evaluating market regime...`);
-        setTimeout(async () => {
-          try {
-            const res = await pairRotator.evaluateAndRotate({
-              currentSymbol: currentSym,
-              trigger: "POST_ROUND_EXIT",
-              cfg,
-            });
-            if (res.rotated && res.targetSymbol) {
-              log(`🚀 [AUTO-ROTATION] Rotating from ${currentSym} to ${res.targetSymbol} (${res.reason})`);
-              await onUpdateSettings({ symbol: res.targetSymbol });
+  // Forward strategy events (ticks, candles, buy/sell/cut executions, gas updates) to dashboard
+  function wireStrategyEventsToDashboard(targetGrid: IStrategy): void {
+    targetGrid.onEvent((event) => {
+      if (event.type === "tick") {
+        dashboard.updateTick(event.data);
+      } else if (event.type === "candle") {
+        if (event.data?.candle) {
+          dashboard.addCandle(event.data.candle, Boolean(event.data.isClosed));
+        }
+      } else if (event.type === "htf_candle") {
+        if (event.data?.candle) {
+          dashboard.addHtfCandle(event.data.candle, Boolean(event.data.isClosed));
+        }
+      } else if (event.type === "order") {
+        dashboard.addOrder(event.data);
+      } else if (event.type === "order_gas") {
+        dashboard.updateOrderGas(event.data.txHash, event.data.gasFeeBase, event.data.gasFeeQuote);
+      } else if (event.type === "position_flat") {
+        const cfg = targetGrid.getRuntimeConfig();
+        if (cfg.enableAutoRotation && !targetGrid.getIsPaused() && exchange.exchangeName === "binance") {
+          const currentSym = cfg.symbol || activeSymbol;
+          log(`🔄 [AUTO-ROTATION] Detected position flat (cycle closed) -> Evaluating market regime...`);
+          setTimeout(async () => {
+            try {
+              const res = await pairRotator.evaluateAndRotate({
+                currentSymbol: currentSym,
+                trigger: "POST_ROUND_EXIT",
+                cfg,
+              });
+              if (res.rotated && res.targetSymbol) {
+                log(`🚀 [AUTO-ROTATION] Rotating from ${currentSym} to ${res.targetSymbol} (${res.reason})`);
+                await onUpdateSettings({ symbol: res.targetSymbol });
+              }
+            } catch (e: any) {
+              log(`⚠️ [AUTO-ROTATION] Evaluation error: ${e.message}`);
             }
-          } catch (e: any) {
-            log(`⚠️ [AUTO-ROTATION] Evaluation error: ${e.message}`);
-          }
-        }, 3000);
+          }, 3000);
+        }
       }
-    }
-  });
+    });
+  }
+  wireStrategyEventsToDashboard(grid);
 
   let stop = false;
   process.on("SIGINT", () => {
@@ -1037,6 +1047,8 @@ async function main(): Promise<void> {
   if (grid.strategyType === "ma_fan_portfolio") {
     const portCandles = grid.getChartCandles?.();
     if (portCandles?.length) dashboard.setInitialCandles(portCandles);
+    const portHtfCandles = grid.getHtfChartCandles?.();
+    if (portHtfCandles?.length) dashboard.setInitialHtfCandles(portHtfCandles);
   }
 
   while (!stop) {
@@ -1094,6 +1106,7 @@ async function main(): Promise<void> {
     await interruptibleSleep(loopInterval > 0 ? loopInterval : 1000);
   }
 
+  grid.stop?.();
   dashboard.stop();
   macroFeed?.stop();
   tradingFeed?.stop();

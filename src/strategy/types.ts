@@ -50,7 +50,7 @@ export interface OpenOrder {
 }
 
 export interface StrategyEvent {
-  type: "tick" | "order" | "order_gas" | "position_flat";
+  type: "tick" | "order" | "order_gas" | "position_flat" | "candle" | "htf_candle";
   data: any;
 }
 
@@ -239,6 +239,7 @@ export interface IStrategy {
   // Lifecycle & Execution
   tick(): Promise<void>;
   getIntervalMs(): number;
+  stop?(): void;
 
   // Real-time Feeds & Events
   onCandleClosed(candle: Candle): void;

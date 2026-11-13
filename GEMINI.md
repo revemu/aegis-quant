@@ -9726,3 +9726,18 @@ When investigating live production behavior, debugging issues, or analyzing trad
      - ใน `MaFanPortfolioStrategy.emitTelemetryTick()` คำนวณ `realizedPnl` / `tradeRealizedPnl` จากรอบเทรดที่กรองตามกระดานแล้ว
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.75`** ใน `package.json` และ `src/version.ts`
+
+---
+
+## 321. v0.3.0.76 — Alpaca Real-Time WebSocket Hybrid (<= 30 Symbols) & Portfolio Live Chart Auto-Sync (`src/exchange/alpaca/ws.ts`, `src/strategy/ma-fan-portfolio/index.ts`, `src/index.ts`, `public/app.js`)
+
+- **Alpaca Real-Time WebSocket Hybrid Stream (`src/exchange/alpaca/ws.ts` & `src/exchange/alpaca/index.ts`)**:
+  - เพิ่ม `AlpacaPortfolioWsClient` เชื่อมต่อ `wss://stream.data.alpaca.markets/v2/iex` (รองรับทั้ง live และ sandbox URL ตาม `dataUrl`)
+  - บังคับเพดานตามแผน Free/Basic (`ALPACA_WS_MAX_SYMBOLS = 30`) อย่างเคร่งครัด จัดลำดับความสำคัญอัตโนมัติ: **1) Benchmark (`SPY`) -> 2) หุ้นที่ถือใน Slots -> 3) หุ้นที่เปิดกราฟ (`inspectedSymbol`) -> 4) Radar (`PULLBACK_READY` / `WAITING_PULLBACK` / Top Radar)** พร้อมส่ง `unsubscribe` ก่อน `subscribe` แบบ incremental diff และจัดการ `error 406` / heartbeat ping
+  - ผสมผสานกับ Polling: ใน `refreshLiveQuotes()` จะข้ามหุ้นที่เพิ่งได้ tick สดจาก WebSocket (< 12s) และใช้ REST Batch เฉพาะตัวที่ยังไม่สตรีมหรือค้าง ส่วน `refreshUniverseBars()` ยังคงสแกนแท่ง `15m` + `1h` ครบ 49 ตัวทุก 60 วินาที
+- **Portfolio Live Chart Auto-Update (`src/strategy/ma-fan-portfolio/index.ts`, `src/strategy/types.ts`, `src/index.ts`, `public/app.js`)**:
+  - เพิ่ม event `"candle"` และ `"htf_candle"` ใน `StrategyEvent` และ `wireStrategyEventsToDashboard()` ใน `src/index.ts` (พร้อมกันไม่ให้ `macroFeed` / `htfFeed` เดิมแทรกแท่งเทียนผิดตัวในโหมด `ma_fan_portfolio` และเรียก `grid.stop?.()` เมื่อสลับกลยุทธ์หรือปิดบอท)
+  - เมื่อได้ราคาสดจาก Alpaca WS หรือ REST Polling ของ `inspectedSymbol` ระบบจะอัปเดตแท่ง `15m` และ `1h` ปัจจุบัน (`open/high/low/close`) แล้วส่ง SSE `"candle"` / `"htf_candle"` ไปยังแดชบอร์ดทันที (และส่งแท่งที่เพิ่งปิดสมบูรณ์เมื่อครบ 15m/1h)
+  - ปรับปรุง `updateSingleCandle()` / `updateSingleHtfCandle()` ใน `public/app.js` ผ่าน helper `applyActiveSingleCandleUpdate()` ให้รองรับการแก้แท่งที่เพิ่งปิดสมบูรณ์ย้อนหลัง 1 แท่งโดยไม่รีเซ็ต zoom/pan ของกราฟ และส่ง `cachedHtfCandles` ถูกต้องเมื่อดู TF สูง
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.76`** ใน `package.json` และ `src/version.ts`
