@@ -47,6 +47,7 @@ export class MaFanStrategy {
   private lastEntryChecklist: EntryChecklist | null = null;
 
   private isPaused: boolean = true;
+  private isMarketClosed: boolean = false;
   private isProcessing: boolean = false;
   private log: (msg: string) => void;
   private onTrade?: (trade: any) => void;
@@ -229,7 +230,7 @@ export class MaFanStrategy {
    * Main Strategy Tick Step
    */
   public async step(refPrice: number): Promise<void> {
-    if (this.isProcessing || this.isPaused) return;
+    if (this.isProcessing || this.isPaused || this.isMarketClosed) return;
     this.isProcessing = true;
 
     try {
@@ -683,6 +684,10 @@ export class MaFanStrategy {
 
   public getIsPaused(): boolean {
     return this.isPaused;
+  }
+
+  public setMarketClosed(closed: boolean): void {
+    this.isMarketClosed = closed;
   }
 
   public async cancelAll(): Promise<{ cancelledCount: number }> {

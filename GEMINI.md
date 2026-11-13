@@ -9658,3 +9658,28 @@ When investigating live production behavior, debugging issues, or analyzing trad
      - อัปเดต `#logoBadge` (`ALPACA ...`), `renderTopSymbolOptions()` ดึงรายการหุ้นสหรัฐฯ จาก `/api/symbols?exchange=alpaca`, และสลับ default ticker ให้อัตโนมัติเมื่อเปลี่ยนกระดานเทรด
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.72`** ใน `package.json` และ `src/version.ts`
+
+---
+
+## 318. v0.3.0.73 — Clear Stale Symbol/Exchange Telemetry & Enable Market-Closed Monitoring Mode (`src/strategy/*`, `src/index.ts`, `src/exchange/alpaca/feed.ts`)
+
+- **สาเหตุของปัญหา ("แท่งเทียนดูไม่ได้" บน Alpaca AAPL หลังสลับจาก Binance ERAFDUSD)**:
+  1. **Telemetry เก่าค้างข้าม Exchange / Symbol (`src/strategy/index.ts`, `src/strategy/ma-fan/strategy-adapter.ts`)**:
+     - `DynamicGrid.updateSymbolInfo()` ไม่ได้ล้าง `this.lastTelemetryData`, `this.confirmedChannel`, `this.lastDynamicBounds` และไม่ได้ตั้ง `this.pendingConfirmedChannelUpdate = true`
+     - `emitTelemetryTick()` ผสานค่าเดิมจาก `this.lastTelemetryData` (`bestBid: 0.0818`, `upperBound: 0.0847`, `bottomBound: 0.0793`, `swingHighs: [0.0839]`, `exchange: "binance"`) เข้ากับกราฟ `AAPL` (`~$354.85`) ทำให้แกน Y ของ Lightweight Charts ถูกดึงยืดตั้งแต่ `0.08` ถึง `480` จนแท่งเทียนแบนติดขอบบนและป้ายสวิงไปกองอยู่ขอบล่าง
+  2. **Main Loop ข้าม `grid.tick()` เมื่อตลาด US ปิด (`src/index.ts`)**:
+     - เมื่อ `clock.isOpen === false` ลูปเดิมสั่ง `continue` ทันทีโดยเรียกแค่ `emitTelemetryTick()` ทำให้ Strategy ไม่เคยประเมินราคาปิด, Swings, Dow Structure หรือคำนวณระดับ Grid ใหม่ให้ `AAPL` เลย
+  3. **`AlpacaBookTickerFeed` ส่ง `time` เป็น Unix seconds (`src/exchange/alpaca/feed.ts`)**:
+     - `pollOnce()` ส่ง `book.time` (วินาที) แทน milliseconds (`Date.now()`) ทำให้เงื่อนไข `now - this.wsBookTicker.time < 10_000` ใน `DynamicGrid.tick()` มองว่า Book Ticker หมดอายุตลอดเวลา
+- **การแก้ไขที่ทำ**:
+  1. **ล้าง Telemetry/Channel Cache ทันทีเมื่อเปลี่ยนคู่เทรดหรือกระดาน (`src/strategy/index.ts`, `src/strategy/ma-fan/strategy-adapter.ts`)**:
+     - `DynamicGrid.updateSymbolInfo()` รีเซ็ต `confirmedChannel`, `pendingConfirmedChannelUpdate = true`, `lastDynamicBounds`, และ `lastTelemetryData = undefined`
+     - `DynamicGrid.emitTelemetryTick()` ตรวจสอบความตรงกันของ `symbol` และ `exchange` ก่อนนำ `lastTelemetryData` มาผสาน และส่ง `exchange: this.binance.exchangeName`, `isMarketClosed: this.isMarketClosed` ให้ครบทั้งสองสาขา
+     - `MaFanStrategyAdapter` ส่งค่า `exchange` ที่แท้จริงลง `tickData` แทนที่จะปล่อยให้สืบทอดค่าเก่าจากกระดานก่อนหน้า
+  2. **รองรับ `setMarketClosed(closed)` Monitoring Mode ทุก Strategy (`src/strategy/types.ts`, `src/strategy/index.ts`, `src/strategy/swing/index.ts`, `src/strategy/ma-fan/*`, `src/index.ts`)**:
+     - เพิ่มเมธอด `setMarketClosed?(closed: boolean): void` ใน `IStrategy` และ implement ทั้งใน `DynamicGrid`, `SwingTrader`, `MaFanStrategy` + `MaFanStrategyAdapter`
+     - ใน `src/index.ts`: แยกตัวช่วย `syncAlpacaMarketClock(loopCfg)` รัน `await grid.tick()` ตามปกติในโหมด Monitoring Mode แม้อยู่นอกเวลาทำการตลาด US (โดย `isMarketClosed = true` จะระงับการวาง/ยกเลิกออเดอร์และ TP/Triangle Squeeze บนกระดาน แต่ยังอัปเดตกราฟ Swings, Bounds และ Grid Ladder ให้ตรงกับหุ้นตัวใหม่ทันทีทั้งตอน Boot, Exchange Switch, Symbol Switch และระหว่างรัน)
+  3. **แก้ไข Timestamp ของ `AlpacaBookTickerFeed` (`src/exchange/alpaca/feed.ts`)**:
+     - ให้ `pollOnce()` ส่ง `{ ...book, time: Date.now() }` เป็น milliseconds สอดคล้องกับ `BinanceBookTickerFeed` หลังคำนวณอายุ quote จริงเพื่อลดความถี่ polling นอกเวลาตลาด
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.73`** ใน `package.json` และ `src/version.ts`

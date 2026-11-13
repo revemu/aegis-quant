@@ -271,6 +271,7 @@ export class MaFanTradingStrategy implements IStrategy {
     const tickData = {
       ...state,
       lastCalibration: compactCalibration,
+      exchange: this.exchange.exchangeName || this.cfg.exchange || "binance",
       strategyType: "ma_ribbon",
       strategyMode: "ma_ribbon",
       symbol: this.symbolInfo.symbol,
@@ -545,6 +546,10 @@ export class MaFanTradingStrategy implements IStrategy {
 
   public getIsPaused(): boolean {
     return this.maFan.getIsPaused();
+  }
+
+  public setMarketClosed(closed: boolean): void {
+    this.maFan.setMarketClosed(closed);
   }
 
   public async cancelAllOrdersUser(): Promise<{ cancelledCount: number }> {

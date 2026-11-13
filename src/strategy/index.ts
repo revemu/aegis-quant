@@ -156,6 +156,7 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
   /** Indices of Sell Targets (0..4) that have already been executed/sold in the current inventory wave */
   public soldSellIndices = new Set<number>();
   private lastTelemetryData?: any;
+  private isMarketClosed = false;
   private lastHudLogTime = 0;
   private lastHudStateSig = "";
   private lastHudPrice = 0;
@@ -487,6 +488,10 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
     this.pricePrecision = info.pricePrecision ?? 6;
     this.minNotional = info.minNotional;
     this.db.setSetting("symbol", this.symbol);
+    this.confirmedChannel = undefined;
+    this.pendingConfirmedChannelUpdate = true;
+    this.lastDynamicBounds = undefined;
+    this.lastTelemetryData = undefined;
     this.loadState();
     this.log(`🔄 [strategy] Updated trading pair to ${this.symbol} (${this.baseAsset}/${this.quoteAsset})`);
   }
@@ -1719,6 +1724,7 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
         if (
           !forceAdopt && (
             this.isPaused ||
+            this.isMarketClosed ||
             this.waitingForHigherLow ||
             this.isDowntrendDropPaused ||
             (this.lastRefPrice && this.lastEvaluatedFloor && this.lastRefPrice < this.lastEvaluatedFloor)
@@ -2307,6 +2313,10 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
     return this.isPaused;
   }
 
+  public setMarketClosed(closed: boolean): void {
+    this.isMarketClosed = closed;
+  }
+
   public async cancelAllOrdersUser(): Promise<{ cancelledCount: number }> {
     this.log(`🛑 User triggered MANUAL EMERGENCY CANCEL ALL ORDERS.`);
     // Automatically pause bot so it does not immediately re-place orders on the next tick
@@ -2544,6 +2554,14 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
     const held = this.baseHeld();
     const unrealizedPnl = held > 0 && avgEntry > 0 ? (valuationPrice - avgEntry) * held : 0;
 
+    const hasMatchingTelemetry =
+      this.lastTelemetryData &&
+      this.lastTelemetryData.symbol === this.symbol &&
+      (this.lastTelemetryData.exchange || "").toLowerCase() === (this.binance.exchangeName || "").toLowerCase();
+    if (!hasMatchingTelemetry) {
+      this.lastTelemetryData = undefined;
+    }
+
     if (this.lastTelemetryData) {
       const merged = {
         ...this.lastTelemetryData,
@@ -2572,6 +2590,8 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
         netPnlQuote: this.realizedPnl,
         netPnlUsdso: this.realizedPnl,
         avgEntryPrice: avgEntry,
+        exchange: this.binance.exchangeName,
+        isMarketClosed: this.isMarketClosed,
         effectiveSellTargets: (this.lastTelemetryData.sellLevels || []).map((rawLvl: number, idx: number) => {
           if (avgEntry <= 0) return rawLvl;
           const feeBufferPct = this.getFeeBufferPct();
@@ -2664,6 +2684,11 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
         totalTxCount: this.totalTxCount,
         netPnlQuote: this.realizedPnl,
         netPnlUsdso: this.realizedPnl,
+        exchange: this.binance.exchangeName,
+        symbol: this.symbol,
+        baseAsset: this.symbolInfo.baseAsset,
+        quoteAsset: this.symbolInfo.quoteAsset,
+        isMarketClosed: this.isMarketClosed,
         avgEntry,
         lots: this.lots,
         openOrders: this.openOrders,
@@ -3771,6 +3796,7 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
 
     if (
       !this.isPaused &&
+      !this.isMarketClosed &&
       this.cfg.takeProfitAtUpperBound &&
       this.lots.length > 0 &&
       realCeilingReached
@@ -4091,7 +4117,7 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
     }
 
     // 1. Trigger Squeeze Standby: Pause buying & cancel resting buy orders
-    if (!this.isPaused && enableSqueezeExit && isConverging && !this.isSqueezePaused) {
+    if (!this.isPaused && !this.isMarketClosed && enableSqueezeExit && isConverging && !this.isSqueezePaused) {
       this.isSqueezePaused = true;
       const isHolding = this.baseHeld() > 0;
       this.log(
@@ -4771,6 +4797,7 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
         } : undefined,
         symbol: this.symbol,
         symbolStatus: this.symbolInfo.status || "TRADING",
+        isMarketClosed: this.isMarketClosed,
         exchange: this.binance.exchangeName,
         binanceSymbol: this.cfg.binanceSymbol,
         baseAsset: this.symbolInfo.baseAsset,
@@ -4883,20 +4910,20 @@ export class DynamicGrid implements IStrategyHost, IStrategy {
           (stuckRemainingMin !== undefined ? ` (Hold timeout in ${stuckRemainingMin}m)` : "") +
           ` | Realized PnL: ${this.realizedPnl >= 0 ? "+$" : "-$"}${Math.abs(this.realizedPnl).toFixed(2)}` +
           (offloadOnly ? " | Stop-loss reached: Offload only" : "") +
-          (this.isPaused ? " | ⏸️ [PAUSED - MONITORING ONLY]" : ""),
+          (this.isPaused ? " | ⏸️ [PAUSED - MONITORING ONLY]" : (this.isMarketClosed ? " | 🇺🇸 [US MARKET CLOSED - MONITORING ONLY]" : "")),
       );
     }
 
     // ── Trading Gate: When strategy is paused or spread is dislocated, all order placements, cancellations, and exits are strictly suspended ──
-    if (this.isPaused || isSpreadDislocated) {
-      if (isSpreadDislocated && !this.isPaused) {
+    if (this.isPaused || this.isMarketClosed || isSpreadDislocated) {
+      if (isSpreadDislocated && !this.isPaused && !this.isMarketClosed) {
         this.wasSpreadDislocated = true;
         this.status(`${spreadDislocationReason} — sitting out order execution`);
       }
       return;
     }
 
-    if (this.wasSpreadDislocated && !this.isPaused) {
+    if (this.wasSpreadDislocated && !this.isPaused && !this.isMarketClosed) {
       this.wasSpreadDislocated = false;
       this.log(`🟢 Spread recovered to ${currentSpreadPct.toFixed(2)}% (<= Max ${maxSpreadPct.toFixed(2)}%) — resuming order execution`);
     }

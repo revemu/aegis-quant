@@ -252,6 +252,7 @@ export interface IStrategy {
   updateRuntimeSettings(s: any): any;
   setPaused(paused: boolean): boolean;
   getIsPaused(): boolean;
+  setMarketClosed?(closed: boolean): void;
   cancelAllOrdersUser(): Promise<{ cancelledCount: number; }>;
   sellAllUser(): Promise<{ success: boolean; soldQty: number; price: number; error?: string; }>;
   resetBotState(opts?: any): Promise<{ success: boolean; }>;

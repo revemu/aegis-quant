@@ -479,9 +479,11 @@ export class AlpacaBookTickerFeed {
           if (Date.now() - book.time * 1000 > 5 * 60_000) {
             nextDelayMs = 15_000;
           }
-          this.latestBook = book;
+          // Strategy wsBookTicker freshness expects received timestamp in milliseconds (matching BinanceBookTickerFeed)
+          const wsBook: BookTickerData = { ...book, time: Date.now() };
+          this.latestBook = wsBook;
           for (const fn of this.listeners) {
-            fn(book);
+            fn(wsBook);
           }
         }
       }

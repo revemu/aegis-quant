@@ -579,8 +579,11 @@ async function main(): Promise<void> {
             }
           });
           macroFeed?.start();
-          tradingFeed?.start();
+          await Promise.resolve(tradingFeed?.start());
           htfFeed?.start();
+          grid.setSwitchingSymbol(false);
+          await syncAlpacaMarketClock(grid.getRuntimeConfig());
+          await grid.tick();
           wakeSleep?.();
           log(`🔄 Successfully switched Exchange Adapter to: ${exchange.exchangeName.toUpperCase()} (${nextInfo.symbol})`);
         } catch (err) {
@@ -624,8 +627,11 @@ async function main(): Promise<void> {
             }
           });
           macroFeed?.start();
-          tradingFeed?.start();
+          await Promise.resolve(tradingFeed?.start());
           htfFeed?.start();
+          grid.setSwitchingSymbol(false);
+          await syncAlpacaMarketClock(grid.getRuntimeConfig());
+          await grid.tick();
           wakeSleep?.();
           log(`🔄 Switched active ${exchange.exchangeName} trading pair to: ${nextInfo.symbol}`);
         } catch (err) {
@@ -963,30 +969,44 @@ async function main(): Promise<void> {
   let lastIdleCheckTime = Date.now();
   let alpacaMarketClosedLogged = false;
 
+  async function syncAlpacaMarketClock(loopCfg: Record<string, any>): Promise<boolean> {
+    if (exchange.exchangeName === "alpaca" && !loopCfg.dryRun && !loopCfg.alpacaIgnoreMarketHours && exchange.hasCredentials()) {
+      const clock = await exchange.getMarketClock?.();
+      if (clock && !clock.isOpen) {
+        if (!alpacaMarketClosedLogged) {
+          log(`⏸️ [ALPACA MARKET CLOSED] US Equities market is closed (next open: ${clock.nextOpen}). Holding live order execution until market opens (monitoring chart active).`);
+          alpacaMarketClosedLogged = true;
+        }
+        grid.setMarketClosed?.(true);
+        return true;
+      }
+      if (clock?.isOpen && alpacaMarketClosedLogged) {
+        log(`🔔 [ALPACA MARKET OPEN] US Equities market is now OPEN — resuming live execution.`);
+        alpacaMarketClosedLogged = false;
+      }
+    } else {
+      alpacaMarketClosedLogged = false;
+    }
+    grid.setMarketClosed?.(false);
+    return false;
+  }
+
+  // Ensure initial boot telemetry (even while paused or when market closed) renders the active symbol immediately
+  await Promise.resolve(tradingFeed?.start());
+  await syncAlpacaMarketClock(grid.getRuntimeConfig());
+  await grid.tick().catch((err) => log(`initial tick error: ${(err as Error).message}`));
+
   while (!stop) {
     let tickSleepOverrideMs = 0;
     try {
       const loopCfg = grid.getRuntimeConfig();
-      if (exchange.exchangeName === "alpaca" && !loopCfg.dryRun && !loopCfg.alpacaIgnoreMarketHours && exchange.hasCredentials()) {
-        const clock = await exchange.getMarketClock?.();
-        if (clock && !clock.isOpen) {
-          if (!alpacaMarketClosedLogged) {
-            log(`⏸️ [ALPACA MARKET CLOSED] US Equities market is closed (next open: ${clock.nextOpen}). Holding live order execution until market opens.`);
-            alpacaMarketClosedLogged = true;
-          }
-          grid.emitTelemetryTick();
-          tickSleepOverrideMs = 15_000;
-        } else if (clock?.isOpen && alpacaMarketClosedLogged) {
-          log(`🔔 [ALPACA MARKET OPEN] US Equities market is now OPEN — resuming live ticks.`);
-          alpacaMarketClosedLogged = false;
-        }
-      } else {
-        alpacaMarketClosedLogged = false;
+      const isMarketClosedNow = await syncAlpacaMarketClock(loopCfg);
+      if (isMarketClosedNow) {
+        tickSleepOverrideMs = 15_000;
       }
 
-      if (tickSleepOverrideMs === 0) {
-        await grid.tick();
-      }
+      // Always run monitoring tick (evaluates live price, Dow swings, grid bounds) even if US market is closed
+      await grid.tick();
       // Periodic Idle Cash Check (every 60s) for Auto-Rotation
       if (Date.now() - lastIdleCheckTime >= 60_000) {
         lastIdleCheckTime = Date.now();

@@ -74,6 +74,7 @@ export class SwingTraderStrategy implements IStrategy {
   public lots: Lot[] = [];
   public openOrders: OpenOrder[] = [];
   public isPaused = false;
+  private isMarketClosed = false;
   public isSwitchingSymbol = false;
 
   public walletBaseBalance = 0;
@@ -291,6 +292,10 @@ export class SwingTraderStrategy implements IStrategy {
 
   public getIsPaused(): boolean {
     return this.isPaused;
+  }
+
+  public setMarketClosed(closed: boolean): void {
+    this.isMarketClosed = closed;
   }
 
   public getEffectiveGasReserveBase(): number {
@@ -946,8 +951,8 @@ export class SwingTraderStrategy implements IStrategy {
       const signal = SwingSignalDetector.evaluateSetup(refPrice, structure, swingCfg, candles, this.consumedBreakoutTlKey);
       this.lastSignal = signal;
 
-      if (this.isPaused) {
-        // Paused: monitoring only, do not manage active positions, do not cancel or place orders, do not enter new trades
+      if (this.isPaused || this.isMarketClosed) {
+        // Paused or market closed: monitoring only, do not manage active positions, cancel/place orders, or enter new trades
         this.emitTelemetryTick();
         return;
       }
