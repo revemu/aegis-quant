@@ -50,6 +50,7 @@ export interface EntryDecision {
   checklist?: EntryChecklist;
   reason?: string;
   engineType?: "DIP_HUNTER" | "PEAK_HUNTER" | "TREND_RIDER_LONG" | "TREND_RIDER_SHORT";
+  tp1TargetPrice?: number;
 }
 
 export type ExitActionType = "NONE" | "TP1" | "TP2" | "SL";
@@ -555,9 +556,9 @@ export class MaFanCoreRules {
         name: "ระยะวิ่งถึง EMA25 (Upside Room)",
         passed: isDownside,
         actualText: closePrice < ribbon.ema25
-          ? `ต่ำกว่า EMA25 ${upsidePct.toFixed(2)}%${enableUpsideFloor && upsidePct < 0.45 ? " (แคบไป)" : ""}`
+          ? `ต่ำกว่า EMA25 ${upsidePct.toFixed(2)}%${enableUpsideFloor && upsidePct < 0.50 ? " (แคบไป)" : ""}`
           : "อยู่เหนือ EMA25",
-        requiredText: enableUpsideFloor ? "ต่ำกว่า EMA25 ≥ 0.45%" : "ต่ำกว่า EMA25 ≥ 0.30%",
+        requiredText: enableUpsideFloor ? "ต่ำกว่า EMA25 ≥ 0.50%" : "ต่ำกว่า EMA25 ≥ 0.30%",
       },
       {
         id: "wick",
@@ -851,10 +852,11 @@ export class MaFanCoreRules {
       const rawSl = swingLow - slDist;
       const stopLossPrice = Math.max(rawSl, closePrice * (1 - maxSlPct / 100));
 
-      // TP Target: Recent 15-bar swing high or 1.2x Risk
+      // TP Target: Recent 15-bar swing high (at least +0.75%, capped at +2.00% for realistic TP1 partial lock)
       const recentHighs = candles.slice(Math.max(0, currentIndex - 14), currentIndex + 1).map((c) => c.high);
       const swingHigh15 = recentHighs.length > 0 ? Math.max(...recentHighs) : closePrice * 1.01;
       const targetPrice = Math.max(swingHigh15, closePrice * 1.0075);
+      const tp1TargetPrice = Math.min(targetPrice, closePrice * 1.020);
 
       const rrCalc = MaFanCoreRules.computeRewardRisk({
         entryPrice: closePrice,
@@ -885,6 +887,7 @@ export class MaFanCoreRules {
           engineType: "TREND_RIDER_LONG",
           entryPrice: closePrice,
           stopLossPrice,
+          tp1TargetPrice,
           swingLow,
           fanSpreadPct: ribbon.fanSpreadPct,
           riskPct: rrCalc.riskPct,
@@ -902,6 +905,7 @@ export class MaFanCoreRules {
         engineType: "TREND_RIDER_LONG",
         entryPrice: closePrice,
         stopLossPrice,
+        tp1TargetPrice,
         swingLow,
         fanSpreadPct: ribbon.fanSpreadPct,
         riskPct: rrCalc.riskPct,
@@ -950,10 +954,11 @@ export class MaFanCoreRules {
       const rawSl = swingHigh + slDist;
       const stopLossPrice = Math.min(rawSl, closePrice * (1 + maxSlPct / 100));
 
-      // TP Target: Recent 15-bar swing low or 1.2x Risk downwards
+      // TP Target: Recent 15-bar swing low (at least -0.75%, capped at -2.00% for realistic TP1 partial lock)
       const recentLows = candles.slice(Math.max(0, currentIndex - 14), currentIndex + 1).map((c) => c.low);
       const swingLow15 = recentLows.length > 0 ? Math.min(...recentLows) : closePrice * 0.99;
       const targetPrice = Math.min(swingLow15, closePrice * 0.9925);
+      const tp1TargetPrice = Math.max(targetPrice, closePrice * 0.980);
 
       const rrCalc = MaFanCoreRules.computeRewardRisk({
         entryPrice: closePrice,
@@ -984,6 +989,7 @@ export class MaFanCoreRules {
           engineType: "TREND_RIDER_SHORT",
           entryPrice: closePrice,
           stopLossPrice,
+          tp1TargetPrice,
           swingHigh,
           fanSpreadPct: ribbon.fanSpreadPct,
           riskPct: rrCalc.riskPct,
@@ -1001,6 +1007,7 @@ export class MaFanCoreRules {
         engineType: "TREND_RIDER_SHORT",
         entryPrice: closePrice,
         stopLossPrice,
+        tp1TargetPrice,
         swingHigh,
         fanSpreadPct: ribbon.fanSpreadPct,
         riskPct: rrCalc.riskPct,
@@ -1210,6 +1217,8 @@ export class MaFanCoreRules {
     tp1TargetMode?: "EMA25" | "EMA75" | "EMA200";
     lockBreakevenAtEma200?: boolean;
     maxDisasterSlPct?: number;
+    engineType?: EntryDecision["engineType"];
+    tp1TargetPrice?: number;
   }): ExitDecision {
     const {
       highPrice,
@@ -1235,6 +1244,7 @@ export class MaFanCoreRules {
     } = opts;
 
     const beFeeBuffer = (breakevenFeeBufferPct ?? 0.05) / 100;
+    const isTrendRider = opts.engineType === "TREND_RIDER_LONG" || opts.engineType === "TREND_RIDER_SHORT";
 
     // ─── SHORT POSITION EXITS ────────────────────────────────────────────
     if (positionSide === "SHORT") {
@@ -1285,7 +1295,9 @@ export class MaFanCoreRules {
       // ── Priority 2: TP2 Check (SHORT) ──────────────────────────────────────
       if (tp1Filled) {
         const target = Math.min(ribbon.ema75, ribbon.ema200);
-        const hitTarget = lowPrice <= target && lowPrice < entryPrice * 0.9965;
+        // Only treat EMA75/EMA200 as a macro reversion target for mean-reversion trades when it sits strictly below entry.
+        const hasMacroTarget = !isTrendRider && target > 0 && target < entryPrice * 0.9965;
+        const hitTarget = hasMacroTarget && lowPrice <= target;
         const lowestSince = opts.lowestPriceSinceTp1 ?? lowPrice;
         const trailingExitRatio = 1 + trailingPullbackPct / 100;
         const hitTrailing = lowestSince < entryPrice * 0.995 && highPrice >= lowestSince * trailingExitRatio;
@@ -1313,12 +1325,17 @@ export class MaFanCoreRules {
 
       // ── Priority 3: TP1 at EMA 25 & Asymmetric Profit Target (SHORT) ────────
       if (!tp1Filled) {
-        const isTrapped = (barsHeld !== undefined && barsHeld >= 5) && (ribbon.ema25 >= entryPrice * 0.9985);
-        const minProfitFrac = Math.max((opts.tp1MinProfitPct ?? 0.85) / 100, beFeeBuffer);
+        // Trend Rider enters below EMA25, so never classify it as "trapped" below/above EMA25.
+        const isTrapped = !isTrendRider && (barsHeld !== undefined && barsHeld >= 5) && (ribbon.ema25 >= entryPrice * 0.9985);
+        const defaultMinPct = isTrendRider ? 0.75 : 0.85;
+        const minProfitFrac = Math.max((opts.tp1MinProfitPct ?? defaultMinPct) / 100, beFeeBuffer);
         const minProfitPrice = isTrapped
           ? entryPrice * (1 - beFeeBuffer)
           : entryPrice * (1 - minProfitFrac);
-        const tp1Target = Math.min(ribbon.ema25, minProfitPrice);
+        const rawTarget = isTrendRider
+          ? (opts.tp1TargetPrice && opts.tp1TargetPrice > 0 ? opts.tp1TargetPrice : minProfitPrice)
+          : ribbon.ema25;
+        const tp1Target = Math.min(rawTarget, minProfitPrice);
 
         if (lowPrice <= tp1Target) {
           const tp1ProfitPct = ((entryPrice - tp1Target) / entryPrice) * 100;
@@ -1339,6 +1356,8 @@ export class MaFanCoreRules {
               ? "Trapped Short Breakeven Rescue"
               : cushionApplied
               ? "TP1 Mean Reversion (Bear Cushion Active)"
+              : isTrendRider
+              ? `Trend Rider TP1 (+${tp1ProfitPct.toFixed(2)}%)`
               : `TP1 Profit Target (+${tp1ProfitPct.toFixed(2)}%)`,
           };
         }
@@ -1361,7 +1380,7 @@ export class MaFanCoreRules {
     }
 
     // Lock Breakeven at EMA200
-    if (opts.lockBreakevenAtEma200 && ribbon.ema200 > 0 && highPrice >= ribbon.ema200 && highPrice >= entryPrice * (1 + beFeeBuffer * 2)) {
+    if (opts.lockBreakevenAtEma200 && !isTrendRider && ribbon.ema200 > entryPrice * (1 + beFeeBuffer) && highPrice >= ribbon.ema200 && highPrice >= entryPrice * (1 + beFeeBuffer * 2)) {
       const beSl = entryPrice * (1 + beFeeBuffer);
       if (beSl > stopLossPrice) {
         return {
@@ -1420,7 +1439,9 @@ export class MaFanCoreRules {
     // ── Priority 2: TP2 Check (if TP1 was already filled) ───────────────────
     if (tp1Filled) {
       const target = Math.max(ribbon.ema75, ribbon.ema200);
-      const hitTarget = highPrice >= target && highPrice > entryPrice * 1.0035;
+      // Only treat EMA75/EMA200 as a macro reversion ceiling for mean-reversion trades when it sits strictly above entry.
+      const hasMacroTarget = !isTrendRider && target > entryPrice * 1.0035;
+      const hitTarget = hasMacroTarget && highPrice >= target;
       const trailingExitRatio = 1 - trailingPullbackPct / 100;
       const hitTrailing = highestPriceSinceTp1 > entryPrice * 1.005 && lowPrice <= highestPriceSinceTp1 * trailingExitRatio;
       const hitOverbought = !!isOverbought && highPrice > entryPrice * 1.008;
@@ -1445,16 +1466,20 @@ export class MaFanCoreRules {
       }
     }
 
-    // ── Priority 3: TP1 at Target EMA & Trapped Breakeven Rescue ────────────────
+    // ── Priority 3: TP1 at Target EMA / Trend Swing Target & Trapped Breakeven Rescue ──
     if (!tp1Filled) {
       const targetEma = opts.tp1TargetMode === "EMA200" ? ribbon.ema200 : (opts.tp1TargetMode === "EMA75" ? ribbon.ema75 : ribbon.ema25);
-      // Trapped Position Rescue only activates if held for >= 3 bars and targetEma drifted below entry
-      const isTrapped = (barsHeld !== undefined && barsHeld >= 3) && (targetEma <= entryPrice * 1.0015);
-      const minProfitFrac = Math.max((opts.tp1MinProfitPct ?? 0.20) / 100, beFeeBuffer);
+      // Trend Rider enters above EMA25 on continuation pullbacks; do not trigger EMA25 mean-reversion rescue.
+      const isTrapped = !isTrendRider && (barsHeld !== undefined && barsHeld >= 3) && (targetEma <= entryPrice * 1.0015);
+      const defaultMinPct = isTrendRider ? 0.75 : 0.20;
+      const minProfitFrac = Math.max((opts.tp1MinProfitPct ?? defaultMinPct) / 100, beFeeBuffer);
       const minProfitPrice = isTrapped
         ? entryPrice * (1 + beFeeBuffer)
-        : entryPrice * (1 - minProfitFrac);
-      const tp1Target = Math.max(targetEma, minProfitPrice);
+        : entryPrice * (1 + minProfitFrac);
+      const rawTarget = isTrendRider
+        ? (opts.tp1TargetPrice && opts.tp1TargetPrice > 0 ? opts.tp1TargetPrice : minProfitPrice)
+        : targetEma;
+      const tp1Target = Math.max(rawTarget, minProfitPrice);
 
       if (highPrice >= tp1Target) {
         // Trend-Aware Breathing Cushion for Breakeven SL:
@@ -1480,6 +1505,8 @@ export class MaFanCoreRules {
             ? "Trapped Position Breakeven Rescue"
             : cushionApplied
             ? "TP1 Mean Reversion (HTF Bull Cushion Active)"
+            : isTrendRider
+            ? `Trend Rider TP1 (+${tp1ProfitPct.toFixed(2)}%)`
             : `TP1 Mean Reversion at ${targetLabel}`,
         };
       }

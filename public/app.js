@@ -1291,9 +1291,14 @@
     updateMaFanRibbonLines(candles);
   }
 
+  function isMaRibbonType(st, mode) {
+    const v = st || mode;
+    return v === "ma_ribbon" || v === "ma_fan";
+  }
+
   function updateMaFanRibbonLines(candles) {
     if (!ema4Series || !ema8Series || !ema16Series || !ema25Series || !ema75Series || !ema200Series) return;
-    const isMaFanMode = latestGridData?.strategyType === "ma_fan" || latestGridData?.strategyMode === "ma_fan" || (document.getElementById("cfg_strategyType")?.value === "ma_fan");
+    const isMaFanMode = isMaRibbonType(latestGridData?.strategyType, latestGridData?.strategyMode) || isMaRibbonType(document.getElementById("cfg_strategyType")?.value);
 
     const elLegendMaRow = document.getElementById("legendMaRow");
     const elLegendDowRow = document.getElementById("legendDowRow");
@@ -2185,7 +2190,7 @@
         elPositionStatus.style.color = ribbon.isFanningDown && ribbon.fanSpreadPct >= effSpread ? "#facc15" : "var(--text-muted)";
       }
 
-      if (elSignalType) elSignalType.textContent = "🪭 MA-FOLD-FAN (กำลังสแกนจังหวะ)";
+      if (elSignalType) elSignalType.textContent = "🎀 MA-Ribbon (กำลังสแกนจังหวะ)";
       if (elSignalDesc) elSignalDesc.textContent = `พัดปัจจุบัน: ${(ribbon.fanSpreadPct || 0).toFixed(2)}% (ต้องการ ≥ ${effSpread.toFixed(2)}%)`;
 
       if (elEntryPrice) elEntryPrice.textContent = "--.------";
@@ -2239,8 +2244,8 @@
       if (elMaFanPlanCard) elMaFanPlanCard.style.display = "none";
       updateSwingTradePlanUI(data);
       return;
-    } else if (data.strategyType === "ma_fan" || data.strategyMode === "ma_fan") {
-      if (elGridTitle) elGridTitle.textContent = "🪭 แผนการเทรด MA-FOLD-FAN";
+    } else if (isMaRibbonType(data.strategyType, data.strategyMode)) {
+      if (elGridTitle) elGridTitle.textContent = "🎀 แผนการเทรด MA-Ribbon";
       if (elVerticalLadder) elVerticalLadder.style.display = "none";
       if (elSwingPlanCard) elSwingPlanCard.style.display = "none";
       if (elMaFanPlanCard) elMaFanPlanCard.style.display = "flex";
@@ -2891,7 +2896,7 @@
     // Symbol Display
     const rawSymbol = data.symbol || (data.binanceSymbol ? `${data.binanceSymbol.toUpperCase()}` : "SOMI:USDso");
     const displaySymbol = rawSymbol.replace(":", " / ").toUpperCase();
-    const isMaFan = data.strategyType === "ma_fan" || data.strategyMode === "ma_fan";
+    const isMaFan = isMaRibbonType(data.strategyType, data.strategyMode);
     const execTf = (data.executionTimeframe || "5m").toUpperCase();
     const supTf = (data.supervisorTimeframe || data.htfRegime?.timeframe || "15m").toUpperCase();
     const macroTf = (data.dowTimeframe || "15m").toUpperCase();
@@ -2911,8 +2916,8 @@
       let stratSuffix = "GRID";
       if (data.strategyType === "swing_trade" || (data.strategyName && data.strategyName.includes("Swing"))) {
         stratSuffix = "SWING";
-      } else if (data.strategyType === "ma_fan" || data.strategyMode === "ma_fan") {
-        stratSuffix = "MA-FOLD-FAN";
+      } else if (isMaRibbonType(data.strategyType, data.strategyMode)) {
+        stratSuffix = "MA-RIBBON";
       }
       elLogoBadge.textContent = isDreamdex ? `DREAMDEX ${stratSuffix}` : `BINANCE ${stratSuffix}`;
     }
@@ -2944,7 +2949,7 @@
     }
 
     // Timeframe Badge & Subtitle
-    if (data.strategyType === "ma_fan") {
+    if (isMaRibbonType(data.strategyType, data.strategyMode)) {
       const execTf = (data.executionTimeframe || "5m").toUpperCase();
       const supTf = (data.supervisorTimeframe || data.htfRegime?.timeframe || "15m").toUpperCase();
       if (elTimeframeBadge) {
@@ -3429,7 +3434,7 @@
       elLiveBotStatusText.style.color = isPaused ? "#f59e0b" : "#38bdf8";
     }
     if (elLiveBotStatusSub) {
-      const mode = data.strategyMode === "ma_fan" ? "MA-FOLD-FAN" : "DYNAMIC GRID";
+      const mode = isMaRibbonType(data.strategyType, data.strategyMode) ? "MA-RIBBON" : "DYNAMIC GRID";
       elLiveBotStatusSub.textContent = `${mode} • ${data.executionTimeframe || "5m"}`;
     }
 
@@ -3467,7 +3472,7 @@
 
     // Dow Regime Badge
     if (elRegimeBadge) {
-      if (data.strategyMode === "ma_fan" || data.strategyType === "ma_fan") {
+      if (isMaRibbonType(data.strategyType, data.strategyMode)) {
         elRegimeBadge.style.display = "none";
       } else if (data.regime) {
         elRegimeBadge.style.display = "";
@@ -3816,7 +3821,7 @@
           try { candleSeries.removePriceLine(lineSwingNextEntry); } catch (_) {}
           lineSwingNextEntry = null;
         }
-      } else if (data.strategyType === "ma_fan" || data.strategyMode === "ma_fan") {
+      } else if (isMaRibbonType(data.strategyType, data.strategyMode)) {
         // Clear grid levels
         while (gridZoneLevelLines.length > 0) {
           const l = gridZoneLevelLines.pop();
@@ -5362,14 +5367,14 @@
     const gridBtns = [btnExec, btnStruct, btnRisk];
     let primaryTabId = "tab-execution";
 
-    if (stratType === "ma_fan") {
+    if (isMaRibbonType(stratType)) {
       primaryTabId = "tab-ma-fan";
 
-      // 1. Move MA Fan tab to front and highlight
+      // 1. Move MA-Ribbon tab to front and highlight
       if (btnMaFan) {
         btnMaFan.style.display = "inline-flex";
         btnMaFan.style.order = "-1";
-        btnMaFan.textContent = "🪭 กลยุทธ์ MA-FOLD-FAN ⭐ (ใช้งานอยู่)";
+        btnMaFan.textContent = "🎀 กลยุทธ์ MA-Ribbon ⭐ (ใช้งานอยู่)";
         btnMaFan.style.borderColor = "#a855f7";
         btnMaFan.style.color = "#c084fc";
       }
@@ -5501,7 +5506,7 @@
       }
       setVal("cfg_symbol", resolvedSym);
       setVal("cfg_exchange", data.exchange || "binance");
-      setVal("cfg_strategyType", data.strategyType || "dynamic_grid");
+      setVal("cfg_strategyType", isMaRibbonType(data.strategyType) ? "ma_ribbon" : (data.strategyType || "dynamic_grid"));
       renderTopSymbolOptions(currentExchange, data.symbol || defaultSym);
       updateExchangeFieldsVisibility(currentExchange);
       setVal("cfg_binanceApiKey", data.binanceApiKey || "");

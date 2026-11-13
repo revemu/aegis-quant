@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MA-FOLD-FAN — Backtest Studio</title>
+  <title>MA-Ribbon &amp; MA-Fan — Backtest Studio</title>
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
@@ -23,7 +23,7 @@
           <span class="bt-back-icon">←</span> หน้าเทรดสด
         </a>
         <div class="bt-title-wrap">
-          <span class="bt-badge">MA-FOLD-FAN</span>
+          <span class="bt-badge">MA-Ribbon &amp; MA-Fan</span>
           <h1 class="bt-title">🧪 Backtest Studio</h1>
         </div>
       </div>
@@ -61,10 +61,11 @@
           <label style="color: #a5b4fc; font-weight: 700;">⚙️ โหมดกลยุทธ์ (Engine)</label>
           <select id="btTradeMode" title="เลือกรูปแบบเครื่องยนต์กลยุทธ์" style="font-weight: 700; color: #fff; background: rgba(99, 102, 241, 0.2); border-color: rgba(99, 102, 241, 0.5);">
             <option value="dual_hybrid" selected>⚡🕸️ Dual Hybrid (Grid + Sniper)</option>
-            <option value="dual">⚡ Dual MA-Fan (Hunter + Trend)</option>
-            <option value="dip_hunter">🎯 Dip/Peak Hunter (MA-Fan)</option>
+            <option value="dual">⚡ Dual MA-Ribbon (Hunter + Trend)</option>
+            <option value="dip_hunter">🎯 Dip/Peak Hunter (MA-Ribbon)</option>
             <option value="trend_rider">🏄 Trend Rider (เกาะเทรนด์)</option>
             <option value="dynamic_grid">🕸️ Dynamic Grid (Dow 4-Levels)</option>
+            <option value="swing_trade">🎯 Swing Trade (Dow R:R)</option>
           </select>
         </div>
 
@@ -393,7 +394,7 @@
             <select id="scScanType" style="font-weight: 700; color: #38bdf8; background: rgba(56, 189, 248, 0.15); border-color: rgba(56, 189, 248, 0.4);">
               <option value="grid_dna" selected>🧬 สแกนหาเหรียญ Grade S / A (Dynamic Grid DNA) ⭐</option>
               <option value="backtest_leaderboard">📊 Historical Leaderboard (ผลงานย้อนหลัง + DNA)</option>
-              <option value="mafan_setups">⚡ MA-Fan Setup (กางล่าง + กลับตัว)</option>
+              <option value="mafan_setups">⚡ MA-Ribbon Setup (กางล่าง + กลับตัว)</option>
             </select>
           </div>
 
@@ -412,10 +413,11 @@
             <label style="color: #a5b4fc; font-weight: 700;">⚙️ Engine</label>
             <select id="scTradeMode" title="เลือกรูปแบบเครื่องยนต์กลยุทธ์" style="font-weight: 700; color: #fff;">
               <option value="dual_hybrid" selected>⚡🕸️ Dual Hybrid (Grid + Sniper)</option>
-              <option value="dual">⚡ Dual MA-Fan</option>
+              <option value="dual">⚡ Dual MA-Ribbon</option>
               <option value="dip_hunter">🎯 Dip/Peak Hunter</option>
               <option value="trend_rider">🏄 Trend Rider</option>
               <option value="dynamic_grid">🕸️ Dynamic Grid</option>
+              <option value="swing_trade">🎯 Swing Trade (Dow R:R)</option>
             </select>
           </div>
 
@@ -617,7 +619,7 @@
         <!-- Scan Progress Bar -->
         <div id="scannerProgressWrap" class="scanner-progress-wrap" style="display: none;">
           <div class="scanner-progress-info">
-            <span id="scannerStatusText">กำลังดึงข้อมูลแท่งเทียนและตรวจจับสัญญาณ MA-Fan...</span>
+            <span id="scannerStatusText">กำลังดึงข้อมูลแท่งเทียนและตรวจจับสัญญาณ MA-Ribbon...</span>
             <span id="scannerCountText">กรุณารอสักครู่ (ใช้เวลา 2-5 วินาที)</span>
           </div>
           <div class="scanner-progress-bar"><div class="scanner-progress-fill" id="scannerProgressFill" style="width: 100%;"></div></div>
@@ -715,6 +717,14 @@
 
           <!-- 3. MA-Fan Multi-Coin Portfolio Options (Dynamic display) -->
           <div class="scanner-ctrl-group" data-rot-mode="mafan">
+            <label>เครื่องยนต์พอร์ต (Portfolio Engine)</label>
+            <select id="rotBtPortfolioEngine" title="เลือกกลยุทธ์เข้า-ออกสำหรับพอร์ต MA-Fan Multi-Coin">
+              <option value="auto" selected>🤖 Auto (MA-Fan สำหรับ Crypto &amp; US Stocks - แนะนำ) ★</option>
+              <option value="ma_fan">📈 MA-Fan (EMA4 Pullback -> EMA200)</option>
+              <option value="dip_hunter">⚡ Dip Hunter (MA-Ribbon 15m + 1h HTF Mean Reversion)</option>
+            </select>
+          </div>
+          <div class="scanner-ctrl-group" data-rot-mode="mafan">
             <label id="rotBtMaxSlotsLabel">จำนวนช่องถือเหรียญ (Max Slots)</label>
             <select id="rotBtMaxSlots" title="จำนวนเหรียญที่ถือครองพร้อมกันสูงสุด (กระจายเงินทุนช่องละเท่าๆ กัน)">
               <option value="1">1 ช่อง (All-in ทีละเหรียญ)</option>
@@ -727,9 +737,11 @@
           <div class="scanner-ctrl-group" data-rot-mode="mafan">
             <label>เป้าทำกำไรครึ่งไม้ (TP1 Mode)</label>
             <select id="rotBtTp1Target" title="ขายทำกำไร 50% ไม้แรกที่เส้น EMA และล็อคจุดตัดขาดทุนที่จุดคุ้มทุน (Breakeven)">
-              <option value="EMA200" selected>🎯 EMA200 (15m) + Lock Breakeven (แนะนำ) ⭐</option>
+              <option value="auto" selected>🤖 Auto (EMA200 สำหรับ MA-Fan / EMA25 สำหรับ Dip Hunter) ⭐</option>
+              <option value="EMA25">⚡ EMA25 (Mean Reversion TP1)</option>
+              <option value="EMA200">🎯 EMA200 (15m) + Lock Breakeven</option>
               <option value="EMA75">⚡ EMA75 (15m) + Lock Breakeven</option>
-              <option value="none">❌ ไม่แบ่งขาย (ถือจน Full Fan Exit 100%)</option>
+              <option value="none">❌ ไม่แบ่งขาย (ถือจน Full Exit 100%)</option>
             </select>
           </div>
           <div class="scanner-ctrl-group" data-rot-mode="mafan">

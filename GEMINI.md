@@ -9553,3 +9553,79 @@ When investigating live production behavior, debugging issues, or analyzing trad
 - **Version Bump & Typecheck**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.65`** ใน `package.json` และ `src/version.ts`
   - ตรวจสอบผ่าน `npm run typecheck` 100% (0 errors)
+
+---
+
+## 313. v0.3.0.68 — Core Rules, Multi-Strategy Backtest, Calibrator & Live Parity Bug-Fix Pass (`core-rules.ts`, `backtest-service.ts`, `rolling-calibrator.ts`, `executor.ts`, `strategy.ts`, `server.ts`)
+
+- **ปัญหาที่ตรวจพบและแก้ไข (6 จุดหลัก)**:
+  1. **LONG TP1 Floor คำนวณติดลบ (`src/strategy/ma-fan/core-rules.ts`)**:
+     - โค้ดเดิมใช้ `entryPrice * (1 - minProfitFrac)` ทำให้ LONG TP1 ต่ำกว่าทุน (เช่น `-0.20%` หรือ `-0.65%` ใน `Dual Hybrid`) ส่งผลให้ `TREND_RIDER_LONG` ปิด TP1 ขาดทุนตั้งแต่วินาทีแรกของแท่งถัดไปแล้วโดน `TP1+SL_BE` รัวๆ
+     - แก้ไขเป็น `entryPrice * (1 + minProfitFrac)` พร้อมแก้ข้อความ checklist `0.45% -> 0.50%`
+  2. **`evaluateExits` ขาดการรองรับ `TREND_RIDER` Engine (`src/strategy/ma-fan/core-rules.ts`)**:
+     - เพิ่ม `tp1TargetPrice` ใน `EntryDecision` และ `evaluateTrendRiderEntry` (LONG/SHORT) พร้อมส่ง `engineType` และ `tp1TargetPrice` เข้า `evaluateExits`
+     - เพิ่ม `isTrendRider` guards ป้องกันไม่ให้บังคับใช้ `EMA25` เป็น TP1, ไม่ให้ `isTrapped` เตะออกที่ EMA25 หลัง 3/5 แท่ง และไม่ให้ `EMA75`/`EMA200` หรือ `lockBreakevenAtEma200` ปิด TP2/ล็อก BE ก่อนกำหนดเมื่อเส้นอยู่หลังจุดเข้า
+  3. **Live Strategy Parity (`src/strategy/ma-fan/types.ts`, `executor.ts`, `strategy.ts`)**:
+     - เพิ่ม `engineType` และ `tp1TargetPrice` ใน `MaFanPosition` พร้อมส่งต่อค่า `engineType`, `tp1TargetPrice`, `tp1TargetMode`, `lockBreakevenAtEma200`, `maxDisasterSlPct`, `maxSlPct`, และ `stopLossPrice` ครบทั้งฝั่ง Long และ Short
+  4. **Rolling Calibrator Missing Exit State (`src/strategy/ma-fan/rolling-calibrator.ts`)**:
+     - ติดตาม `highestSinceEntry` และส่ง `engineType: "DIP_HUNTER"`, `prevRibbon`, `prevExhaustion`, `highestPriceSinceEntry` เข้า `evaluateExits`
+  5. **Backtest Simulator Parity & Leverage Bugs (`src/backtest-service.ts`)**:
+     - แยก shared helper `resolvePostTp1StopLoss` และปรับ `runDualHybridSimulation` ให้ใช้ `exitDecision.newStopLossPrice` บน TP1, ตรวจสอบ `hitIntrabarBe`, ส่งพารามิเตอร์ `prevRibbon`/`prevExhaustion`/`breakevenFeeBufferPct`/`cushionMode`/`cushionThresholdPct`/`tp1TargetMode`/`engineType`/`tp1TargetPrice` และแก้บั๊ก Phantom Leverage / Premature Freeze ที่ใช้ `sniperInitialCap` เต็มจำนวนทั้งที่ `sniperCash < sniperInitialCap`
+     - แก้ `highestSinceEntry` / `lowestSinceEntry` เริ่มต้นใน `runDualHybridSimulation` และ `runMaFanSimulation` จากไส้แท่งก่อนหน้าเป็น `entryPrice`
+  6. **BTC Macro Sit-Out Timeframe Alignment (`src/backtest-service.ts`, `src/server.ts`)**:
+     - แก้ `scanMarket` และ `/api/backtest/run` ให้ดึง `BTCUSDT` ตาม `timeframe` จริงแทนการฮาร์ดโค้ด `"5m"`
+- **Version Bump & Typecheck**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.68`** ใน `package.json` และ `src/version.ts`
+  - ตรวจสอบ `npm run typecheck` และสคริปต์ยืนยันหลังแก้ไขครบถ้วน
+
+---
+
+## 314. v0.3.0.69 — Market-Aware Portfolio Engine Auto-Selection (`portfolioEngine: "auto" | "dip_hunter" | "legacy_pullback"`) (`src/backtest-service.ts`, `src/server.ts`, `public/backtest.html`, `public/backtest.js`)
+
+- **ผลการทดลองและสถาปัตยกรรมใหม่**:
+  - จากการทดสอบ Multi-Slot Portfolio Rotation (`15m`, `maxSlots=3`) ข้าม 3 ตลาด (`FDUSD`, `USDT`, `US Stocks`) พบว่า:
+    1. **Crypto (`FDUSD` & `USDT`)**: เครื่องยนต์ **`dip_hunter` (`MaFanCoreRules.evaluateModularEntry` + `evaluateExits`, `15m` + `1h` HTF, `cushionMode: "htfBull"`)** ชนะ `legacy_pullback` และ `trend_rider` ในทุกกรณี (`FDUSD +1.46%` PF `2.64` DD `-1.23%`, `USDT +0.96%` PF `1.35` DD `-2.03%`)
+    2. **US Stocks (`USD`)**: เครื่องยนต์ **`legacy_pullback` (`EMA4 Pullback -> EMA200`)** ยังแข็งแรงกว่า (`+2.68%` ที่ `sitOut=dual` / `+8.28%` ที่ `sitOut=off`, WR `71%–79%`)
+  - **การแก้ไขและเชื่อมต่อระบบ**:
+    1. เพิ่ม `PortfolioEngineMode = "auto" | "dip_hunter" | "legacy_pullback"` และเมธอด `resolvePortfolioEngine` + `runDipHunterPortfolioSimulation` ใน `src/backtest-service.ts` (`"auto"` เลือก `dip_hunter` ให้ Crypto และ `legacy_pullback` ให้ US Stocks อัตโนมัติ พร้อมแก้ fallback benchmark ของ `runMaFanPortfolioRotationWrapper` ให้ใช้ `"15m"` ตรงกับ universe)
+    2. เพิ่มการส่งค่า `portfolioEngine` และ `tp1TargetMode = "auto"` (`EMA25` สำหรับ Dip Hunter / `EMA200` สำหรับ Legacy Pullback) ใน `src/server.ts`, `public/backtest.html`, และ `public/backtest.js`
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.69`** ใน `package.json` และ `src/version.ts`
+
+---
+
+## 315. v0.3.0.70 — Unified `ma_fan` ("MA-Fan") Portfolio Engine Default Across Crypto & US Stocks (`src/backtest-service.ts`, `src/server.ts`, `public/backtest.html`)
+
+- **ผลการทดสอบระยะยาว (97.1–136.2 วัน)**:
+  - เมื่อขยายการทดสอบพอร์ตเป็น 90+ วัน:
+    1. **Crypto `FDUSD` (97.1 วัน, `2026-08-07` ➔ `2026-11-13`, 5 เหรียญหลัก, `$200`, `sitOut="dual"`)**: กลยุทธ์ **MA-Fan (`EMA4 Pullback -> EMA200`)** ทำกำไร **`+5.44%` (`+$10.88`, `WR 81.3%`, `PF 1.65`, `MaxDD -3.90%`)** ชนะทุกเดือนที่เป็นขาขึ้น/ไซด์เวย์และรอดเดือนขาลง ขณะที่ `dip_hunter` ติดลบ `-1.75%` (`WR 31.6%`, `PF 0.59`) และ `Dynamic Grid DNA` (`grid_sequential`) ติดลบ `-2.23%`
+    2. **US Stocks `USD` (136.2 วัน, `2026-06-29` ➔ `2026-11-12`, 25 หุ้น, `$200`)**: **MA-Fan** ทำกำไร **`+5.26%` (`sitOut="dual"`, `WR 74.4%`, `PF 1.45`)** / **`+10.13%` (`sitOut="off"`, `WR 78.8%`, `PF 1.79`)** ขณะที่ `Dynamic Grid DNA` ติดลบ `-9.91%`
+- **การแก้ไขและเปลี่ยนชื่อมาตรฐาน**:
+  1. **เปลี่ยนชื่อจาก `legacy_pullback` เป็น `ma_fan` (`MA-Fan`) (`src/backtest-service.ts`, `src/server.ts`, `public/backtest.html`)**:
+     - เพิ่ม `"ma_fan"` ใน `PortfolioEngineMode` และเปลี่ยน Return Type ของ `BacktestService.resolvePortfolioEngine` เป็น `"dip_hunter" | "ma_fan"` (ยังคงรับ `"legacy_pullback"` เป็น backward-compatible alias ที่ normalize เป็น `"ma_fan"` เพื่อไม่ให้ caller เก่าพัง)
+     - ปรับ `resolvePortfolioEngine("auto", ...)` ให้เลือก **`"ma_fan"`** เป็นตัวหลักสำหรับ **ทั้ง Crypto และ US Stocks** และอัปเดต `engineLabel` เป็น `"MA-Fan"`
+     - ใน `runMaFanPortfolioRotationWrapper`: เมื่อ `resolvedEngine === "ma_fan"` และ `tp1TargetMode === "auto"` ระบบจะใช้ `TP1 = EMA200` + Lock Breakeven เป็นค่าเริ่มต้นทั้งสองตลาด
+     - อัปเดต UI Dropdown ใน `public/backtest.html` (`#rotBtPortfolioEngine`, `#rotBtTp1Target`) ให้แสดงชื่อ **MA-Fan** และคำอธิบาย `"Auto (MA-Fan สำหรับ Crypto & US Stocks - แนะนำ)"`
+- **Version Bump & Verification**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.70`** ใน `package.json` และ `src/version.ts`
+
+---
+
+## 316. v0.3.0.71 — Disambiguate Strategy Naming (`ma_ribbon` / "MA-Ribbon" vs Portfolio `ma_fan` / "MA-Fan") + Scanner Zero-Fee Auto-Enforcement for Alpaca/FDUSD (`src/strategy/*`, `src/config.ts`, `src/index.ts`, `src/server.ts`, `public/*`)
+
+- **สาเหตุและปัญหาที่แก้ไข**:
+  1. **ความซ้ำซ้อนของชื่อ `ma_fan` ระหว่างกลยุทธ์ระดับบอทเดี่ยว กับระดับพอร์ต Rotation**:
+     - ระบบกลยุทธ์เทรดเดี่ยว (`src/strategy/ma-fan/`) ใช้ `RibbonEngine` จับแถบริบบิ้น EMA จึงควรใช้ชื่อมาตรฐานว่า **`ma_ribbon` (`MA-Ribbon`)** เพื่อไม่ให้ซ้ำกับกลยุทธ์ **`ma_fan` (`MA-Fan`, `EMA4 Pullback -> EMA200`)** ใน Multi-Coin Portfolio (`portfolioEngine`)
+  2. **Tab 2 Market Scanner (`Backtest Leaderboard`) หักค่าฟี `0.075%` เกินจริงบนหุ้น US (Alpaca) และ `FDUSD`**:
+     - `/api/backtest/scan` ใน `src/server.ts` เดิมรับ `parsed.feeTier` (`"bnb" = 0.075%`) มาตรงๆ โดยไม่บังคับเป็น `0%` เมื่อ `scope === "alpaca_stocks"` หรือ `"fdusd"` (และบน UI `#scFeeTier` ก็ค้างอยู่ที่ `"bnb"`)
+- **การแก้ไขที่ทำ**:
+  1. **เพิ่ม `StrategyType = "dynamic_grid" | "swing_trade" | "ma_ribbon"` และตัวช่วย `normalizeStrategyType()` (`src/strategy/types.ts`)**:
+     - อัปเดต `createStrategy` (`src/strategy/factory.ts`), `MaFanTradingStrategy` (`src/strategy/ma-fan/strategy-adapter.ts`), `MaFanStrategy.getDashboardState` (`src/strategy/ma-fan/strategy.ts`), `loadConfigFromDatabase` (`src/config.ts`), `src/index.ts`, และ `/api/db/settings` (`src/server.ts`) ให้ใช้ `"ma_ribbon"` (`"MA-Ribbon"`) เป็นค่ามาตรฐาน
+     - **Backward Compatibility เต็มรูปแบบ**: คีย์ตั้งค่า `maFan*` และโฟลเดอร์ `src/strategy/ma-fan/` ยังคงเดิม และค่า `strategyType: "ma_fan"` จาก `settings.db.json` เก่าจะถูก normalize เป็น `"ma_ribbon"` อัตโนมัติไม่กระทบ Live Server
+  2. **อัปเดต UI Labels (`public/index.html`, `public/app.js`, `public/backtest.html`, `public/backtest.js`)**:
+     - เปลี่ยนป้าย **`MA-FOLD-FAN`** ➔ **`MA-Ribbon`**, ตัวเลือก `#cfg_strategyType` ➔ `ma_ribbon`, และกำกับ `Dip Hunter (MA-Ribbon 15m + 1h HTF)` ในพอร์ตเพื่อแยกกับ `MA-Fan (EMA4 Pullback -> EMA200)` อย่างชัดเจน
+  3. **บังคับ Zero-Fee + 0.01% Slippage ใน Market Scanner (`src/server.ts`, `public/backtest.js`)**:
+     - ใน `/api/backtest/scan`: เมื่อ `scope === "alpaca_stocks"` หรือ `"fdusd"` ระบบบังคับ `scanCostModel = { feePctPerSide: 0, slippagePctPerFill: 0.01 }` อัตโนมัติ พร้อมให้ `updateScannerMacroGateUI` ปรับ `#scFeeTier` เป็น `"zero"` ให้สอดคล้องกันบนหน้าเว็บ
+     - *(หมายเหตุจากการตรวจสอบ Alpaca จริง: Brokerage commission ของหุ้น/ETF สหรัฐฯ คือ `$0` จริง แต่อาจมี Regulatory pass-through fees เล็กน้อยอย่าง SEC Section 31 / FINRA TAF ฝั่งขาย และ CAT ซึ่งมักปัดขึ้นทีละ `$0.01` จึงคง Slippage `0.01%` ไว้เป็นการประมาณต้นทุนแฝงขั้นต่ำ)*
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.71`** ใน `package.json` และ `src/version.ts`

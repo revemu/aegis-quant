@@ -31,6 +31,7 @@ export interface Lot {
   qty: number;
   time: number;
   buyIdx?: number;
+  investQuote?: number;
 }
 
 export interface TradeRecord {
@@ -48,6 +49,9 @@ export interface BacktestConfig extends Partial<Config> {
   cutLossMode?: "CONFIRMED_CLOSE" | "WICK_INSTANT" | "OFF";
   floorBufferPct?: number;
   buyWeights?: number[];
+  feePctPerSide?: number;
+  slippagePctPerFill?: number;
+  takerFeePctPerSide?: number;
 }
 
 export interface BacktestResult {
@@ -119,6 +123,10 @@ export function runSimulation(symbol: string, candles: Candle[], customCfg: Back
   }
 
   let cash = cfg.budget;
+  const makerRate = ((cfg.feePctPerSide ?? 0) + (cfg.slippagePctPerFill ?? 0)) / 100;
+  const takerRate = cfg.takerFeePctPerSide !== undefined
+    ? cfg.takerFeePctPerSide / 100
+    : makerRate;
   let lots: Lot[] = [];
   const trades: TradeRecord[] = [];
   let peakEquity = cfg.budget;
@@ -179,7 +187,7 @@ export function runSimulation(symbol: string, candles: Candle[], customCfg: Back
 
     const currentBaseHeld = lots.reduce((sum, l) => sum + l.qty, 0);
     const avgEntry = currentBaseHeld > 0 ? lots.reduce((sum, l) => sum + l.price * l.qty, 0) / currentBaseHeld : 0;
-    const currentEquity = cash + currentBaseHeld * c.close;
+    const currentEquity = cash + currentBaseHeld * c.close * (1 - makerRate);
 
     if (currentEquity > peakEquity) peakEquity = currentEquity;
     const dd = peakEquity > 0 ? ((peakEquity - currentEquity) / peakEquity) * 100 : 0;
@@ -242,8 +250,10 @@ export function runSimulation(symbol: string, candles: Candle[], customCfg: Back
       if (currentBaseHeld > 0 && cfg.liquidateOnTrendSupportBreak) {
         // Liquidate
         const exitPrice = Math.min(c.open, uptrendLine!.currentLinePrice);
-        const pnl = (exitPrice - avgEntry) * currentBaseHeld;
-        cash += currentBaseHeld * exitPrice;
+        const totalCostQuote = lots.reduce((sum, l) => sum + (l.investQuote ?? l.price * l.qty), 0);
+        const netProceeds = currentBaseHeld * exitPrice * (1 - takerRate);
+        const pnl = netProceeds - totalCostQuote;
+        cash += netProceeds;
         if (pnl >= 0) { grossProfit += pnl; winTrades++; }
         else { grossLoss += Math.abs(pnl); lossTrades++; }
         trades.push({ type: "CUT_LOSS", price: exitPrice, qty: currentBaseHeld, pnl, time: c.time, reason: "Trend Support Liquidate" });
@@ -306,8 +316,10 @@ export function runSimulation(symbol: string, candles: Candle[], customCfg: Back
     // A0. Fast Cut: Dow Downtrend Emergency Exit
     if (cfg.enableExitOnDowntrendRegime && currentBaseHeld > 0 && isDowntrend) {
       const exitPrice = c.open;
-      const pnl = (exitPrice - avgEntry) * currentBaseHeld;
-      cash += currentBaseHeld * exitPrice;
+      const totalCostQuote = lots.reduce((sum, l) => sum + (l.investQuote ?? l.price * l.qty), 0);
+      const netProceeds = currentBaseHeld * exitPrice * (1 - takerRate);
+      const pnl = netProceeds - totalCostQuote;
+      cash += netProceeds;
       if (pnl >= 0) { grossProfit += pnl; winTrades++; }
       else { grossLoss += Math.abs(pnl); lossTrades++; }
       trades.push({ type: "CUT_LOSS", price: exitPrice, qty: currentBaseHeld, pnl, time: c.time, reason: "Fast Cut: Dow Downtrend" });
@@ -321,8 +333,10 @@ export function runSimulation(symbol: string, candles: Candle[], customCfg: Back
     }
     // A. Floor Cut Loss
     else if (isCutLossTriggered && currentBaseHeld > 0) {
-      const pnl = (cutLossPrice - avgEntry) * currentBaseHeld;
-      cash += currentBaseHeld * cutLossPrice;
+      const totalCostQuote = lots.reduce((sum, l) => sum + (l.investQuote ?? l.price * l.qty), 0);
+      const netProceeds = currentBaseHeld * cutLossPrice * (1 - takerRate);
+      const pnl = netProceeds - totalCostQuote;
+      cash += netProceeds;
       if (pnl >= 0) { grossProfit += pnl; winTrades++; }
       else { grossLoss += Math.abs(pnl); lossTrades++; }
       trades.push({ type: "CUT_LOSS", price: cutLossPrice, qty: currentBaseHeld, pnl, time: c.time, reason: "Floor Cut Loss" });
@@ -342,8 +356,10 @@ export function runSimulation(symbol: string, candles: Candle[], customCfg: Back
       (cfg.sellProfitMode !== "PORTFOLIO_AVG_PROFIT" || c.high >= avgEntry * (1 + cfg.minNetProfitPct / 100))
     ) {
       const exitPrice = upperBound;
-      const pnl = (exitPrice - avgEntry) * currentBaseHeld;
-      cash += currentBaseHeld * exitPrice;
+      const totalCostQuote = lots.reduce((sum, l) => sum + (l.investQuote ?? l.price * l.qty), 0);
+      const netProceeds = currentBaseHeld * exitPrice * (1 - makerRate);
+      const pnl = netProceeds - totalCostQuote;
+      cash += netProceeds;
       if (pnl >= 0) { grossProfit += pnl; winTrades++; completedCycles++; }
       else { grossLoss += Math.abs(pnl); lossTrades++; }
       trades.push({ type: "TAKE_PROFIT", price: exitPrice, qty: currentBaseHeld, pnl, time: c.time, reason: "Ceiling 100% Exit" });
@@ -363,8 +379,10 @@ export function runSimulation(symbol: string, candles: Candle[], customCfg: Back
       c.high >= structure.lastLh.price
     ) {
       const exitPrice = structure.lastLh.price;
-      const pnl = (exitPrice - avgEntry) * currentBaseHeld;
-      cash += currentBaseHeld * exitPrice;
+      const totalCostQuote = lots.reduce((sum, l) => sum + (l.investQuote ?? l.price * l.qty), 0);
+      const netProceeds = currentBaseHeld * exitPrice * (1 - makerRate);
+      const pnl = netProceeds - totalCostQuote;
+      cash += netProceeds;
       if (pnl >= 0) { grossProfit += pnl; winTrades++; completedCycles++; }
       else { grossLoss += Math.abs(pnl); lossTrades++; }
       trades.push({ type: "SELL", price: exitPrice, qty: currentBaseHeld, pnl, time: c.time, reason: "LH Dynamic Escape" });
@@ -412,11 +430,13 @@ export function runSimulation(symbol: string, candles: Candle[], customCfg: Back
 
               if (sellQty > 0) {
                 let rem = sellQty;
-                let tradePnl = 0;
+                let costClosed = 0;
                 while (rem > 0 && lots.length > 0) {
                   const l = lots[0]!;
                   const take = Math.min(l.qty, rem);
-                  tradePnl += (sPrice - l.price) * take;
+                  const lotCost = (l.investQuote ?? l.price * l.qty) * (take / Math.max(l.qty, 1e-12));
+                  costClosed += lotCost;
+                  if (l.investQuote !== undefined) l.investQuote = Math.max(0, l.investQuote - lotCost);
                   l.qty -= take;
                   rem -= take;
                   if (l.qty <= 1e-8) {
@@ -424,7 +444,9 @@ export function runSimulation(symbol: string, candles: Candle[], customCfg: Back
                     lots.shift();
                   }
                 }
-                cash += sellQty * sPrice;
+                const netProceeds = sellQty * sPrice * (1 - makerRate);
+                const tradePnl = netProceeds - costClosed;
+                cash += netProceeds;
                 if (tradePnl >= 0) { grossProfit += tradePnl; winTrades++; }
                 else { grossLoss += Math.abs(tradePnl); lossTrades++; }
                 trades.push({ type: "SELL", price: sPrice, qty: sellQty, pnl: tradePnl, time: c.time, reason: `Sell Target ${item.idx + 1}` });
@@ -468,7 +490,7 @@ export function runSimulation(symbol: string, candles: Candle[], customCfg: Back
         : (customCfg.buyWeights || cfg.buyLevelWeights || [35, 35, 30, 10, 10]);
       const totalWeight = weights.reduce((s, w) => s + w, 0);
 
-      const currentHeldQuote = lots.reduce((sum, l) => sum + l.price * l.qty, 0);
+      const currentHeldQuote = lots.reduce((sum, l) => sum + (l.investQuote ?? l.price * l.qty), 0);
       const currentHoldFrac = cfg.budget > 0 ? currentHeldQuote / cfg.budget : 0;
 
       if (currentHoldFrac < 0.95) {
@@ -494,9 +516,9 @@ export function runSimulation(symbol: string, candles: Candle[], customCfg: Back
             const weightFrac = (weights[bIdx] ?? 20) / totalWeight;
             const trancheBudget = Math.min(cash, cfg.budget * weightFrac);
             if (trancheBudget >= 5.0) {
-              const buyQty = trancheBudget / bPrice;
+              const buyQty = (trancheBudget * (1 - makerRate)) / bPrice;
               cash -= trancheBudget;
-              lots.push({ price: bPrice, qty: buyQty, time: c.time, buyIdx: bIdx });
+              lots.push({ price: bPrice, qty: buyQty, time: c.time, buyIdx: bIdx, investQuote: trancheBudget });
               filledBuyIndices.add(bIdx);
               trades.push({ type: "BUY", price: bPrice, qty: buyQty, time: c.time, reason: `Buy Level ${bIdx + 1}` });
               break;
@@ -511,9 +533,10 @@ export function runSimulation(symbol: string, candles: Candle[], customCfg: Back
 
   const lastCandle = candles[candles.length - 1]!;
   const finalHeldBase = lots.reduce((sum, l) => sum + l.qty, 0);
-  const finalAvg = finalHeldBase > 0 ? lots.reduce((sum, l) => sum + l.price * l.qty, 0) / finalHeldBase : 0;
-  const unrealizedPnl = finalHeldBase > 0 ? (lastCandle.close - finalAvg) * finalHeldBase : 0;
-  const finalEquity = cash + finalHeldBase * lastCandle.close;
+  const totalHeldCost = lots.reduce((sum, l) => sum + (l.investQuote ?? l.price * l.qty), 0);
+  const finalMtmValue = finalHeldBase * lastCandle.close * (1 - makerRate);
+  const unrealizedPnl = finalHeldBase > 0 ? finalMtmValue - totalHeldCost : 0;
+  const finalEquity = cash + finalMtmValue;
   const netPnl = finalEquity - cfg.budget;
   const netPnlPct = (netPnl / cfg.budget) * 100;
   const totalClosedTrades = winTrades + lossTrades;
@@ -557,11 +580,17 @@ export function runSimulation(symbol: string, candles: Candle[], customCfg: Back
 export function runSwingSimulation(
   symbol: string,
   candles: Candle[],
-  swingCfg: SwingStrategyConfig & { enableChoChGate?: boolean; name?: string },
+  swingCfg: SwingStrategyConfig & {
+    enableChoChGate?: boolean;
+    name?: string;
+    feePctPerSide?: number;
+    slippagePctPerFill?: number;
+  },
   initialBudget = 200,
 ): BacktestResult {
   const engine = new DowStructureEngine(3, true, 20.0, 600);
   const warmupCount = 120;
+  const costRate = ((swingCfg.feePctPerSide ?? 0) + (swingCfg.slippagePctPerFill ?? 0)) / 100;
 
   for (let i = 0; i < warmupCount && i < candles.length; i++) {
     engine.addCandle(candles[i]!);
@@ -600,7 +629,7 @@ export function runSwingSimulation(
       useOnlyClosedCandles: true,
     });
 
-    const currentEquity = cash + (activePos ? activePos.qty * c.close : 0);
+    const currentEquity = cash + (activePos ? activePos.qty * c.close * (1 - costRate) : 0);
     if (currentEquity > peakEquity) peakEquity = currentEquity;
     const dd = peakEquity > 0 ? ((peakEquity - currentEquity) / peakEquity) * 100 : 0;
     if (dd > maxDrawdown) maxDrawdown = dd;
@@ -627,8 +656,9 @@ export function runSwingSimulation(
       // 1. Stop Loss triggered
       if (c.low <= effectiveSl) {
         const exitP = Math.min(c.open, effectiveSl);
-        const pnl = (exitP - activePos.entryPrice) * activePos.qty;
-        cash += activePos.qty * exitP;
+        const proceeds = activePos.qty * exitP * (1 - costRate);
+        const pnl = proceeds - activePos.notional;
+        cash += proceeds;
         totalTrades++;
         if (pnl >= 0) {
           grossProfit += pnl;
@@ -644,23 +674,39 @@ export function runSwingSimulation(
       // 2. TP1 Target reached (close 50%, move SL to Breakeven)
       else if (!activePos.tp1Executed && c.high >= activePos.tp1Price) {
         const exitQty = activePos.qty * swingCfg.tp1CloseRatio;
-        const pnl = (activePos.tp1Price - activePos.entryPrice) * exitQty;
-        cash += exitQty * activePos.tp1Price;
-        grossProfit += pnl;
-        tpProfit += pnl;
-        winTrades++;
+        const tp1Cost = activePos.notional * swingCfg.tp1CloseRatio;
+        const proceeds = exitQty * activePos.tp1Price * (1 - costRate);
+        const pnl = proceeds - tp1Cost;
+        cash += proceeds;
+        if (pnl >= 0) {
+          grossProfit += pnl;
+          tpProfit += pnl;
+          winTrades++;
+        } else {
+          grossLoss += Math.abs(pnl);
+          cutLossLoss += Math.abs(pnl);
+          lossTrades++;
+        }
         totalTrades++;
         activePos.qty -= exitQty;
+        activePos.notional -= tp1Cost;
         activePos.tp1Executed = true;
         activePos.stopLossPrice = activePos.entryPrice; // Breakeven!
       }
       // 3. TP2 Target reached
       else if (activePos.tp1Executed && c.high >= activePos.tp2Price) {
-        const pnl = (activePos.tp2Price - activePos.entryPrice) * activePos.qty;
-        cash += activePos.qty * activePos.tp2Price;
-        grossProfit += pnl;
-        tpProfit += pnl;
-        winTrades++;
+        const proceeds = activePos.qty * activePos.tp2Price * (1 - costRate);
+        const pnl = proceeds - activePos.notional;
+        cash += proceeds;
+        if (pnl >= 0) {
+          grossProfit += pnl;
+          tpProfit += pnl;
+          winTrades++;
+        } else {
+          grossLoss += Math.abs(pnl);
+          cutLossLoss += Math.abs(pnl);
+          lossTrades++;
+        }
         totalTrades++;
         activePos = null;
       }
@@ -688,7 +734,7 @@ export function runSwingSimulation(
         if (signal.hasSignal && signal.entryPrice > 0) {
           const budgetForTrade = cash * (swingCfg.maxPositionPct / 100);
           const entryPrice = c.close;
-          const qty = budgetForTrade / entryPrice;
+          const qty = (budgetForTrade * (1 - costRate)) / entryPrice;
           cash -= budgetForTrade;
           activePos = {
             entryPrice,
@@ -709,13 +755,11 @@ export function runSwingSimulation(
   }
 
   // Close remaining position if any
-  let unrealizedPnl = 0;
-  if (activePos && candles.length > 0) {
-    const lastClose = candles[candles.length - 1]!.close;
-    unrealizedPnl = (lastClose - activePos.entryPrice) * activePos.qty;
-  }
+  const lastClose = candles.length > 0 ? candles[candles.length - 1]!.close : 0;
+  const endPosVal = activePos ? activePos.qty * lastClose * (1 - costRate) : 0;
+  const unrealizedPnl = activePos ? endPosVal - activePos.notional : 0;
 
-  const netPnl = cash + (activePos ? activePos.qty * (candles[candles.length - 1]?.close || 0) : 0) - initialBudget;
+  const netPnl = cash + endPosVal - initialBudget;
   const netPnlPct = (netPnl / initialBudget) * 100;
   const winRate = totalTrades > 0 ? (winTrades / totalTrades) * 100 : 0;
   const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : (grossProfit > 0 ? 99.99 : 1.0);
@@ -927,6 +971,7 @@ async function main() {
   await runMasterBenchmark();
 }
 
-if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, "/")}` || process.argv[1]?.includes("backtest")) {
+const entryBase = path.basename(process.argv[1] || "");
+if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, "/")}` || entryBase === "backtest.ts" || entryBase === "backtest.js") {
   main().catch(console.error);
 }

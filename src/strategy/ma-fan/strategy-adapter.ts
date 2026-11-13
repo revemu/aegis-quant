@@ -9,20 +9,21 @@ import type { Config } from "../../config.js";
 import type { AtrSource } from "../../types.js";
 import { type Candle } from "../../market-structure.js";
 import { BotDatabase, getDatabase } from "../../db.js";
-import type {
-  IStrategy,
-  StrategyType,
-  StrategyContext,
-  StrategyEvent,
-  Lot,
-  OpenOrder,
+import {
+  normalizeStrategyType,
+  type IStrategy,
+  type StrategyType,
+  type StrategyContext,
+  type StrategyEvent,
+  type Lot,
+  type OpenOrder,
 } from "../types.js";
 import { MaFanStrategy } from "./strategy.js";
 import { MaFanConfig } from "./types.js";
 
 export class MaFanTradingStrategy implements IStrategy {
-  public readonly name = "MA-FOLD-FAN Reversion Trader";
-  public readonly strategyType: StrategyType = "ma_fan";
+  public readonly name = "MA-Ribbon Reversion Trader";
+  public readonly strategyType: StrategyType = "ma_ribbon";
 
   public atrSource: AtrSource;
   private exchange: IExchangeClient;
@@ -229,7 +230,7 @@ export class MaFanTradingStrategy implements IStrategy {
     const waitingList = cl?.waitingLabels ?? [];
 
     let botAction = {
-      title: cl ? `🎯 สแกนสัญญาณซื้อ (${clPassed}/${clTotal})` : "🪭 MA-FOLD-FAN",
+      title: cl ? `🎯 สแกนสัญญาณซื้อ (${clPassed}/${clTotal})` : "🎀 MA-Ribbon",
       reason: `สแกนพัด (${cl ? `ผ่าน ${clPassed}/${clTotal} ข้อ • ` : ""}Spread: ${curSpread.toFixed(2)}% / ≥ ${reqSpread.toFixed(2)}% • ${regimeStr})`,
       nextTrigger: waitingList.length > 0 ? `กำลังรอ: ${waitingList.slice(0, 3).join(", ")}` : "รอพัดกางตึงสุด + ปลายม้วนกลับ (Hook)",
       severity: clPassed >= 4 ? "warning" : "info",
@@ -270,8 +271,8 @@ export class MaFanTradingStrategy implements IStrategy {
     const tickData = {
       ...state,
       lastCalibration: compactCalibration,
-      strategyType: "ma_fan",
-      strategyMode: "ma_fan",
+      strategyType: "ma_ribbon",
+      strategyMode: "ma_ribbon",
       symbol: this.symbolInfo.symbol,
       symbolStatus: this.symbolInfo.status || "TRADING",
       executionTimeframe: this.cfg.maFanExecutionTimeframe || "5m",
@@ -396,13 +397,15 @@ export class MaFanTradingStrategy implements IStrategy {
   public getRuntimeConfig(): any {
     return {
       ...this.cfg,
-      strategyType: "ma_fan",
-      strategyMode: "ma_fan",
+      strategyType: "ma_ribbon",
+      strategyMode: "ma_ribbon",
     };
   }
 
   public updateRuntimeSettings(s: any): any {
-    if (s.strategyType) this.cfg.strategyType = s.strategyType;
+    if (s.strategyType || s.strategyMode) {
+      this.cfg.strategyType = normalizeStrategyType(s.strategyType ?? s.strategyMode);
+    }
     if (s.symbol) {
       const clean = String(s.symbol).toUpperCase().replace(/[\/\-_:]/g, "");
       this.cfg.symbol = clean;

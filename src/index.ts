@@ -5,7 +5,7 @@
 
 import { config } from "./config.js";
 import { createExchangeClient, type IExchangeClient } from "./exchange/index.js";
-import { DynamicGrid, createStrategy, type IStrategy } from "./strategy.js";
+import { DynamicGrid, createStrategy, normalizeStrategyType, type IStrategy } from "./strategy.js";
 import { VolatilityEngine } from "./volatility.js";
 import { BinanceAtrFeed, BinanceBookTickerFeed, BinanceUserDataFeed } from "./exchange/binance/feed.js";
 import { sanitizeHttpErrorBody } from "./exchange/binance/client.js";
@@ -37,7 +37,7 @@ function formatTimestamp(d = new Date()): string {
 }
 
 function getStrategyLogTag(): string {
-  if (config.strategyType === "ma_fan") return "ma-fold-fan";
+  if (config.strategyType === "ma_ribbon") return "ma-ribbon";
   if (config.strategyType === "swing_trade") return "swing-trade";
   return "dynamic-grid";
 }
@@ -139,12 +139,12 @@ async function main(): Promise<void> {
     localTrendEngine.clearCandles();
     htfDowEngine.clearCandles();
 
-    const isMaFan = config.strategyType === "ma_fan";
-    const primaryInterval = isMaFan ? ((config.maFanExecutionTimeframe as string) || "5m") : config.dowTimeframe;
-    const htfInterval = isMaFan ? ((config.maFanSupervisorTimeframe as string) || "15m") : config.htfTimeframe;
-    const initialCandleLimit = isMaFan ? 1000 : (config.initialCandleCount ?? 300);
+    const isMaRibbon = config.strategyType === "ma_ribbon";
+    const primaryInterval = isMaRibbon ? ((config.maFanExecutionTimeframe as string) || "5m") : config.dowTimeframe;
+    const htfInterval = isMaRibbon ? ((config.maFanSupervisorTimeframe as string) || "15m") : config.htfTimeframe;
+    const initialCandleLimit = isMaRibbon ? 1000 : (config.initialCandleCount ?? 300);
 
-    if (isMaFan) {
+    if (isMaRibbon) {
       macroDowEngine.setMaxCandles(1400);
       dashboard?.setMaxCandles?.(1400);
     }
@@ -516,8 +516,9 @@ async function main(): Promise<void> {
         }
       }
 
-      // 3. Handle Strategy Type switch dynamically (e.g. Dynamic Grid <-> Swing Trade <-> MA Fan)
-      const nextStrat = s.strategyType || s.strategyMode;
+      // 3. Handle Strategy Type switch dynamically (e.g. Dynamic Grid <-> Swing Trade <-> MA-Ribbon)
+      const rawNextStrat = s.strategyType || s.strategyMode;
+      const nextStrat = rawNextStrat ? normalizeStrategyType(rawNextStrat) : undefined;
       if (nextStrat && nextStrat !== prevConfig.strategyType) {
         log(`🔄 [STRATEGY SWITCH] Switching active strategy from ${prevConfig.strategyType || "dynamic_grid"} to ${nextStrat}...`);
         try {
@@ -601,7 +602,7 @@ async function main(): Promise<void> {
         (s.maFanExecutionTimeframe && s.maFanExecutionTimeframe !== prevMaFanExecTf) ||
         (s.maFanSupervisorTimeframe && s.maFanSupervisorTimeframe !== prevMaFanSupTf)
       ) {
-        if (config.strategyType === "ma_fan") {
+        if (config.strategyType === "ma_ribbon") {
           if (s.maFanExecutionTimeframe) config.maFanExecutionTimeframe = s.maFanExecutionTimeframe;
           if (s.maFanSupervisorTimeframe) config.maFanSupervisorTimeframe = s.maFanSupervisorTimeframe;
           await initFeeds(symbolInfo.symbol);
@@ -625,8 +626,8 @@ async function main(): Promise<void> {
           wakeSleep?.();
           return res;
         }
-        const isMaFanStrategy = (s.strategyType || s.strategyMode || config.strategyType) === "ma_fan";
-        const fetchLimit = isMaFanStrategy ? 1000 : (s.initialCandleCount ?? res.initialCandleCount ?? 300);
+        const isMaRibbonStrategy = normalizeStrategyType(s.strategyType || s.strategyMode || config.strategyType) === "ma_ribbon";
+        const fetchLimit = isMaRibbonStrategy ? 1000 : (s.initialCandleCount ?? res.initialCandleCount ?? 300);
         const tf = s.dowTimeframe ?? res.dowTimeframe ?? config.dowTimeframe;
         const microTf = s.tradingTimeframe ?? res.tradingTimeframe ?? config.tradingTimeframe ?? "5m";
         try {
@@ -752,7 +753,7 @@ async function main(): Promise<void> {
     port: config.dashboardPort,
     log,
     db: grid.getDatabase(),
-    maxCandles: config.strategyType === "ma_fan" ? 1200 : (config.maxCandleCount ?? 600),
+    maxCandles: config.strategyType === "ma_ribbon" ? 1200 : (config.maxCandleCount ?? 600),
     getSettings: () => grid.getRuntimeConfig(),
     onUpdateSettings: (s) => onUpdateSettings(s),
     onPauseBot: (paused) => grid.setPaused(paused),

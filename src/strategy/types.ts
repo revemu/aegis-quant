@@ -200,7 +200,14 @@ export interface IStrategyHost {
   getTotalPortfolioValueQuote(refP: number): number;
 }
 
-export type StrategyType = "dynamic_grid" | "swing_trade" | "ma_fan";
+export type StrategyType = "dynamic_grid" | "swing_trade" | "ma_ribbon";
+
+/** Normalize persisted or legacy strategy type aliases ("ma_fan" -> "ma_ribbon"). */
+export function normalizeStrategyType(raw?: unknown): StrategyType {
+  if (raw === "swing_trade") return "swing_trade";
+  if (raw === "ma_ribbon" || raw === "ma_fan") return "ma_ribbon";
+  return "dynamic_grid";
+}
 
 export interface StrategyContext {
   exchange: IExchangeClient;

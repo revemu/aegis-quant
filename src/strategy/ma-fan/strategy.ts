@@ -315,6 +315,11 @@ export class MaFanStrategy {
 
         const exitDecision = MaFanCoreRules.evaluateExits({
           positionSide: pos.positionSide ?? "LONG",
+          engineType: pos.engineType,
+          tp1TargetPrice: pos.tp1TargetPrice,
+          tp1TargetMode: this.config.tp1Target,
+          lockBreakevenAtEma200: this.config.lockBreakevenAtEma200,
+          maxDisasterSlPct: this.config.maxDisasterSlPct,
           highPrice: refPrice,
           lowPrice: refPrice,
           closePrice: refPrice,
@@ -480,6 +485,7 @@ export class MaFanStrategy {
           htfRegime,
           enableUpsideFloor: this.config.upsideFloorEnabled !== false,
           circuitBreakerActive: isCircuitActive,
+          maxSlPct: this.config.maxSlPct,
         });
 
         this.lastEntryChecklist = modularDecision.checklist ?? null;
@@ -507,7 +513,9 @@ export class MaFanStrategy {
               htfRegime,
               modularDecision.fanSpreadPct,
               curAtr,
-              modularDecision.engineType
+              modularDecision.engineType,
+              modularDecision.tp1TargetPrice,
+              modularDecision.stopLossPrice,
             );
 
             if (newPos) {
@@ -547,7 +555,9 @@ export class MaFanStrategy {
               htfRegime,
               modularDecision.fanSpreadPct,
               curAtr,
-              modularDecision.engineType
+              modularDecision.engineType,
+              modularDecision.tp1TargetPrice,
+              modularDecision.stopLossPrice,
             );
 
             if (newPos) {
@@ -636,8 +646,8 @@ export class MaFanStrategy {
     const isCircuitActive = this.config.circuitBreakerEnabled !== false && Date.now() < this.circuitBreakerCooldownUntil;
 
     return {
-      strategyType: "ma_fan",
-      strategyMode: "ma_fan",
+      strategyType: "ma_ribbon",
+      strategyMode: "ma_ribbon",
       symbol: this.symbol,
       isPaused: this.isPaused,
       activePosition: this.activePosition,

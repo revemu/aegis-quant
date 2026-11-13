@@ -11,6 +11,7 @@ import type { Candle } from "./market-structure.js";
 import { BotDatabase, getDatabase } from "./db.js";
 import { APP_VERSION_INFO } from "./version.js";
 import { BacktestService, TOP_US_STOCK_UNIVERSE } from "./backtest-service.js";
+import { normalizeStrategyType } from "./strategy/types.js";
 import { readLatestDecisionSnapshots } from "./strategy/ma-fan/decision-log.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -858,7 +859,7 @@ export class DashboardServer {
           const limit = Number(parsed.limit) || 1000;
           const spreadThreshold = parsed.spreadThreshold === "auto" ? "auto" : (Number(parsed.spreadThreshold) || 0.25);
           const budget = Number(parsed.budget) || Number(liveCfg.maFanMaxBudgetUsd) || 200;
-          const slBufferPct = Number(parsed.slBufferPct) || Number(liveCfg.maFanSlBufferPct) || 0.25;
+          const slBufferPct = parsed.slBufferPct !== undefined ? Number(parsed.slBufferPct) : (liveCfg.maFanSlBufferPct !== undefined ? Number(liveCfg.maFanSlBufferPct) : 0.25);
           const useRatchetSl = parsed.useRatchetSl !== false;
           const supervisorTimeframe = (parsed.supervisorTimeframe || liveCfg.maFanSupervisorTimeframe || "15m") as "15m" | "1h";
           const macroGateMode = parsed.macroGateMode || liveCfg.maFanMacroGate || "off";
@@ -870,8 +871,10 @@ export class DashboardServer {
           const maxSlPct = parsed.maxSlPct !== undefined ? Number(parsed.maxSlPct) : 1.80;
           const lockChannelInPosition = parsed.lockChannelInPosition !== undefined ? Boolean(parsed.lockChannelInPosition) : (liveCfg.lockChannelInPosition !== false);
 
+          const tradeModeStr = parsed.tradeMode || (liveCfg.maFanTradeMode as string) || "dip_hunter";
+          const isGridOrHybrid = tradeModeStr === "dynamic_grid" || tradeModeStr === "dual_hybrid" || tradeModeStr === "swing_trade";
           const isAutoSpread = spreadThreshold === "auto";
-          const warmupPrefixBars = isAutoSpread ? 1200 : 0;
+          const warmupPrefixBars = isAutoSpread ? 1200 : (isGridOrHybrid ? 200 : 0);
           const fetchLimit = limit + warmupPrefixBars;
 
           // Compute required HTF supervisor candles based on fetchLimit and timeframe ratio
@@ -917,13 +920,13 @@ export class DashboardServer {
           if (downtrendSitOut !== "off") {
             fetches.push(
               isAlpaca
-                ? BacktestService.fetchAlpacaCandles("SPY", "5m", fetchLimit).catch(() => [])
-                : BacktestService.fetchBinanceCandles("BTCUSDT", "5m", fetchLimit).catch(() => [])
+                ? BacktestService.fetchAlpacaCandles("SPY", timeframe, fetchLimit).catch(() => [])
+                : BacktestService.fetchBinanceCandles("BTCUSDT", timeframe, fetchLimit).catch(() => [])
             );
           }
 
           const [candles, candlesHtf, btcCandles] = await Promise.all(fetches);
-          const actualWarmup = isAutoSpread ? Math.max(0, candles.length - limit) : 0;
+          const actualWarmup = warmupPrefixBars > 0 ? Math.max(0, candles.length - limit) : 0;
 
           const result = BacktestService.runMaFanSimulation(candles, {
             symbol,
@@ -955,6 +958,7 @@ export class DashboardServer {
             tradeDirection: parsed.tradeDirection || (liveCfg.maFanTradeDirection as any) || "long",
             enableBaseConfirmationFilter: hlMode,
             channelMode: parsed.channelMode || (liveCfg.channelMode as any) || "DONCHIAN_ATR",
+            vpLookbackBars: parsed.vpLookbackBars !== undefined ? Number(parsed.vpLookbackBars) : (Number(liveCfg.vpLookbackBars) || 192),
             donchianPeriod: parsed.donchianPeriod !== undefined ? Number(parsed.donchianPeriod) : (Number(liveCfg.donchianPeriod) || 48),
             minChannelWidthPct: parsed.minChannelWidthPct !== undefined ? Number(parsed.minChannelWidthPct) : (Number(liveCfg.minChannelWidthPct) || 2.0),
             maxChannelWidthPct: parsed.maxChannelWidthPct !== undefined ? Number(parsed.maxChannelWidthPct) : (Number(liveCfg.maxChannelWidthPct) || 20.0),
@@ -968,8 +972,29 @@ export class DashboardServer {
             gridCutLossMode: parsed.gridCutLossMode || (liveCfg.gridCutLossMode as any) || "none",
             zoneExitMode: parsed.zoneExitMode || (liveCfg.zoneExitMode as any) || "PORTFOLIO_AVG",
             minNetProfitPct: parsed.minNetProfitPct !== undefined ? Number(parsed.minNetProfitPct) : (Number(liveCfg.minNetProfitPct) || 0.25),
-            warmupBars: actualWarmup,
-            trimWarmupPrefix: isAutoSpread && actualWarmup > 0,
+            buyLevelPcts: Array.isArray(parsed.buyLevelPcts) ? parsed.buyLevelPcts.map(Number) : undefined,
+            sellLevelPcts: Array.isArray(parsed.sellLevelPcts) ? parsed.sellLevelPcts.map(Number) : undefined,
+            buyWeights: Array.isArray(parsed.buyWeights) ? parsed.buyWeights.map(Number) : undefined,
+            gridHtfGovernor: parsed.gridHtfGovernor,
+            swingConfig: {
+              minRiskReward: parsed.swingConfig?.minRiskReward !== undefined ? Number(parsed.swingConfig.minRiskReward) : (Number(liveCfg.swingMinRiskReward) || 2.0),
+              stopLossBufferPct: parsed.swingConfig?.stopLossBufferPct !== undefined ? Number(parsed.swingConfig.stopLossBufferPct) : (Number(liveCfg.swingStopLossBufferPct) || 0.5),
+              maxPositionPct: parsed.swingConfig?.maxPositionPct !== undefined ? Number(parsed.swingConfig.maxPositionPct) : (Number(liveCfg.swingMaxPositionPct) || 60.0),
+              tp1CloseRatio: parsed.swingConfig?.tp1CloseRatio !== undefined ? Number(parsed.swingConfig.tp1CloseRatio) : (Number(liveCfg.swingTp1CloseRatio) || 0.5),
+              tp1TargetType: parsed.swingConfig?.tp1TargetType || liveCfg.swingTp1TargetType || "CENTER_POC",
+              tp2TargetType: parsed.swingConfig?.tp2TargetType || liveCfg.swingTp2TargetType || "SWING_HIGH_HH",
+              trailingActivationPct: parsed.swingConfig?.trailingActivationPct !== undefined ? Number(parsed.swingConfig.trailingActivationPct) : (Number(liveCfg.swingTrailingActivationPct) || 1.5),
+              trailingPullbackPct: parsed.swingConfig?.trailingPullbackPct !== undefined ? Number(parsed.swingConfig.trailingPullbackPct) : (Number(liveCfg.swingTrailingPullbackPct) || 0.8),
+              enableHlBaseEntry: parsed.swingConfig?.enableHlBaseEntry !== undefined ? Boolean(parsed.swingConfig.enableHlBaseEntry) : (liveCfg.swingEnableHlBaseEntry !== false),
+              enableTrendlineBreakoutEntry: parsed.swingConfig?.enableTrendlineBreakoutEntry !== undefined ? Boolean(parsed.swingConfig.enableTrendlineBreakoutEntry) : Boolean(liveCfg.swingEnableTrendlineBreakoutEntry),
+              enableSupportRetestEntry: parsed.swingConfig?.enableSupportRetestEntry !== undefined ? Boolean(parsed.swingConfig.enableSupportRetestEntry) : (liveCfg.swingEnableSupportRetestEntry !== false),
+              enableBearishReversalExit: parsed.swingConfig?.enableBearishReversalExit !== undefined ? Boolean(parsed.swingConfig.enableBearishReversalExit) : (liveCfg.swingEnableBearishReversalExit !== false),
+              bearishReversalMinProfitPct: parsed.swingConfig?.bearishReversalMinProfitPct !== undefined ? Number(parsed.swingConfig.bearishReversalMinProfitPct) : (Number(liveCfg.swingBearishReversalMinProfitPct) || 0.35),
+              bearishReversalResistanceTolerancePct: parsed.swingConfig?.bearishReversalResistanceTolerancePct !== undefined ? Number(parsed.swingConfig.bearishReversalResistanceTolerancePct) : (Number(liveCfg.swingBearishReversalResistanceTolerancePct) || 0.8),
+              orderExecutionMode: (parsed.swingConfig?.orderExecutionMode || liveCfg.orderExecutionMode || "MAKER_LIMIT") as "MAKER_LIMIT" | "IOC_BRACKET",
+            },
+            warmupBars: actualWarmup > 0 ? actualWarmup : undefined,
+            trimWarmupPrefix: actualWarmup > 0,
           });
 
           console.log(`[Backtest] ✅ Simulation complete for ${symbol}: Net PnL ${(result.summary.netPnlPct >= 0 ? '+' : '')}${result.summary.netPnlPct.toFixed(2)}% | Win Rate ${result.summary.winRate.toFixed(1)}% | ${result.summary.totalTrades} trades`);
@@ -1012,10 +1037,17 @@ export class DashboardServer {
             const limit = Number(parsed.limit) || 4000;
             const initialCapital = Number(parsed.initialCapital) || 200;
             const maxSlots = Number(parsed.maxSlots) || 3;
-            const tp1TargetMode = parsed.tp1TargetMode || "EMA200";
+            const portfolioEngine = parsed.portfolioEngine === "dip_hunter"
+              ? "dip_hunter"
+              : parsed.portfolioEngine === "ma_fan" || parsed.portfolioEngine === "legacy_pullback"
+              ? "ma_fan"
+              : "auto";
+            const tp1TargetMode = parsed.tp1TargetMode || "auto";
             const lockBreakevenAtEma200 = parsed.lockBreakevenAtEma200 !== false;
             const partialTpAtEma200 = parsed.partialTpAtEma200 !== false;
-            const maxDisasterSlPct = parsed.maxDisasterSlPct !== undefined && parsed.maxDisasterSlPct !== "none" ? Number(parsed.maxDisasterSlPct) : 3.5;
+            const maxDisasterSlPct = parsed.maxDisasterSlPct === "none"
+              ? 0
+              : (parsed.maxDisasterSlPct !== undefined ? Number(parsed.maxDisasterSlPct) : 3.5);
             const excludeToxicMemes = parsed.excludeToxicMemes !== false && parsed.excludeToxicMemes !== "false";
             const downtrendSitOutMode = parsed.downtrendSitOutMode || "dual";
             const rankBy = parsed.rankBy || "COMPOSITE_QUALITY";
@@ -1026,6 +1058,7 @@ export class DashboardServer {
               limit,
               initialCapital,
               portfolioMode: "mafan_portfolio",
+              portfolioEngine,
               maxSlots,
               tp1TargetMode,
               lockBreakevenAtEma200,
@@ -1043,9 +1076,9 @@ export class DashboardServer {
             const maxUniversePairs = Number(parsed.maxUniversePairs) || 50;
             const limit = Number(parsed.limit) || 2000;
             const initialCapital = Number(parsed.initialCapital) || 200;
-            const rotationIntervalMinutes = Number(parsed.rotationIntervalMinutes) || 180;
-            const rotationIdleCashMinutes = Number(parsed.rotationIdleCashMinutes) || 120;
-            const rotationScoreMarginPct = Number(parsed.rotationScoreMarginPct) || 12;
+            const rotationIntervalMinutes = parsed.rotationIntervalMinutes !== undefined ? Number(parsed.rotationIntervalMinutes) : 180;
+            const rotationIdleCashMinutes = parsed.rotationIdleCashMinutes !== undefined ? Number(parsed.rotationIdleCashMinutes) : 120;
+            const rotationScoreMarginPct = parsed.rotationScoreMarginPct !== undefined ? Number(parsed.rotationScoreMarginPct) : 12;
             const capitalZones = parsed.capitalZones !== undefined ? Number(parsed.capitalZones) : 1;
             const channelMode = parsed.channelMode || "DONCHIAN_ATR";
             const gridCutLossMode = parsed.gridCutLossMode || "entry_floor";
@@ -1129,7 +1162,10 @@ export class DashboardServer {
           const downtrendSitOutMode = parsed.downtrendSitOutMode || (parsed.tradeMode === "dynamic_grid" ? (parsed.scGridMacroGate || "dual") : undefined);
 
           let scanCostModel: { feePctPerSide: number; slippagePctPerFill: number } | undefined;
-          if (parsed.feeTier === "zero" || parsed.feeTier === "none") {
+          if (scope === "alpaca_stocks" || scope === "fdusd") {
+            // Alpaca US Equities & Binance FDUSD pairs carry 0% trading fee (0.01% slippage proxy)
+            scanCostModel = { feePctPerSide: 0, slippagePctPerFill: 0.01 };
+          } else if (parsed.feeTier === "zero" || parsed.feeTier === "none") {
             scanCostModel = { feePctPerSide: 0, slippagePctPerFill: 0 };
           } else if (parsed.feeTier === "standard") {
             scanCostModel = { feePctPerSide: 0.10, slippagePctPerFill: 0.01 };
@@ -1140,7 +1176,26 @@ export class DashboardServer {
           this.currentScanProgress = { index: 0, total: 0, symbol: "Starting...", candlesCount: 0 };
           const scanType = (parsed.scanType || "grid_dna") as "grid_dna" | "mafan_setups" | "backtest_leaderboard";
 
-          if (scanType === "grid_dna" || scanType === "backtest_leaderboard") {
+          const scanSwingConfig = {
+            minRiskReward: parsed.swingConfig?.minRiskReward !== undefined ? Number(parsed.swingConfig.minRiskReward) : (Number(liveCfg.swingMinRiskReward) || 2.0),
+            stopLossBufferPct: parsed.swingConfig?.stopLossBufferPct !== undefined ? Number(parsed.swingConfig.stopLossBufferPct) : (Number(liveCfg.swingStopLossBufferPct) || 0.5),
+            maxPositionPct: parsed.swingConfig?.maxPositionPct !== undefined ? Number(parsed.swingConfig.maxPositionPct) : (Number(liveCfg.swingMaxPositionPct) || 60.0),
+            tp1CloseRatio: parsed.swingConfig?.tp1CloseRatio !== undefined ? Number(parsed.swingConfig.tp1CloseRatio) : (Number(liveCfg.swingTp1CloseRatio) || 0.5),
+            tp1TargetType: parsed.swingConfig?.tp1TargetType || liveCfg.swingTp1TargetType || "CENTER_POC",
+            tp2TargetType: parsed.swingConfig?.tp2TargetType || liveCfg.swingTp2TargetType || "SWING_HIGH_HH",
+            trailingActivationPct: parsed.swingConfig?.trailingActivationPct !== undefined ? Number(parsed.swingConfig.trailingActivationPct) : (Number(liveCfg.swingTrailingActivationPct) || 1.5),
+            trailingPullbackPct: parsed.swingConfig?.trailingPullbackPct !== undefined ? Number(parsed.swingConfig.trailingPullbackPct) : (Number(liveCfg.swingTrailingPullbackPct) || 0.8),
+            enableHlBaseEntry: parsed.swingConfig?.enableHlBaseEntry !== undefined ? Boolean(parsed.swingConfig.enableHlBaseEntry) : (liveCfg.swingEnableHlBaseEntry !== false),
+            enableTrendlineBreakoutEntry: parsed.swingConfig?.enableTrendlineBreakoutEntry !== undefined ? Boolean(parsed.swingConfig.enableTrendlineBreakoutEntry) : Boolean(liveCfg.swingEnableTrendlineBreakoutEntry),
+            enableSupportRetestEntry: parsed.swingConfig?.enableSupportRetestEntry !== undefined ? Boolean(parsed.swingConfig.enableSupportRetestEntry) : (liveCfg.swingEnableSupportRetestEntry !== false),
+            enableBearishReversalExit: parsed.swingConfig?.enableBearishReversalExit !== undefined ? Boolean(parsed.swingConfig.enableBearishReversalExit) : (liveCfg.swingEnableBearishReversalExit !== false),
+            bearishReversalMinProfitPct: parsed.swingConfig?.bearishReversalMinProfitPct !== undefined ? Number(parsed.swingConfig.bearishReversalMinProfitPct) : (Number(liveCfg.swingBearishReversalMinProfitPct) || 0.35),
+            bearishReversalResistanceTolerancePct: parsed.swingConfig?.bearishReversalResistanceTolerancePct !== undefined ? Number(parsed.swingConfig.bearishReversalResistanceTolerancePct) : (Number(liveCfg.swingBearishReversalResistanceTolerancePct) || 0.8),
+            orderExecutionMode: (parsed.swingConfig?.orderExecutionMode || liveCfg.orderExecutionMode || "MAKER_LIMIT") as "MAKER_LIMIT" | "IOC_BRACKET",
+          };
+          const vpLookbackBars = parsed.vpLookbackBars !== undefined ? Number(parsed.vpLookbackBars) : (Number(liveCfg.vpLookbackBars) || 192);
+
+          if (scanType === "grid_dna") {
             const hlModeStr = enableBaseConfirmationFilter ? "ON (รอสร้างฐาน HL - บอทจริง)" : "OFF (Pure Grid - ดักเก็บทุกรอบ)";
             console.log(`[MarketScanner] 🚀 Starting Dynamic Grid Market Scan (Scope: ${scope}, TF: ${timeframe}, Limit: ${limit} bars, Engine: dynamic_grid, HL Filter: ${hlModeStr})...`);
 
@@ -1178,6 +1233,7 @@ export class DashboardServer {
               maxChannelWidthPct,
               donchianPeriod,
               channelMode,
+              vpLookbackBars,
               downtrendSitOutMode,
               gridHtfGovernor,
               maxChannelPos,
@@ -1215,8 +1271,9 @@ export class DashboardServer {
             return;
           }
 
+          const resolvedLeaderboardMode = (parsed.tradeMode || (liveCfg.strategyType === "swing_trade" ? "swing_trade" : liveCfg.strategyType === "dynamic_grid" ? "dynamic_grid" : liveCfg.maFanTradeMode) || "dip_hunter") as any;
           const hlModeStr = enableBaseConfirmationFilter ? "ON (รอสร้างฐาน HL - บอทจริง)" : "OFF (Pure Grid - ดักเก็บทุกรอบ)";
-          console.log(`[MarketScanner] 🚀 Starting Market Scan (Scope: ${scope}, TF: ${timeframe}, Limit: ${limit} bars, Engine: ${parsed.tradeMode || "dip_hunter"}, HL Filter: ${hlModeStr})...`);
+          console.log(`[MarketScanner] 🚀 Starting Market Scan (Scope: ${scope}, TF: ${timeframe}, Limit: ${limit} bars, Engine: ${resolvedLeaderboardMode}, HL Filter: ${hlModeStr})...`);
 
           const results = await BacktestService.scanMarket({
             scope,
@@ -1242,7 +1299,7 @@ export class DashboardServer {
             fastCutThresholdPct,
             stagnationBars,
             maxSlPct,
-            tradeMode: parsed.tradeMode || (liveCfg.maFanTradeMode as any) || "dip_hunter",
+            tradeMode: resolvedLeaderboardMode,
             tradeDirection: parsed.tradeDirection || (liveCfg.maFanTradeDirection as any) || "long",
             enableBaseConfirmationFilter,
             lockChannelInPosition,
@@ -1252,6 +1309,8 @@ export class DashboardServer {
             maxChannelWidthPct,
             donchianPeriod,
             channelMode,
+            vpLookbackBars,
+            swingConfig: scanSwingConfig,
             downtrendSitOutMode,
             gridHtfGovernor,
             maxChannelPos,
@@ -1348,6 +1407,11 @@ export class DashboardServer {
           try {
             const parsed = JSON.parse(body);
             if (parsed && typeof parsed === "object") {
+              if (parsed.strategyType !== undefined || parsed.strategyMode !== undefined) {
+                const normalized = normalizeStrategyType(parsed.strategyType ?? parsed.strategyMode);
+                parsed.strategyType = normalized;
+                if (parsed.strategyMode !== undefined) parsed.strategyMode = normalized;
+              }
               const updated = this.opts.onUpdateSettings
                 ? await this.opts.onUpdateSettings(parsed)
                 : (() => {

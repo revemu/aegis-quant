@@ -8,6 +8,7 @@
 
 import dotenv from "dotenv";
 import { getDatabase } from "./db.js";
+import { normalizeStrategyType, type StrategyType } from "./strategy/types.js";
 
 dotenv.config();
 
@@ -21,10 +22,10 @@ const cleanBinanceSymbol = envSymbol.toLowerCase().replace(/[\/\-_:]/g, "");
  */
 export const defaultStrategyConfig = {
   // ── Strategy Selection ──────────────────────────────────────────────────
-  /** Active Trading Strategy: "dynamic_grid" (default), "swing_trade", or "ma_fan". */
-  strategyType: "dynamic_grid" as "dynamic_grid" | "swing_trade" | "ma_fan",
-  get strategyMode(): "dynamic_grid" | "swing_trade" | "ma_fan" { return this.strategyType; },
-  set strategyMode(v: "dynamic_grid" | "swing_trade" | "ma_fan") { this.strategyType = v; },
+  /** Active Trading Strategy: "dynamic_grid" (default), "swing_trade", or "ma_ribbon". */
+  strategyType: "dynamic_grid" as StrategyType,
+  get strategyMode(): StrategyType { return this.strategyType; },
+  set strategyMode(v: StrategyType) { this.strategyType = normalizeStrategyType(v); },
 
   // ── MA Fan Strategy Parameters ──────────────────────────────────────────
   maFanExecutionTimeframe: "15m" as "5m" | "15m",
@@ -410,6 +411,9 @@ export function loadConfigFromDatabase(): typeof defaultStrategyConfig {
         ...defaultStrategyConfig,
         ...saved,
       };
+      if (saved.strategyType !== undefined || saved.strategyMode !== undefined) {
+        merged.strategyType = normalizeStrategyType(saved.strategyType ?? saved.strategyMode);
+      }
       if (saved.symbol) {
         merged.symbol = String(saved.symbol).toUpperCase().replace(/[\/\-_:]/g, "");
         merged.binanceSymbol = String(saved.symbol).toLowerCase().replace(/[\/\-_:]/g, "");

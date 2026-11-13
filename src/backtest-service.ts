@@ -7,9 +7,13 @@
 import fs from "fs";
 import path from "path";
 import { Candle, RibbonEngine, ExhaustionEngine, AutoCalibrator, RollingSpreadCalibrator, MaFanCoreRules, RegimeSupervisor, CushionMode, RibbonState, ExhaustionState, WaterfallGuardMode } from "./strategy/ma-fan/index.js";
+import type { EntryDecision } from "./strategy/ma-fan/core-rules.js";
 import { calcATR, calcEMA } from "./strategy/ma-fan/ribbon.js";
 import { calcRSI, calcMACD } from "./strategy/ma-fan/exhaustion.js";
 import { DowStructureEngine } from "./market-structure.js";
+import { VolumeProfileEngine } from "./market-structure/volume-profile.js";
+import { SwingSignalDetector } from "./strategy/swing/signals.js";
+import type { SwingStrategyConfig } from "./strategy/swing/config.js";
 import { getActiveBinanceTradingSymbols } from "./exchange/binance/client.js";
 import { isSyntheticOrStock } from "./pair-rotator.js";
 
@@ -190,13 +194,14 @@ export interface MarketScanOptions {
   fastCutThresholdPct?: number;
   stagnationBars?: number;
   maxSlPct?: number;
-  tradeMode?: "dip_hunter" | "trend_rider" | "dual" | "dynamic_grid" | "dual_hybrid";
+  tradeMode?: "dip_hunter" | "trend_rider" | "dual" | "dynamic_grid" | "dual_hybrid" | "swing_trade";
   tradeDirection?: "long" | "short" | "both";
   enableBaseConfirmationFilter?: boolean;
   lockChannelInPosition?: boolean;
   capitalZones?: number;
   gridCutLossMode?: "none" | "entry_floor" | "final_zone_floor";
   channelMode?: "DOW_SWINGS" | "DOW_ATR_CLAMP" | "FIXED_PCT_CLAMP" | "DONCHIAN_ATR" | "VOLUME_PROFILE_HTF";
+  vpLookbackBars?: number;
   donchianPeriod?: number;
   minChannelWidthPct?: number;
   maxChannelWidthPct?: number;
@@ -205,6 +210,7 @@ export interface MarketScanOptions {
   downtrendSitOutMode?: "off" | "btc1d" | "btc4h" | "dual";
   gridHtfGovernor?: "off" | "1h_ema200" | "4h_ema75";
   maxChannelPos?: number;
+  swingConfig?: Partial<SwingStrategyConfig>;
   onProgress?: (info: { index: number; total: number; symbol: string; candlesCount: number; pnlPct?: number; winRate?: number; tradesCount?: number }) => void;
 }
 
@@ -298,6 +304,8 @@ export interface MarketScanPersistence {
   setupResults?: MaFanLiveSetupItem[];
 }
 
+export type PortfolioEngineMode = "auto" | "ma_fan" | "dip_hunter" | "legacy_pullback";
+
 export interface MultiPairRotationOptions {
   quoteAsset: "FDUSD" | "USDT" | "USD";
   maxUniversePairs?: number;
@@ -307,8 +315,9 @@ export interface MultiPairRotationOptions {
   limit?: number;
   initialCapital?: number;
   portfolioMode?: "mafan_portfolio" | "grid_sequential";
+  portfolioEngine?: PortfolioEngineMode;
   maxSlots?: number;
-  tp1TargetMode?: "EMA25" | "EMA75" | "EMA200" | "none";
+  tp1TargetMode?: "auto" | "EMA25" | "EMA75" | "EMA200" | "none";
   lockBreakevenAtEma200?: boolean;
   partialTpAtEma200?: boolean;
   maxDisasterSlPct?: number;
@@ -1148,6 +1157,149 @@ export class BacktestService {
   }
 
   /**
+   * Consistent cash proceeds calculation for LONG and SHORT partial/full exits.
+   * Deducts exit transaction + slippage fee on exited notional symmetrically for both directions.
+   */
+  private static calcExitProceeds(
+    side: "LONG" | "SHORT",
+    qty: number,
+    entryPrice: number,
+    exitPrice: number,
+    costPerFill: number,
+  ): number {
+    if (side === "LONG") {
+      return qty * exitPrice * (1 - costPerFill);
+    }
+    const exitFee = qty * exitPrice * costPerFill;
+    return (qty * entryPrice) + (qty * (entryPrice - exitPrice)) - exitFee;
+  }
+
+  /**
+   * Apply post-TP1 Stop Loss adjustment and check conservative same-bar breakeven stop trigger.
+   */
+  private static resolvePostTp1StopLoss(
+    side: "LONG" | "SHORT",
+    entryPrice: number,
+    currentSl: number,
+    newStopLossPrice: number | undefined,
+    bar: Candle,
+    intrabarMode: "optimistic" | "closeBased" | "pessimistic",
+  ): { nextSl: number; hitIntrabarBe: boolean } {
+    let nextSl = currentSl;
+    if (newStopLossPrice) {
+      nextSl = side === "LONG"
+        ? Math.max(currentSl, newStopLossPrice)
+        : Math.min(currentSl, newStopLossPrice);
+    }
+    let hitBar = false;
+    if (side === "LONG") {
+      hitBar = intrabarMode === "closeBased" ? bar.close <= nextSl : intrabarMode === "pessimistic" ? bar.low <= nextSl : false;
+    } else {
+      hitBar = intrabarMode === "closeBased" ? bar.close >= nextSl : intrabarMode === "pessimistic" ? bar.high >= nextSl : false;
+    }
+    const hitIntrabarBe = Boolean(
+      newStopLossPrice &&
+      (side === "LONG" ? newStopLossPrice > entryPrice : newStopLossPrice < entryPrice) &&
+      hitBar,
+    );
+    return { nextSl, hitIntrabarBe };
+  }
+
+  /**
+   * Prepare higher-timeframe BTC/SPY context for macro downtrend sit-out gating.
+   */
+  private static prepareBtcSitOutContext(btcCandles?: Candle[]): {
+    btc4h: Candle[];
+    btc4hEma75: number[];
+    btc1d: Candle[];
+    btc1dEma25: number[];
+  } | null {
+    if (!btcCandles || btcCandles.length === 0) return null;
+    const btc4h = BacktestService.aggregateCandles(btcCandles, 240);
+    const btc4hEma75 = calcEMA(btc4h.map((c) => c.close), 75);
+    const btc1d = BacktestService.aggregateCandles(btcCandles, 1440);
+    const btc1dEma25 = calcEMA(btc1d.map((c) => c.close), 25);
+    return { btc4h, btc4hEma75, btc1d, btc1dEma25 };
+  }
+
+  private static getClosedHtfIndexAt(arr: Candle[], durationSec: number, targetSec: number): number {
+    let lo = 0;
+    let hi = arr.length - 1;
+    let ans = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (arr[mid]!.time + durationSec <= targetSec) {
+        ans = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    return ans;
+  }
+
+  private static isBtcSitOutActive(
+    ctx: { btc4h: Candle[]; btc4hEma75: number[]; btc1d: Candle[]; btc1dEma25: number[] } | null,
+    mode: "off" | "btc1d" | "btc4h" | "dual" | undefined,
+    targetSec: number,
+  ): boolean {
+    if (!ctx || !mode || mode === "off") return false;
+    const idx4h = BacktestService.getClosedHtfIndexAt(ctx.btc4h, 14400, targetSec);
+    const idx1d = BacktestService.getClosedHtfIndexAt(ctx.btc1d, 86400, targetSec);
+    const pass4h = idx4h >= 75 ? ctx.btc4h[idx4h]!.close >= ctx.btc4hEma75[idx4h]! : true;
+    const pass1d = idx1d >= 25 ? ctx.btc1d[idx1d]!.close >= ctx.btc1dEma25[idx1d]! : true;
+    if (mode === "dual") return !pass4h || !pass1d;
+    if (mode === "btc1d") return !pass1d;
+    if (mode === "btc4h") return !pass4h;
+    return false;
+  }
+
+  /**
+   * Precompute HTF EMA series (`1h` EMA200 or `4h` EMA75) from macro candles
+   * so Grid / Scanner / Rotation can evaluate macro trend gate causally on closed HTF bars.
+   */
+  private static prepareGridHtfGovernor(candles: Candle[]): {
+    htf1hCandles: Candle[];
+    htf1hEma200: number[];
+    htf4hCandles: Candle[];
+    htf4hEma75: number[];
+  } {
+    const htf1hCandles = BacktestService.aggregateCandles(candles, 60);
+    const htf4hCandles = BacktestService.aggregateCandles(candles, 240);
+    return {
+      htf1hCandles,
+      htf1hEma200: htf1hCandles.length > 0 ? calcEMA(htf1hCandles.map((c) => c.close), 200) : [],
+      htf4hCandles,
+      htf4hEma75: htf4hCandles.length > 0 ? calcEMA(htf4hCandles.map((c) => c.close), 75) : [],
+    };
+  }
+
+  private static isGridHtfGovernorPass(
+    ctx: { htf1hCandles: Candle[]; htf1hEma200: number[]; htf4hCandles: Candle[]; htf4hEma75: number[] } | null,
+    governor: "off" | "1h_ema200" | "4h_ema75" | undefined,
+    targetSec: number,
+  ): boolean {
+    if (!ctx || !governor || governor === "off") return true;
+    if (governor === "1h_ema200") {
+      const idx = BacktestService.getClosedHtfIndexAt(ctx.htf1hCandles, 3600, targetSec);
+      if (idx < 200) return true;
+      const ema = ctx.htf1hEma200[idx];
+      const close = ctx.htf1hCandles[idx]?.close;
+      if (!Number.isFinite(ema) || !Number.isFinite(close)) return true;
+      return close >= ema;
+    }
+    if (governor === "4h_ema75") {
+      const idx = BacktestService.getClosedHtfIndexAt(ctx.htf4hCandles, 14400, targetSec);
+      if (idx < 75) return true;
+      const ema = ctx.htf4hEma75[idx];
+      const close = ctx.htf4hCandles[idx]?.close;
+      if (!Number.isFinite(ema) || !Number.isFinite(close)) return true;
+      return close >= ema;
+    }
+    return true;
+  }
+
+  /**
    * Run full-fidelity simulation for Dynamic Grid (Dow Market Structure 4-Channel Grid)
    */
   public static runDynamicGridSimulation(
@@ -1163,6 +1315,7 @@ export class BacktestService {
       regimeFilterMode?: "SIDEWAY_ONLY" | "NO_DOWNTREND" | "UPTREND_AND_SIDEWAY" | "OFF";
       lockChannelInPosition?: boolean;
       channelMode?: "DOW_SWINGS" | "DOW_ATR_CLAMP" | "FIXED_PCT_CLAMP" | "DONCHIAN_ATR" | "VOLUME_PROFILE_HTF";
+      vpLookbackBars?: number;
       donchianPeriod?: number;
       minChannelWidthPct?: number;
       maxChannelWidthPct?: number;
@@ -1179,9 +1332,14 @@ export class BacktestService {
       buyLevelPcts?: number[];
       sellLevelPcts?: number[];
       buyWeights?: number[];
-      zoneExitMode?: "PORTFOLIO_AVG" | "ORIGINAL_TARGETS" | "PER_ZONE";
+      zoneExitMode?: "PORTFOLIO_AVG" | "ORIGINAL_TARGETS" | "PER_ZONE" | "HYBRID_ZONE_RECOVERY" | "AVG_PROFIT_ALL";
       minNetProfitPct?: number;
       startTradingBarIndex?: number;
+      warmupBars?: number;
+      trimWarmupPrefix?: boolean;
+      btcCandles?: Candle[];
+      downtrendSitOutMode?: "off" | "btc1d" | "btc4h" | "dual";
+      gridHtfGovernor?: "off" | "1h_ema200" | "4h_ema75";
       enableDipHunterEntryGuard?: boolean;
       onFlatCheckStop?: (state: {
         barIndex: number;
@@ -1203,6 +1361,7 @@ export class BacktestService {
   ): BacktestRecord {
     const symbol = opts.symbol.toUpperCase().replace(/[\/\-_:]/g, "");
     const timeframe = opts.timeframe || "5m";
+    const barsPer24h = timeframe === "5m" ? 288 : timeframe === "1h" ? 24 : 96;
     const initialCapital = opts.initialCapital ?? 200;
     const maxInventory = opts.maxInventoryQuote ?? initialCapital;
     const cm = opts.costModel ?? { feePctPerSide: 0, slippagePctPerFill: 0 };
@@ -1217,6 +1376,7 @@ export class BacktestService {
     const costPerFill = makerCostPerFill;
 
     const atrs = calcATR(candles, 14);
+    const btcSitOutCtx = BacktestService.prepareBtcSitOutContext(opts.btcCandles);
 
     // คำนวณ Multi-Timeframe EMAs บนฐาน 15m (O(N) Zero-Lookahead):
     // - 15m EMA50  = 50 bars
@@ -1276,6 +1436,9 @@ export class BacktestService {
     let stableFloorCandleCount = 0;
     let prevCandidateFloor: number | undefined = undefined;
     let lastZoneUnlockFloor: number | undefined = undefined;
+    const gridHtfCtx = opts.gridHtfGovernor && opts.gridHtfGovernor !== "off"
+      ? BacktestService.prepareGridHtfGovernor(candles)
+      : null;
     let activeChannel: {
       floor: number;
       ceiling: number;
@@ -1285,10 +1448,25 @@ export class BacktestService {
       sellTargets: number[];
     } | null = null;
 
+    const defaultWarmup = Math.min(100, Math.floor(candles.length / 4));
+    const startIdx = Math.max(
+      0,
+      Math.min(
+        candles.length > 0 ? candles.length - 1 : 0,
+        opts.startTradingBarIndex !== undefined
+          ? Math.max(defaultWarmup, opts.startTradingBarIndex)
+          : (opts.warmupBars !== undefined ? opts.warmupBars : defaultWarmup),
+      ),
+    );
+    const warmup = Math.min(defaultWarmup, startIdx > 0 ? startIdx : defaultWarmup);
     const dow = new DowStructureEngine(3, true, 20.0, 300);
-    const warmup = Math.min(100, Math.floor(candles.length / 4));
+    let consecutiveReds = 0;
     for (let k = 0; k < warmup; k++) {
-      dow.addCandle(candles[k]);
+      const wk = candles[k];
+      if (!wk) continue;
+      if (wk.close < wk.open) consecutiveReds++;
+      else consecutiveReds = 0;
+      dow.addCandle(wk);
     }
 
     const lockChannelInPosition = opts.lockChannelInPosition !== false;
@@ -1308,6 +1486,7 @@ export class BacktestService {
       zoneIndex?: number;
       qty: number;
       buyPrice: number;
+      investQuote: number;
       entryTime: number;
       entryIdx: number;
       targetPrice: number;
@@ -1335,53 +1514,69 @@ export class BacktestService {
     let tradeCounter = 0;
     let totalFeesQuote = 0;
 
-    const startIdx = opts.startTradingBarIndex !== undefined ? Math.max(warmup, opts.startTradingBarIndex) : warmup;
     let lastFlatTime = candles.length > startIdx ? candles[startIdx].time : Date.now();
     let wasHolding = false;
     let lastProcessedBar = candles.length > 0 ? candles.length - 1 : 0;
-    let consecutiveReds = 0;
+
+    const recordEquityAndDrawdown = (barTime: number, barClose: number, isActive: boolean, barIdx: number, forcePush = false) => {
+      const currentInvVal = heldLots.reduce((sum, l) => sum + (l.qty * barClose * (1 - costPerFill)), 0);
+      const curEquity = cash + currentInvVal;
+      if (curEquity > peakEquity) peakEquity = curEquity;
+      const dd = peakEquity > 0 ? ((peakEquity - curEquity) / peakEquity) * 100 : 0;
+      if (dd > maxDrawdownPct) maxDrawdownPct = dd;
+
+      if (isActive && (forcePush || barIdx % 6 === 0 || barIdx === candles.length - 1)) {
+        gridEquityCurve.push({ time: barTime, equity: Number(curEquity.toFixed(2)) });
+      }
+    };
 
     for (let i = warmup; i < candles.length; i++) {
       lastProcessedBar = i;
       const c = candles[i];
-      if (c.close < c.open) {
-        consecutiveReds++;
-      } else {
-        consecutiveReds = 0;
-      }
-      dow.addCandle(c);
+      const commitBarToHistory = () => {
+        if (c.close < c.open) consecutiveReds++;
+        else consecutiveReds = 0;
+        dow.addCandle(c);
+      };
 
       const isTradingActive = i >= startIdx;
+      const prevIdx = Math.max(0, i - 1);
+      const prevBar = candles[prevIdx]!;
+      const isBtcSitOut = BacktestService.isBtcSitOutActive(btcSitOutCtx, opts.downtrendSitOutMode, c.time);
 
-      const curAtr = atrs[i] ?? (c.close * 0.005);
-      const atrPct = c.close > 0 ? (curAtr / c.close) * 100 : 0.5;
+      const curAtr = atrs[prevIdx] ?? (prevBar.close * 0.005);
+      const atrPct = prevBar.close > 0 ? (curAtr / prevBar.close) * 100 : 0.5;
       const configuredMinWidth = opts.minChannelWidthPct ?? 2.0;
       // สำหรับสินทรัพย์ความผันผวนต่ำ (เช่น หุ้นสหรัฐฯ KO, SPY ที่ atrPct < 0.25%) อนุญาตให้บีบกรอบลงมาได้ถึง 1.0% ตาม ATR จริง
       const effectiveMinWidthFloor = atrPct < 0.25 ? Math.max(1.0, atrPct * 6.0) : configuredMinWidth;
       const dynamicMinWidth = Math.max(effectiveMinWidthFloor, Math.min(4.5, atrPct * 4.0));
 
-      const structure = dow.getStructure(c.close, undefined, {
+      const volumeProfile = opts.channelMode === "VOLUME_PROFILE_HTF"
+        ? VolumeProfileEngine.calculate(dow.getCandles(), opts.vpLookbackBars ?? 192)
+        : undefined;
+      const structure = dow.getStructure(prevBar.close, undefined, {
         useOnlyClosedCandles: true,
         mode: opts.channelMode ?? "DONCHIAN_ATR",
         donchianLookback: opts.donchianPeriod ?? 48,
         minChannelWidthPct: dynamicMinWidth,
         maxChannelWidthPct: opts.maxChannelWidthPct ?? 25.0,
         floorBufferPct: opts.floorBufferPct ?? 0.0,
+        volumeProfile,
       });
 
-      // 🌐 Multi-Timeframe (4H & 1H) Macro Governor & Structural Floor Calculation:
-      const curEma50 = ema50s[i] ?? c.close;
-      const cur1hEma20 = ema80s[i] ?? c.close;
-      const prev1hEma20 = ema80s[Math.max(0, i - 4)] ?? cur1hEma20;
-      const cur1hEma50 = ema200s[i] ?? c.close;
-      const prev1hEma50 = ema200s[Math.max(0, i - 8)] ?? cur1hEma50;
-      const cur4hEma20 = ema320s[i] ?? c.close;
-      const prev4hEma20 = ema320s[Math.max(0, i - 16)] ?? cur4hEma20;
-      const cur4hEma50 = ema800s[i] ?? c.close;
-      const prev4hEma50 = ema800s[Math.max(0, i - 16)] ?? cur4hEma50;
+      // 🌐 Multi-Timeframe (4H & 1H) Macro Governor & Structural Floor Calculation (Strictly Zero-Lookahead: prevIdx):
+      const curEma50 = ema50s[prevIdx] ?? prevBar.close;
+      const cur1hEma20 = ema80s[prevIdx] ?? prevBar.close;
+      const prev1hEma20 = ema80s[Math.max(0, prevIdx - 4)] ?? cur1hEma20;
+      const cur1hEma50 = ema200s[prevIdx] ?? prevBar.close;
+      const prev1hEma50 = ema200s[Math.max(0, prevIdx - 8)] ?? cur1hEma50;
+      const cur4hEma20 = ema320s[prevIdx] ?? prevBar.close;
+      const prev4hEma20 = ema320s[Math.max(0, prevIdx - 16)] ?? cur4hEma20;
+      const cur4hEma50 = ema800s[prevIdx] ?? prevBar.close;
+      const prev4hEma50 = ema800s[Math.max(0, prevIdx - 16)] ?? cur4hEma50;
 
       // คำนวณกรอบราคา 4H (240 แท่ง = 60 ชม.), 36h (144 แท่ง), และ 24h (96 แท่ง) แบบใช้เฉพาะแท่งที่ปิดแล้ว (i - 1) เพื่อป้องกัน Lookahead
-      const closedEndIdx = Math.max(0, i - 1);
+      const closedEndIdx = prevIdx;
       let htf4hHigh = candles[closedEndIdx].high;
       let htf4hLow = candles[closedEndIdx].low;
       let htf36hLow = candles[closedEndIdx].low;
@@ -1397,32 +1592,32 @@ export class BacktestService {
         if (k >= start96 && ck.low < htf24hLow) htf24hLow = ck.low;
       }
       const htf4hSpan = Math.max(0, htf4hHigh - htf4hLow);
-      const htf4hPosRatio = htf4hSpan > 0 ? (c.close - htf4hLow) / htf4hSpan : 0.5;
+      const htf4hPosRatio = htf4hSpan > 0 ? (prevBar.close - htf4hLow) / htf4hSpan : 0.5;
 
-      // วิเคราะห์ทิศทาง 4H และ 1H
+      // วิเคราะห์ทิศทาง 4H และ 1H จากแท่งปิดล่าสุด (i - 1)
       const is4hBull =
-        c.close > cur4hEma50 &&
+        prevBar.close > cur4hEma50 &&
         cur4hEma20 >= cur4hEma50 * 0.999 &&
         cur4hEma50 >= prev4hEma50 * 0.9998;
       const is4hBear =
-        c.close < cur4hEma50 &&
+        prevBar.close < cur4hEma50 &&
         cur4hEma20 < cur4hEma50 * 0.999 &&
         cur4hEma20 < prev4hEma20;
       const is1hBull =
-        c.close > cur1hEma50 &&
+        prevBar.close > cur1hEma50 &&
         cur1hEma20 >= cur1hEma50 * 0.999;
       const is1hBearFlow =
-        c.close < cur1hEma20 &&
+        prevBar.close < cur1hEma20 &&
         cur1hEma20 < cur1hEma50 &&
         cur1hEma20 < prev1hEma20;
       const is1hStabilized =
-        c.close >= (candles[Math.max(0, i - 3)]?.open ?? c.open) ||
-        c.close >= cur1hEma20 * 0.998 ||
+        prevBar.close >= (candles[Math.max(0, prevIdx - 3)]?.open ?? prevBar.open) ||
+        prevBar.close >= cur1hEma20 * 0.998 ||
         cur1hEma20 >= prev1hEma20;
 
       const isMacroUptrend =
         (structure.regime === "UPTREND" || is4hBull) &&
-        c.close > cur1hEma50 &&
+        prevBar.close > cur1hEma50 &&
         curEma50 >= cur1hEma50 * 0.999 &&
         cur1hEma50 >= prev1hEma50;
       const isUptrend = isMacroUptrend;
@@ -1448,7 +1643,11 @@ export class BacktestService {
         const ltfFloor = structure.bottomBound;
         const ltfCeiling = structure.upperBound;
         const ltfSpan = ltfCeiling - ltfFloor;
-        if (ltfSpan <= 0) continue;
+        if (ltfSpan <= 0) {
+          commitBarToHistory();
+          recordEquityAndDrawdown(c.time, c.close, isTradingActive, i, false);
+          continue;
+        }
 
         // 🌟 Scoped Asymmetric MTF Channel (Master Plan v14.0):
         // - เมื่อตลาดไม่ได้อยู่ในขาลงใหญ่ 4H (!is4hBear): ใช้กรอบ 15m/1H มาตรฐาน 100% (รักษาไม้ทำเงินของ ETH, AVAX, DOGE, PEPE ครบถ้วน)
@@ -1491,7 +1690,7 @@ export class BacktestService {
           prevCandidateFloor = candidateFloor;
 
           // Pillar 2: Not in dump
-          const isPillar2Ok = !structure.isDowntrendDropActive && (c.close >= c.open || structure.gridZone?.canEstablishChannel !== false);
+          const isPillar2Ok = !structure.isDowntrendDropActive && (prevBar.close >= prevBar.open || structure.gridZone?.canEstablishChannel !== false);
 
           // Pillar 3: Min drop % from active floor or lowest held lot
           const dropFromActiveFloorPct = currentActiveFloor > 0 ? ((currentActiveFloor - candidateFloor) / currentActiveFloor) * 100 : 0;
@@ -1510,7 +1709,7 @@ export class BacktestService {
               unlockedCapitalZones++;
               if (zoneRequireReversal) {
                 isZoneReversalConfirmed = false;
-                zoneDumpLowPrice = Math.min(c.low, candidateFloor);
+                zoneDumpLowPrice = Math.min(prevBar.low, candidateFloor);
                 zoneUnlockCandleIdx = i;
               }
             }
@@ -1537,7 +1736,11 @@ export class BacktestService {
           ceiling = structure.upperBound;
           center = structure.centerPrice;
           channelSpan = ceiling - floor;
-          if (channelSpan <= 0) continue;
+          if (channelSpan <= 0) {
+            commitBarToHistory();
+            recordEquityAndDrawdown(c.time, c.close, isTradingActive, i, false);
+            continue;
+          }
           buyLevels = curBuys.map((pct) => floor + channelSpan * (pct / 100));
           sellTargets = curSells.map((pct) => floor + channelSpan * (pct / 100));
           activeChannel = { floor, ceiling, center, channelSpan, buyLevels: [...buyLevels], sellTargets: [...sellTargets] };
@@ -1547,7 +1750,7 @@ export class BacktestService {
         // Dynamic Trailing: when channel moves while holding lots, update sell targets ensuring min profit hurdle!
         if (isHoldingPosition) {
           const totalHeldQty = heldLots.reduce((sum, l) => sum + l.qty, 0);
-          const totalInvestQuote = heldLots.reduce((sum, l) => sum + (l.qty * l.buyPrice), 0);
+          const totalInvestQuote = heldLots.reduce((sum, l) => sum + l.investQuote, 0);
           const avgEntry = totalHeldQty > 0 ? (totalInvestQuote / totalHeldQty) : 0;
 
           const hasL2Held = heldLots.some((l) => l.index === 1);
@@ -1555,7 +1758,20 @@ export class BacktestService {
             if (zoneExitMode === "ORIGINAL_TARGETS" && lot.targetPrice > 0) {
               continue;
             }
-            const lotSafeBase = Math.max(avgEntry, lot.buyPrice);
+            let baseCost = avgEntry;
+            if (zoneExitMode === "PER_ZONE" || zoneExitMode === "HYBRID_ZONE_RECOVERY") {
+              const lotZone = lot.zoneIndex ?? 1;
+              const useZoneOnly = zoneExitMode === "PER_ZONE" || (lotZone === unlockedCapitalZones && totalZones > 1);
+              if (useZoneOnly) {
+                const zLots = heldLots.filter((l) => (l.zoneIndex ?? 1) === lotZone);
+                const zQty = zLots.reduce((s, l) => s + l.qty, 0);
+                const zInv = zLots.reduce((s, l) => s + l.investQuote, 0);
+                if (zQty > 0) baseCost = zInv / zQty;
+              }
+            }
+            const lotSafeBase = zoneExitMode === "AVG_PROFIT_ALL"
+              ? (baseCost > 0 ? baseCost : lot.buyPrice)
+              : Math.max(baseCost, lot.buyPrice);
             const lotMinProfitTarget = lotSafeBase * (1 + effectiveMinProfitPct / 100);
             let dynamicTarget = sellTargets[0] ?? (lotSafeBase * 1.015);
             if ((hasL2Held || (sellTargets.length > 1 && lot.targetPrice >= (sellTargets[1] ?? 0) * 0.999)) && lot.index === 0 && sellTargets.length > 1) {
@@ -1589,12 +1805,84 @@ export class BacktestService {
         gridCutLossMode !== "none" &&
         (gridCutLossMode === "entry_floor" || unlockedCapitalZones >= totalZones);
 
+      const evaluateCutLossForLot = (lot: typeof heldLots[number]): boolean => {
+        const isLotUptrendProtected = Boolean(
+          lot.enteredInUptrend &&
+          prevBar.close >= cur1hEma50 * 0.996 &&
+          !is4hBear
+        );
+        const effectiveCloseCut = isLotUptrendProtected
+          ? Math.max(uptrendCloseCutPrice, lot.buyPrice * 0.982)
+          : closeCutLossPrice;
+        const effectiveWickCut = isLotUptrendProtected
+          ? Math.max(uptrendWickCutPrice, lot.buyPrice * 0.978)
+          : emergencyWickCutPrice;
+
+        const isEmergencyWickHit = baseCanTriggerCutLoss && c.low <= effectiveWickCut;
+        const isConfirmedCloseCutHit = baseCanTriggerCutLoss && c.close <= effectiveCloseCut;
+        if (!isEmergencyWickHit && !isConfirmedCloseCutHit) {
+          return false;
+        }
+
+        const rawCutExit = isEmergencyWickHit
+          ? effectiveWickCut
+          : Math.max(c.close, effectiveWickCut);
+        const exitPrice = rawCutExit * (1 - takerSlippagePct / 100);
+        const proceeds = lot.qty * exitPrice * (1 - takerFeePct / 100);
+        const invest = lot.investQuote;
+        const pnlQuote = proceeds - invest;
+        const pnlPct = invest > 0 ? (pnlQuote / invest) * 100 : 0;
+        cash += proceeds;
+        const exitCost = lot.qty * exitPrice * takerCostPerFill;
+        totalFeesQuote += lot.costQuote + exitCost;
+
+        if (pnlQuote >= 0) {
+          grossProfit += pnlQuote;
+          wins++;
+        } else {
+          grossLoss += Math.abs(pnlQuote);
+          losses++;
+        }
+
+        const lotHoldBars = lot.entryIdx !== undefined ? i - lot.entryIdx : 0;
+        trades.push({
+          id: lot.id,
+          subsystem: "GRID",
+          side: "LONG",
+          entryTime: lot.entryTime,
+          entryPrice: lot.buyPrice,
+          stopLossPrice: rawCutExit,
+          fanSpreadAtEntry: 0,
+          exitTime: c.time,
+          exitPrice,
+          exitType: "GRID_CUT",
+          pnlQuote,
+          pnlPct,
+          holdingBars: lotHoldBars,
+          costQuote: lot.costQuote + exitCost,
+          channelFloor: lot.floorAtEntry,
+          channelCeil: lot.ceilingAtEntry,
+          channelMid: lot.centerAtEntry,
+          channelSpanPct: lot.floorAtEntry && lot.ceilingAtEntry ? Number((((lot.ceilingAtEntry - lot.floorAtEntry) / lot.floorAtEntry) * 100).toFixed(2)) : undefined,
+          zoneIndex: lot.zoneIndex,
+        });
+
+        markers.push({
+          time: c.time,
+          position: "belowBar",
+          color: "#ef4444",
+          shape: "arrowDown",
+          text: `🔴 GRID CUT #${lot.id} (L${lot.index + 1}${lot.zoneIndex ? ` Z${lot.zoneIndex}` : ''}) @ $${exitPrice.toFixed(4)} (${pnlPct.toFixed(2)}%)`,
+        });
+        return true;
+      };
+
       const remainingLots: typeof heldLots = [];
       for (const lot of heldLots) {
         const holdingBars = lot.entryIdx !== undefined ? i - lot.entryIdx : 0;
         const isLotUptrendProtected = Boolean(
           lot.enteredInUptrend &&
-          c.close >= cur1hEma50 * 0.996 &&
+          prevBar.close >= cur1hEma50 * 0.996 &&
           !is4hBear
         );
 
@@ -1613,62 +1901,8 @@ export class BacktestService {
           }
         }
 
-        const effectiveCloseCut = isLotUptrendProtected
-          ? Math.max(uptrendCloseCutPrice, lot.buyPrice * 0.982)
-          : closeCutLossPrice;
-        const effectiveWickCut = isLotUptrendProtected
-          ? Math.max(uptrendWickCutPrice, lot.buyPrice * 0.978)
-          : emergencyWickCutPrice;
-
-        const isEmergencyWickHit = baseCanTriggerCutLoss && c.low <= effectiveWickCut;
-        const isConfirmedCloseCutHit = baseCanTriggerCutLoss && c.close <= effectiveCloseCut;
-
         // 1) Cut Loss Hit (Taker Execution with Taker Fee + Taker Slippage, capped at effectiveWickCut)
-        if (isEmergencyWickHit || isConfirmedCloseCutHit) {
-          const rawCutExit = isEmergencyWickHit
-            ? effectiveWickCut
-            : Math.max(c.close, effectiveWickCut);
-          const exitPrice = rawCutExit * (1 - takerSlippagePct / 100);
-          const proceeds = lot.qty * exitPrice * (1 - takerFeePct / 100);
-          const invest = lot.qty * lot.buyPrice;
-          const pnlQuote = proceeds - invest;
-          const pnlPct = invest > 0 ? (pnlQuote / invest) * 100 : 0;
-          cash += proceeds;
-          const exitCost = lot.qty * exitPrice * takerCostPerFill;
-          totalFeesQuote += lot.costQuote + exitCost;
-
-          grossLoss += Math.abs(pnlQuote);
-          losses++;
-
-          trades.push({
-            id: lot.id,
-            subsystem: "GRID",
-            side: "LONG",
-            entryTime: lot.entryTime,
-            entryPrice: lot.buyPrice,
-            stopLossPrice: rawCutExit,
-            fanSpreadAtEntry: 0,
-            exitTime: c.time,
-            exitPrice,
-            exitType: "GRID_CUT",
-            pnlQuote,
-            pnlPct,
-            holdingBars,
-            costQuote: lot.costQuote + exitCost,
-            channelFloor: lot.floorAtEntry,
-            channelCeil: lot.ceilingAtEntry,
-            channelMid: lot.centerAtEntry,
-            channelSpanPct: lot.floorAtEntry && lot.ceilingAtEntry ? Number((((lot.ceilingAtEntry - lot.floorAtEntry) / lot.floorAtEntry) * 100).toFixed(2)) : undefined,
-            zoneIndex: lot.zoneIndex,
-          });
-
-          markers.push({
-            time: c.time,
-            position: "belowBar",
-            color: "#ef4444",
-            shape: "arrowDown",
-            text: `🔴 GRID CUT #${lot.id} (L${lot.index + 1}${lot.zoneIndex ? ` Z${lot.zoneIndex}` : ''}) @ $${exitPrice.toFixed(4)} (${pnlPct.toFixed(2)}%)`,
-          });
+        if (evaluateCutLossForLot(lot)) {
           continue;
         }
 
@@ -1677,7 +1911,7 @@ export class BacktestService {
           const rawExit = Math.min(lot.stopLossPrice, c.high);
           const exitPrice = Math.max(c.low, rawExit * (1 - takerSlippagePct / 100));
           const proceeds = lot.qty * exitPrice * (1 - takerFeePct / 100);
-          const invest = lot.qty * lot.buyPrice;
+          const invest = lot.investQuote;
           const pnlQuote = proceeds - invest;
           const pnlPct = invest > 0 ? (pnlQuote / invest) * 100 : 0;
           cash += proceeds;
@@ -1729,7 +1963,7 @@ export class BacktestService {
         if (c.high >= lot.targetPrice * 1.0005) {
           const exitPrice = lot.targetPrice;
           const proceeds = lot.qty * exitPrice * (1 - makerCostPerFill);
-          const invest = lot.qty * lot.buyPrice;
+          const invest = lot.investQuote;
           const pnlQuote = proceeds - invest;
           const pnlPct = invest > 0 ? (pnlQuote / invest) * 100 : 0;
           cash += proceeds;
@@ -1852,7 +2086,11 @@ export class BacktestService {
             cash,
             trigger: "POST_ROUND_EXIT",
           });
-          if (shouldStop) break;
+          if (shouldStop) {
+            commitBarToHistory();
+            recordEquityAndDrawdown(c.time, c.close, isTradingActive, i, true);
+            break;
+          }
         } else if (c.time - lastFlatTime >= 7200) { // 2 hours idle cash
           const shouldStop = opts.onFlatCheckStop({
             barIndex: i,
@@ -1860,7 +2098,11 @@ export class BacktestService {
             cash,
             trigger: "IDLE_CASH_TIMEOUT",
           });
-          if (shouldStop) break;
+          if (shouldStop) {
+            commitBarToHistory();
+            recordEquityAndDrawdown(c.time, c.close, isTradingActive, i, true);
+            break;
+          }
           lastFlatTime = c.time; // Reset so next check is after another interval, NOT on every 5m bar!
         }
       }
@@ -1869,10 +2111,10 @@ export class BacktestService {
       if (isTradingActive && opts.onSignalInvalidationCheck && heldLots.length > 0) {
         let change24hPct = 0;
         let posRatio24h = 0.5;
-        if (i >= 288) {
-          const c24 = candles[i - 288];
+        if (i >= barsPer24h) {
+          const c24 = candles[i - barsPer24h];
           change24hPct = ((c.close - c24.open) / c24.open) * 100;
-          const slice24 = candles.slice(i - 288, i + 1);
+          const slice24 = candles.slice(i - barsPer24h, i + 1);
           let h24 = -Infinity;
           let l24 = Infinity;
           for (const sc of slice24) {
@@ -1885,7 +2127,7 @@ export class BacktestService {
         }
 
         const totalHeldQty = heldLots.reduce((sum, l) => sum + l.qty, 0);
-        const totalInvestQuote = heldLots.reduce((sum, l) => sum + (l.qty * l.buyPrice), 0);
+        const totalInvestQuote = heldLots.reduce((sum, l) => sum + l.investQuote, 0);
         const currentPosVal = totalHeldQty * c.close * (1 - costPerFill);
         const unrealizedPnlPct = totalInvestQuote > 0 ? ((currentPosVal - totalInvestQuote) / totalInvestQuote) * 100 : 0;
 
@@ -1913,7 +2155,7 @@ export class BacktestService {
             for (const lot of heldLots) {
               const exitPrice = c.close;
               const proceeds = lot.qty * exitPrice * (1 - costPerFill);
-              const invest = lot.qty * lot.buyPrice;
+              const invest = lot.investQuote;
               const pnlQuote = proceeds - invest;
               const pnlPct = invest > 0 ? (pnlQuote / invest) * 100 : 0;
               cash += proceeds;
@@ -1941,7 +2183,7 @@ export class BacktestService {
                 exitType: "GRID_CUT",
                 pnlQuote,
                 pnlPct,
-                holdingBars: i - (candles.findIndex((x) => x.time === lot.entryTime) || i),
+                holdingBars: lot.entryIdx !== undefined ? i - lot.entryIdx : 0,
                 costQuote: lot.costQuote + exitCost,
                 channelFloor: lot.floorAtEntry,
                 channelCeil: lot.ceilingAtEntry,
@@ -1959,6 +2201,8 @@ export class BacktestService {
             });
 
             heldLots = [];
+            commitBarToHistory();
+            recordEquityAndDrawdown(c.time, c.close, isTradingActive, i, true);
             break;
           }
         }
@@ -1966,12 +2210,12 @@ export class BacktestService {
 
       // 2. Evaluate Grid Buys (Tranche Size = 25% of current zone quota)
       if (unlockedCapitalZones > 1) {
-        if (c.low < zoneDumpLowPrice * 0.9995) {
+        if (prevBar.low < zoneDumpLowPrice * 0.9995) {
           if (isZoneReversalConfirmed) {
             isZoneReversalConfirmed = false;
             zoneUnlockCandleIdx = i;
           }
-          zoneDumpLowPrice = c.low;
+          zoneDumpLowPrice = prevBar.low;
         }
       }
 
@@ -1989,7 +2233,7 @@ export class BacktestService {
         const isChoChBreakout = Boolean(
           choChPrice &&
           choChPrice > zoneDumpLowPrice &&
-          c.close > choChPrice * 1.0005
+          prevBar.close > choChPrice * 1.0005
         );
         if (isBreakout || isHlAfterLl || isChoChBreakout) {
           isZoneReversalConfirmed = true;
@@ -1997,12 +2241,12 @@ export class BacktestService {
       }
 
       const effectiveMaxInventory = zoneBudgetQuote * unlockedCapitalZones;
-      const currentInventory = heldLots.reduce((sum, l) => sum + (l.qty * l.buyPrice), 0);
+      const currentInventory = heldLots.reduce((sum, l) => sum + l.investQuote, 0);
       const trancheQuote = zoneBudgetQuote / Math.max(1, curBuys.length);
 
-      // ตรวจสอบว่าแนวรับ Floor ปัจจุบัน (ทั้งกรณี LTF และ HTF 24h/36h Floor) เป็นฐานแนวนอนที่ตั้งตัวแล้ว (ไม่ได้เพิ่งทุบทำจุดต่ำสุดใหม่ใน 4 แท่งล่าสุด)
-      const recent4Lows = candles.slice(Math.max(0, i - 3), i + 1).map((x) => x.low);
-      const minRecent4Low = recent4Lows.length > 0 ? Math.min(...recent4Lows) : c.low;
+      // ตรวจสอบว่าแนวรับ Floor ปัจจุบันเป็นฐานแนวนอนที่ตั้งตัวแล้ว (ใช้เฉพาะ 4 แท่งปิดก่อนหน้า i-4..i-1 เพื่อป้องกัน Lookahead)
+      const recent4Lows = candles.slice(Math.max(0, i - 4), i).map((x) => x.low);
+      const minRecent4Low = recent4Lows.length > 0 ? Math.min(...recent4Lows) : prevBar.low;
       const isEstablishedHorizontalFloor = floor > 0 && minRecent4Low > floor * 1.0005;
 
       // 🌐 Scoped 4H Bear Gate (แทรกแซงเฉพาะเมื่อกราฟ 4H เป็นขาลงชัดเจน เพื่อไม่ให้ไปตัดไม้ทำกำไรของ ETH/AVAX ในช่วง Sideway/Bull):
@@ -2068,11 +2312,11 @@ export class BacktestService {
       const isHlWaiting = isRegimeBlocked;
       const isZoneWaiting = zoneRequireReversal && unlockedCapitalZones > 1 && !isZoneReversalConfirmed;
 
-      // Dip Hunter Entry Absorption Guard (Active when explicitly requested)
+      // Dip Hunter Entry Absorption Guard (Active when explicitly requested, zero-lookahead on closed bars i-1)
       let passesDipHunterGuard = true;
       if (opts.enableDipHunterEntryGuard === true) {
         const isWaterfall = consecutiveReds >= 4;
-        const prevCandle = i > 0 ? candles[i - 1] : c;
+        const prevCandle = prevBar;
         const prevRange = prevCandle.high - prevCandle.low;
         const prevLowerWick = Math.min(prevCandle.open, prevCandle.close) - prevCandle.low;
         const prevLowerWickPct = prevRange > 0 ? (prevLowerWick / prevRange) * 100 : 0;
@@ -2081,9 +2325,9 @@ export class BacktestService {
         const isNoFallingKnife = prevCandle.low >= prevPrevCandle.low;
 
         let isBad24hDrop = false;
-        if (i >= 288) {
-          const c24 = candles[i - 288];
-          const change24hPct = ((c.close - c24.open) / c24.open) * 100;
+        if (prevIdx >= barsPer24h) {
+          const c24 = candles[prevIdx - barsPer24h];
+          const change24hPct = ((prevCandle.close - c24.open) / c24.open) * 100;
           if (change24hPct < -5.5) isBad24hDrop = true;
         }
 
@@ -2093,21 +2337,20 @@ export class BacktestService {
         }
       }
 
+      const isGridHtfBlocked = !BacktestService.isGridHtfGovernorPass(gridHtfCtx, opts.gridHtfGovernor, c.time);
       const maxLotsForUnlockedZones = unlockedCapitalZones * Math.max(1, curBuys.length);
-      if (isTradingActive && !isHlWaiting && !isZoneWaiting && passesDipHunterGuard) {
+      if (!isBtcSitOut && !isGridHtfBlocked && isTradingActive && !isHlWaiting && !isZoneWaiting && passesDipHunterGuard) {
         for (let lvlIdx = 0; lvlIdx < buyLevels.length; lvlIdx++) {
           if (heldLots.length >= maxLotsForUnlockedZones) break;
           const levelWeight = curBuyWeights[lvlIdx] ?? (100 / Math.max(1, buyLevels.length));
           const weightedTrancheQuote = zoneBudgetQuote * (levelWeight / totalBuyWeight);
-          const currentInv = heldLots.reduce((sum, l) => sum + (l.qty * l.buyPrice), 0);
+          const currentInv = heldLots.reduce((sum, l) => sum + l.investQuote, 0);
           if (currentInv + weightedTrancheQuote > effectiveMaxInventory * 1.001 || cash < weightedTrancheQuote * 0.999) continue;
 
           const bl = buyLevels[lvlIdx];
           const alreadyFilledInCurrentZone = heldLots.some((l) => (l.zoneIndex ?? 1) === unlockedCapitalZones && l.index === lvlIdx);
-          // Queue Penetration: Price must trade through Limit Buy by 0.05%
-          // And candle high must reach or exceed the limit price (must physically overlap bar range)
-          // Also verify bar does not trigger cut loss on the entry candle
-          if (!alreadyFilledInCurrentZone && c.low <= bl * 0.9995 && c.high >= bl && (!baseCanTriggerCutLoss || (c.close > closeCutLossPrice && c.low > emergencyWickCutPrice))) {
+          // Queue Penetration: Price must trade through resting Limit Buy by 0.05% (evaluated without intrabar close lookahead)
+          if (!alreadyFilledInCurrentZone && c.low <= bl * 0.9995 && c.high >= bl) {
             tradeCounter++;
             const buyPrice = bl;
             const invest = Math.min(cash, weightedTrancheQuote);
@@ -2132,12 +2375,13 @@ export class BacktestService {
               }
             }
 
-            heldLots.push({
+            const newLot: typeof heldLots[number] = {
               id: tradeCounter,
               index: lvlIdx,
               zoneIndex: unlockedCapitalZones,
               qty: fillQty,
               buyPrice,
+              investQuote: invest,
               entryTime: c.time,
               entryIdx: i,
               targetPrice,
@@ -2148,7 +2392,25 @@ export class BacktestService {
               peakPrice: buyPrice,
               stopLossPrice: cutLossPrice,
               enteredInUptrend: isUptrend,
+            };
+
+            markers.push({
+              time: c.time,
+              position: "belowBar",
+              color: "#10b981",
+              shape: "arrowUp",
+              text: `🟢 GRID BUY #${tradeCounter} (L${lvlIdx + 1} Z${unlockedCapitalZones}) @ $${buyPrice.toFixed(4)}`,
             });
+
+            // Causal same-bar cut-loss evaluation: if bar hits cut loss after filling the limit buy, settle honestly!
+            if (evaluateCutLossForLot(newLot)) {
+              if (heldLots.length === 0) {
+                lastFlatTime = c.time;
+              }
+              continue;
+            }
+
+            heldLots.push(newLot);
 
             if (!lockedChannel) {
               lockedChannel = {
@@ -2160,28 +2422,14 @@ export class BacktestService {
                 sellTargets: [...sellTargets],
               };
             }
-
-            markers.push({
-              time: c.time,
-              position: "belowBar",
-              color: "#10b981",
-              shape: "arrowUp",
-              text: `🟢 GRID BUY #${tradeCounter} (L${lvlIdx + 1} Z${unlockedCapitalZones}) @ $${buyPrice.toFixed(4)}`,
-            });
           }
         }
       }
+      wasHolding = heldLots.length > 0;
 
-      // Equity curve & drawdown (Mark-to-Market including exit fee)
-      const currentInvVal = heldLots.reduce((sum, l) => sum + (l.qty * c.close * (1 - costPerFill)), 0);
-      const curEquity = cash + currentInvVal;
-      if (curEquity > peakEquity) peakEquity = curEquity;
-      const dd = peakEquity > 0 ? ((peakEquity - curEquity) / peakEquity) * 100 : 0;
-      if (dd > maxDrawdownPct) maxDrawdownPct = dd;
-
-      if (isTradingActive && (i % 6 === 0 || i === candles.length - 1)) {
-        gridEquityCurve.push({ time: c.time, equity: Number(curEquity.toFixed(2)) });
-      }
+      // Commit finished bar c to market structure history BEFORE recording bar-end equity & next bar starts
+      commitBarToHistory();
+      recordEquityAndDrawdown(c.time, c.close, isTradingActive, i, false);
     }
 
     // End of simulation - settle any open remaining lots to align Net PnL, Win Rate, and Loss Trades
@@ -2191,7 +2439,7 @@ export class BacktestService {
     for (const lot of heldLots) {
       const exitPrice = lastPrice;
       const proceeds = lot.qty * exitPrice * (1 - costPerFill);
-      const invest = lot.qty * lot.buyPrice;
+      const invest = lot.investQuote;
       const pnlQuote = proceeds - invest;
       const pnlPct = invest > 0 ? (pnlQuote / invest) * 100 : 0;
       cash += proceeds;
@@ -2265,12 +2513,16 @@ export class BacktestService {
       grossPnlQuote: Number((netPnlQuote + totalFeesQuote).toFixed(2)),
     };
 
+    const finalCandles = (opts.trimWarmupPrefix && startIdx > 0)
+      ? processedCandles.slice(startIdx)
+      : processedCandles;
+
     const record: BacktestRecord = {
       id: `bt_grid_${Date.now()}`,
       createdAt: new Date().toISOString(),
       symbol,
       timeframe,
-      candleCount: processedCandles.length,
+      candleCount: finalCandles.length,
       spreadThreshold: 0,
       isAutoCalibrated: false,
       useRatchetSl: false,
@@ -2281,7 +2533,7 @@ export class BacktestService {
       summary,
       trades,
       markers: markers.sort((a, b) => a.time - b.time),
-      candles: processedCandles,
+      candles: finalCandles,
       equityCurve: gridEquityCurve,
     };
 
@@ -2332,6 +2584,7 @@ export class BacktestService {
       regimeFilterMode?: "SIDEWAY_ONLY" | "NO_DOWNTREND" | "UPTREND_AND_SIDEWAY" | "OFF";
       lockChannelInPosition?: boolean;
       channelMode?: "DOW_SWINGS" | "DOW_ATR_CLAMP" | "FIXED_PCT_CLAMP" | "DONCHIAN_ATR" | "VOLUME_PROFILE_HTF";
+      vpLookbackBars?: number;
       donchianPeriod?: number;
       minChannelWidthPct?: number;
       maxChannelWidthPct?: number;
@@ -2345,9 +2598,14 @@ export class BacktestService {
       buyLevelPcts?: number[];
       sellLevelPcts?: number[];
       buyWeights?: number[];
-      zoneExitMode?: "PORTFOLIO_AVG" | "ORIGINAL_TARGETS" | "PER_ZONE";
+      zoneExitMode?: "PORTFOLIO_AVG" | "ORIGINAL_TARGETS" | "PER_ZONE" | "HYBRID_ZONE_RECOVERY" | "AVG_PROFIT_ALL";
       minNetProfitPct?: number;
       tp1TargetMode?: "EMA25" | "EMA75" | "EMA200";
+      breakevenFeeBufferPct?: number;
+      cushionMode?: CushionMode;
+      cushionThresholdPct?: number;
+      tp1MinProfitPct?: number;
+      intrabarMode?: "optimistic" | "closeBased" | "pessimistic";
       lockBreakevenAtEma200?: boolean;
       maxDisasterSlPct?: number;
       minBuyVolRatio12?: number;
@@ -2355,6 +2613,9 @@ export class BacktestService {
       minRelStrengthVsBtc24h?: number;
       btcCandles?: Candle[];
       downtrendSitOutMode?: "off" | "btc1d" | "btc4h" | "dual";
+      gridHtfGovernor?: "off" | "1h_ema200" | "4h_ema75";
+      warmupBars?: number;
+      trimWarmupPrefix?: boolean;
     }
   ): BacktestRecord {
     const symbol = opts.symbol.toUpperCase().replace(/[\/\-_:]/g, "");
@@ -2367,6 +2628,7 @@ export class BacktestService {
 
     const cm = opts.costModel ?? { feePctPerSide: 0, slippagePctPerFill: 0 };
     const costPerFill = (cm.feePctPerSide + cm.slippagePctPerFill) / 100;
+    const intrabarMode = opts.intrabarMode ?? "closeBased";
     const tradeDirection = opts.tradeDirection ?? "both";
 
     const totalZones = Math.max(1, Math.min(5, opts.capitalZones ?? 2));
@@ -2390,6 +2652,9 @@ export class BacktestService {
     let stableFloorCandleCount = 0;
     let prevCandidateFloor: number | undefined = undefined;
     let lastZoneUnlockFloor: number | undefined = undefined;
+    const gridHtfCtx = opts.gridHtfGovernor && opts.gridHtfGovernor !== "off"
+      ? BacktestService.prepareGridHtfGovernor(candles)
+      : null;
     let activeChannel: {
       floor: number;
       ceiling: number;
@@ -2411,7 +2676,9 @@ export class BacktestService {
     const trailingPullbackPct = opts.trailingPullbackPct ?? 0.45;
     const tp1Ratio = Math.max(0.1, Math.min(0.9, opts.tp1Ratio ?? 0.50));
     const supervisorTf = opts.supervisorTimeframe ?? "15m";
+    const targetMinutes = supervisorTf === "1h" ? 60 : 15;
     const stagnationBars = opts.stagnationBars ?? 6;
+    const btcSitOutCtx = BacktestService.prepareBtcSitOutContext(opts.btcCandles);
 
     // Precompute indicators for Sniper Engine
     const ribbonStates = opts.precomputed?.ribbonStates ?? RibbonEngine.computeAllRibbonStates(candles);
@@ -2419,7 +2686,7 @@ export class BacktestService {
     const atrs = opts.precomputed?.atrs ?? calcATR(candles, 14);
     const candlesHtf = opts.candlesHtf && opts.candlesHtf.length > 0
       ? opts.candlesHtf
-      : BacktestService.aggregateCandles(candles, 15);
+      : BacktestService.aggregateCandles(candles, targetMinutes);
 
     const lockChannelInPosition = opts.lockChannelInPosition !== false;
     let lockedChannel: {
@@ -2432,8 +2699,16 @@ export class BacktestService {
     } | null = null;
 
     // Dow Structure Engine for Dynamic Grid
+    const defaultWarmup = Math.min(100, Math.floor(candles.length / 4));
+    const startIdx = Math.max(
+      0,
+      Math.min(
+        candles.length > 0 ? candles.length - 1 : 0,
+        opts.warmupBars !== undefined ? opts.warmupBars : defaultWarmup,
+      ),
+    );
+    const warmup = Math.min(defaultWarmup, startIdx > 0 ? startIdx : defaultWarmup);
     const dow = new DowStructureEngine(3, true, 20.0, 300);
-    const warmup = Math.min(100, Math.floor(candles.length / 4));
     for (let k = 0; k < warmup; k++) {
       dow.addCandle(candles[k]);
     }
@@ -2446,6 +2721,7 @@ export class BacktestService {
       zoneIndex?: number;
       qty: number;
       buyPrice: number;
+      investQuote: number;
       entryTime: number;
       entryIdx: number;
       targetPrice: number;
@@ -2469,6 +2745,9 @@ export class BacktestService {
     let sniperInitialSlPrice = 0;
     let sniperStopLossPrice = 0;
     let sniperActiveSide: "LONG" | "SHORT" = "LONG";
+    let sniperEngineType: EntryDecision["engineType"] | undefined = undefined;
+    let sniperTp1TargetPrice: number | undefined = undefined;
+    let sniperLastCushionApplied = false;
     let sniperTp1Hit = false;
     let sniperTp1Price = 0;
     let sniperTp1Time = 0;
@@ -2497,6 +2776,8 @@ export class BacktestService {
         trailingPullbackPct,
         tp1Ratio,
         initialCapital: sniperInitialCap,
+        supervisorTimeframe: supervisorTf,
+        executionTimeframe: timeframe === "15m" ? "15m" : "5m",
         useRatchetSl,
         costModel: opts.costModel,
         macroGateMode,
@@ -2509,6 +2790,44 @@ export class BacktestService {
     const trades: BacktestTrade[] = [];
     const markers: BacktestMarker[] = [];
     const evaluations: BacktestEvaluationItem[] = new Array(candles.length);
+    const hybridEquityCurve: Array<{ time: number; equity: number }> = [];
+    for (let k = 0; k < warmup; k++) {
+      const cK = candles[k]!;
+      const ribK = ribbonStates[k]!;
+      const exhK = exhaustionStates[k]!;
+      const htfK = RegimeSupervisor.evaluateHtfRegime(candlesHtf, supervisorTf, cK.time, tp1Ratio);
+      const curAtrK = atrs[k] ?? (cK.close * 0.003);
+      const activeSpK = rollingCal ? Math.max(0.40, rollingCal.bestSpreadAt(k)) : spread;
+      const baseSpK = MaFanCoreRules.computeEffectiveSpread({
+        baseSpread: activeSpK,
+        useAtrAdaptiveSpread: useAtrAdaptive,
+        isAutoCalibrated: isAuto,
+        curAtr: curAtrK,
+        closePrice: cK.close,
+        atrMultiplier,
+      });
+      evaluations[k] = {
+        time: cK.time,
+        fanSpreadPct: ribK.fanSpreadPct,
+        isFanningDown: ribK.isFanningDown,
+        isHookUp: ribK.isHookUp,
+        rsi: exhK.rsi,
+        rsiSma: exhK.rsiSma,
+        isOversoldExhaustion: exhK.isOversoldExhaustion,
+        ema4: ribK.ema4,
+        ema8: ribK.ema8,
+        ema16: ribK.ema16,
+        ema25: ribK.ema25,
+        ema75: ribK.ema75,
+        ema200: ribK.ema200,
+        requiredSpreadPct: Number((baseSpK * (htfK.spreadMultiplier ?? 1.0)).toFixed(2)),
+        spreadMultiplier: htfK.spreadMultiplier,
+        isDeepBear: htfK.isDeepBear,
+        isMacroBlocked: false,
+        isCircuitBreakerActive: false,
+      };
+    }
+
     let grossProfit = 0;
     let grossLoss = 0;
     let wins = 0;
@@ -2520,15 +2839,22 @@ export class BacktestService {
 
     for (let i = warmup; i < candles.length; i++) {
       const c = candles[i];
-      dow.addCandle(c);
+      const isTradingActive = i >= startIdx;
+      const prevIdx = Math.max(0, i - 1);
+      const prevBar = candles[prevIdx]!;
+      const isBtcSitOut = BacktestService.isBtcSitOutActive(btcSitOutCtx, opts.downtrendSitOutMode, c.time);
 
-      const structure = dow.getStructure(c.close, undefined, {
+      const volumeProfile = opts.channelMode === "VOLUME_PROFILE_HTF"
+        ? VolumeProfileEngine.calculate(dow.getCandles(), opts.vpLookbackBars ?? 192)
+        : undefined;
+      const structure = dow.getStructure(prevBar.close, undefined, {
         useOnlyClosedCandles: true,
         mode: opts.channelMode ?? "DONCHIAN_ATR",
         donchianLookback: opts.donchianPeriod ?? 48,
         minChannelWidthPct: opts.minChannelWidthPct ?? 6.0,
         maxChannelWidthPct: opts.maxChannelWidthPct ?? 25.0,
         floorBufferPct: opts.floorBufferPct ?? 0.0,
+        volumeProfile,
       });
       let floor: number;
       let ceiling: number;
@@ -2573,7 +2899,7 @@ export class BacktestService {
           }
           prevCandidateFloor = candidateFloor;
 
-          const isPillar2Ok = !structure.isDowntrendDropActive && (c.close >= c.open || structure.gridZone?.canEstablishChannel !== false);
+          const isPillar2Ok = !structure.isDowntrendDropActive && (prevBar.close >= prevBar.open || structure.gridZone?.canEstablishChannel !== false);
           // Pillar 3: Min drop % from active floor or lowest held lot
           const dropFromActiveFloorPct = currentActiveFloor > 0 ? ((currentActiveFloor - candidateFloor) / currentActiveFloor) * 100 : 0;
           const lowestHeldLotPrice = heldLots.length > 0 ? Math.min(...heldLots.map((l) => l.buyPrice)) : 0;
@@ -2591,7 +2917,7 @@ export class BacktestService {
               unlockedCapitalZones++;
               if (zoneRequireReversal) {
                 isZoneReversalConfirmed = false;
-                zoneDumpLowPrice = Math.min(c.low, candidateFloor);
+                zoneDumpLowPrice = Math.min(prevBar.low, candidateFloor);
                 zoneUnlockCandleIdx = i;
               }
             }
@@ -2625,15 +2951,29 @@ export class BacktestService {
 
         if (isHoldingPosition) {
           const totalHeldQty = heldLots.reduce((sum, l) => sum + l.qty, 0);
-          const totalInvestQuote = heldLots.reduce((sum, l) => sum + (l.qty * l.buyPrice), 0);
+          const totalInvestQuote = heldLots.reduce((sum, l) => sum + l.investQuote, 0);
           const avgEntry = totalHeldQty > 0 ? (totalInvestQuote / totalHeldQty) : 0;
-          const minProfitTarget = avgEntry > 0 ? avgEntry * (1 + minNetProfitPct / 100) : 0;
 
           for (const lot of heldLots) {
             if (zoneExitMode === "ORIGINAL_TARGETS" && lot.targetPrice > 0) {
               continue;
             }
-            const dynamicTarget = sellTargets[lot.index] ?? (avgEntry * 1.015);
+            let baseCost = avgEntry;
+            if (zoneExitMode === "PER_ZONE" || zoneExitMode === "HYBRID_ZONE_RECOVERY") {
+              const lotZone = lot.zoneIndex ?? 1;
+              const useZoneOnly = zoneExitMode === "PER_ZONE" || (lotZone === unlockedCapitalZones && totalZones > 1);
+              if (useZoneOnly) {
+                const zLots = heldLots.filter((l) => (l.zoneIndex ?? 1) === lotZone);
+                const zQty = zLots.reduce((s, l) => s + l.qty, 0);
+                const zInv = zLots.reduce((s, l) => s + l.investQuote, 0);
+                if (zQty > 0) baseCost = zInv / zQty;
+              }
+            }
+            const lotSafeBase = zoneExitMode === "AVG_PROFIT_ALL"
+              ? (baseCost > 0 ? baseCost : lot.buyPrice)
+              : Math.max(baseCost, lot.buyPrice);
+            const minProfitTarget = lotSafeBase > 0 ? lotSafeBase * (1 + minNetProfitPct / 100) : 0;
+            const dynamicTarget = sellTargets[lot.index] ?? (lotSafeBase * 1.015);
             lot.targetPrice = Math.max(dynamicTarget, minProfitTarget);
           }
         }
@@ -2682,7 +3022,7 @@ export class BacktestService {
         requiredSpreadPct: Number(reqSpread.toFixed(2)),
         spreadMultiplier: htfRegime.spreadMultiplier,
         isDeepBear: htfRegime.isDeepBear,
-        isMacroBlocked: false,
+        isMacroBlocked: isBtcSitOut,
         isCircuitBreakerActive: isCircuitActive,
       };
 
@@ -2699,7 +3039,7 @@ export class BacktestService {
           if (c.high >= lot.targetPrice) {
             const exitPrice = lot.targetPrice;
             const proceeds = lot.qty * exitPrice * (1 - costPerFill);
-            const invest = lot.qty * lot.buyPrice;
+            const invest = lot.investQuote;
             const pnlQuote = proceeds - invest;
             const pnlPct = invest > 0 ? (pnlQuote / invest) * 100 : 0;
             gridCash += proceeds;
@@ -2744,15 +3084,15 @@ export class BacktestService {
           if (canTriggerCutLoss && c.low <= cutLossPrice) {
             const exitPrice = cutLossPrice;
             const proceeds = lot.qty * exitPrice * (1 - costPerFill);
-            const invest = lot.qty * lot.buyPrice;
+            const invest = lot.investQuote;
             const pnlQuote = proceeds - invest;
             const pnlPct = invest > 0 ? (pnlQuote / invest) * 100 : 0;
             gridCash += proceeds;
             const exitCost = lot.qty * exitPrice * costPerFill;
             totalFeesQuote += lot.costQuote + exitCost;
 
-            grossLoss += Math.abs(pnlQuote);
-            losses++;
+            if (pnlQuote >= 0) { grossProfit += pnlQuote; wins++; }
+            else { grossLoss += Math.abs(pnlQuote); losses++; }
 
             trades.push({
               id: lot.id,
@@ -2790,12 +3130,12 @@ export class BacktestService {
         heldLots = remainingLots;
 
         if (unlockedCapitalZones > 1) {
-          if (c.low < zoneDumpLowPrice * 0.9995) {
+          if (prevBar.low < zoneDumpLowPrice * 0.9995) {
             if (isZoneReversalConfirmed) {
               isZoneReversalConfirmed = false;
               zoneUnlockCandleIdx = i;
             }
-            zoneDumpLowPrice = c.low;
+            zoneDumpLowPrice = prevBar.low;
           }
         }
 
@@ -2813,7 +3153,7 @@ export class BacktestService {
           const isChoChBreakout = Boolean(
             choChPrice &&
             choChPrice > zoneDumpLowPrice &&
-            c.close > choChPrice * 1.0005
+            prevBar.close > choChPrice * 1.0005
           );
           if (isBreakout || isHlAfterLl || isChoChBreakout) {
             isZoneReversalConfirmed = true;
@@ -2822,14 +3162,13 @@ export class BacktestService {
 
         // ── 2. EVALUATE GRID BUYS ──
         const effectiveMaxInventory = zoneBudgetQuote * unlockedCapitalZones;
-        const trancheQuote = zoneBudgetQuote / Math.max(1, curBuys.length);
-        const currentGridInv = heldLots.reduce((s, l) => s + (l.qty * l.buyPrice), 0);
+        const currentGridInv = heldLots.reduce((s, l) => s + l.investQuote, 0);
 
         let isRegimeBlocked = !structure.isSwingConfirmed;
         if (regimeFilterMode === "UPTREND_AND_SIDEWAY" || regimeFilterMode === "NO_DOWNTREND") {
           const isDowntrend = structure.regime === "DOWNTREND" || Boolean(structure.isDowntrendDropActive);
           const isBearSpike = (structure.regimeMetrics?.minusDI ?? 0) - (structure.regimeMetrics?.plusDI ?? 0) > 12;
-          const isWaterfall = i >= 3 && candles.slice(i - 3, i + 1).every((b) => b.close < b.open);
+          const isWaterfall = i >= 4 && candles.slice(i - 4, i).every((b) => b.close < b.open);
           if (isDowntrend || isBearSpike || isWaterfall) {
             isRegimeBlocked = true;
           }
@@ -2856,33 +3195,40 @@ export class BacktestService {
           stableFloorCandleCount = 0;
         }
 
+        const isGridHtfBlocked = !BacktestService.isGridHtfGovernorPass(gridHtfCtx, opts.gridHtfGovernor, c.time);
         const maxLotsForUnlockedZones = unlockedCapitalZones * Math.max(1, curBuys.length);
-        if (!isHlWaiting && !isZoneWaiting && currentGridInv + trancheQuote <= effectiveMaxInventory && gridCash >= trancheQuote && heldLots.length < maxLotsForUnlockedZones) {
-
+        if (isTradingActive && !isBtcSitOut && !isGridHtfBlocked && !isHlWaiting && !isZoneWaiting && heldLots.length < maxLotsForUnlockedZones) {
           for (let lvlIdx = 0; lvlIdx < buyLevels.length; lvlIdx++) {
+            if (heldLots.length >= maxLotsForUnlockedZones) break;
+            const levelWeight = curBuyWeights[lvlIdx] ?? (100 / Math.max(1, buyLevels.length));
+            const weightedTrancheQuote = zoneBudgetQuote * (levelWeight / totalBuyWeight);
+            const curGridInvLoop = heldLots.reduce((s, l) => s + l.investQuote, 0);
+            if (curGridInvLoop + weightedTrancheQuote > effectiveMaxInventory * 1.001 || gridCash < weightedTrancheQuote * 0.999) continue;
+
             const bl = buyLevels[lvlIdx];
             const alreadyFilled = heldLots.some((l) => (l.zoneIndex ?? 1) === unlockedCapitalZones && l.index === lvlIdx);
-            if (!alreadyFilled && c.low <= bl && (!canTriggerCutLoss || c.close >= cutLossPrice)) {
+            if (!alreadyFilled && c.low <= bl && c.high >= bl) {
               tradeCounter++;
               const buyPrice = bl;
-              const invest = trancheQuote;
+              const invest = Math.min(gridCash, weightedTrancheQuote);
               const fillQty = (invest / buyPrice) * (1 - costPerFill);
               gridCash -= invest;
 
               const totalHeldQtyBefore = heldLots.reduce((sum, l) => sum + l.qty, 0);
-              const totalInvestBefore = heldLots.reduce((sum, l) => sum + (l.qty * l.buyPrice), 0);
+              const totalInvestBefore = heldLots.reduce((sum, l) => sum + l.investQuote, 0);
               const newAvgEntry = (totalInvestBefore + invest) / (totalHeldQtyBefore + fillQty);
               const minProfitHurdle = newAvgEntry * (1 + minNetProfitPct / 100);
 
               const rawTarget = sellTargets[lvlIdx] ?? (buyPrice * 1.015);
               const targetPrice = Math.max(rawTarget, minProfitHurdle);
 
-              heldLots.push({
+              const newLot: typeof heldLots[number] = {
                 id: tradeCounter,
                 index: lvlIdx,
                 zoneIndex: unlockedCapitalZones,
                 qty: fillQty,
                 buyPrice,
+                investQuote: invest,
                 entryTime: c.time,
                 entryIdx: i,
                 targetPrice,
@@ -2892,7 +3238,61 @@ export class BacktestService {
                 centerAtEntry: center,
                 peakPrice: buyPrice,
                 stopLossPrice: cutLossPrice,
+              };
+
+              markers.push({
+                time: c.time,
+                position: "belowBar",
+                color: "#10b981",
+                shape: "circle",
+                text: `🟢 GRID BUY #${tradeCounter} (L${lvlIdx + 1} Z${unlockedCapitalZones}) @ $${buyPrice.toFixed(4)}`,
               });
+
+              // Honest same-bar cut-loss if price plunges through cutLossPrice after limit fill
+              if (canTriggerCutLoss && c.low <= cutLossPrice) {
+                const cutExitPrice = cutLossPrice;
+                const cutProceeds = newLot.qty * cutExitPrice * (1 - costPerFill);
+                const cutPnlQuote = cutProceeds - newLot.investQuote;
+                const cutPnlPct = newLot.investQuote > 0 ? (cutPnlQuote / newLot.investQuote) * 100 : 0;
+                gridCash += cutProceeds;
+                const cutExitCost = newLot.qty * cutExitPrice * costPerFill;
+                totalFeesQuote += newLot.costQuote + cutExitCost;
+
+                if (cutPnlQuote >= 0) { grossProfit += cutPnlQuote; wins++; }
+                else { grossLoss += Math.abs(cutPnlQuote); losses++; }
+
+                trades.push({
+                  id: newLot.id,
+                  subsystem: "GRID",
+                  side: "LONG",
+                  entryTime: newLot.entryTime,
+                  entryPrice: newLot.buyPrice,
+                  stopLossPrice: cutLossPrice,
+                  fanSpreadAtEntry: 0,
+                  exitTime: c.time,
+                  exitPrice: cutExitPrice,
+                  exitType: "GRID_CUT",
+                  pnlQuote: cutPnlQuote,
+                  pnlPct: cutPnlPct,
+                  holdingBars: 0,
+                  costQuote: newLot.costQuote + cutExitCost,
+                  channelFloor: newLot.floorAtEntry,
+                  channelCeil: newLot.ceilingAtEntry,
+                  channelMid: newLot.centerAtEntry,
+                  channelSpanPct: newLot.floorAtEntry && newLot.ceilingAtEntry ? Number((((newLot.ceilingAtEntry - newLot.floorAtEntry) / newLot.floorAtEntry) * 100).toFixed(2)) : undefined,
+                  zoneIndex: newLot.zoneIndex,
+                });
+                markers.push({
+                  time: c.time,
+                  position: "belowBar",
+                  color: "#ef4444",
+                  shape: "arrowDown",
+                  text: `🔴 GRID CUT #${newLot.id} (L${newLot.index + 1}${newLot.zoneIndex ? ` Z${newLot.zoneIndex}` : ''}) @ $${cutExitPrice.toFixed(4)} (${cutPnlPct.toFixed(2)}%)`,
+                });
+                break;
+              }
+
+              heldLots.push(newLot);
 
               if (!lockedChannel) {
                 lockedChannel = {
@@ -2904,14 +3304,6 @@ export class BacktestService {
                   sellTargets: [...sellTargets],
                 };
               }
-
-              markers.push({
-                time: c.time,
-                position: "belowBar",
-                color: "#10b981",
-                shape: "circle",
-                text: `🟢 GRID BUY #${tradeCounter} (L${lvlIdx + 1} Z${unlockedCapitalZones}) @ $${buyPrice.toFixed(4)}`,
-              });
               break;
             }
           }
@@ -2944,11 +3336,16 @@ export class BacktestService {
           else if (sniperActiveSide === "SHORT" && liftedSl < sniperStopLossPrice) sniperStopLossPrice = liftedSl;
         }
 
+        const prevRibbon = i > 0 ? ribbonStates[i - 1] : undefined;
+        const prevExhaustion = i > 0 ? exhaustionStates[i - 1] : undefined;
         const exitDecision = MaFanCoreRules.evaluateExits({
           highPrice: c.high,
           lowPrice: c.low,
           closePrice: c.close,
           positionSide: sniperActiveSide,
+          engineType: sniperEngineType,
+          tp1TargetPrice: sniperTp1TargetPrice,
+          tp1TargetMode: opts.tp1TargetMode,
           entryPrice: sniperEntryPrice,
           tp1Filled: sniperTp1Hit,
           stopLossPrice: sniperStopLossPrice,
@@ -2957,29 +3354,42 @@ export class BacktestService {
           highestPriceSinceEntry: highestSinceEntry,
           lowestPriceSinceEntry: lowestSinceEntry,
           ribbon,
+          prevRibbon,
           exhaustion,
+          prevExhaustion,
           trailingPullbackPct,
+          breakevenFeeBufferPct: opts.breakevenFeeBufferPct,
+          cushionMode: opts.cushionMode ?? "off",
+          cushionThresholdPct: opts.cushionThresholdPct,
           isOverbought: exhaustion.isOverboughtExhaustion,
           isOversold: exhaustion.isOversoldExhaustion,
           barsHeld,
           isHtfBull: !!htfRegime.isBullish,
-          tp1MinProfitPct: 0.65,
+          tp1MinProfitPct: opts.tp1MinProfitPct ?? (sniperEngineType?.startsWith("TREND_RIDER") ? 0.75 : 0.65),
           enableFastCut,
           fastCutThresholdPct,
           stagnationBars,
         });
 
+        if (exitDecision.action === "NONE" && exitDecision.newStopLossPrice) {
+          if (sniperActiveSide === "LONG" && exitDecision.newStopLossPrice > sniperStopLossPrice) {
+            sniperStopLossPrice = exitDecision.newStopLossPrice;
+          } else if (sniperActiveSide === "SHORT" && exitDecision.newStopLossPrice < sniperStopLossPrice) {
+            sniperStopLossPrice = exitDecision.newStopLossPrice;
+          }
+        }
+
         if (exitDecision.action === "TP2" || exitDecision.action === "SL") {
           const exitPrice = exitDecision.exitPrice;
           tradeCounter++;
-          let secondHalfProceeds = 0;
           const exitCost = sniperHeldQty * exitPrice * costPerFill;
-
-          if (sniperActiveSide === "LONG") {
-            secondHalfProceeds = sniperHeldQty * exitPrice * (1 - costPerFill);
-          } else {
-            secondHalfProceeds = (sniperHeldQty * sniperEntryPrice) + (sniperHeldQty * (sniperEntryPrice - exitPrice) * (1 - costPerFill));
-          }
+          const secondHalfProceeds = BacktestService.calcExitProceeds(
+            sniperActiveSide,
+            sniperHeldQty,
+            sniperEntryPrice,
+            exitPrice,
+            costPerFill,
+          );
 
           const totalProceeds = sniperTp1Proceeds + secondHalfProceeds;
           const totalInvest = sniperInitialInvest;
@@ -3042,37 +3452,113 @@ export class BacktestService {
           sniperTp1Hit = true;
           sniperTp1Price = exitDecision.exitPrice;
           sniperTp1Time = c.time;
-          const halfQty = sniperHeldQty * tp1Ratio;
-          let tp1Proceeds = 0;
-          let partialPnl = 0;
-          if (sniperActiveSide === "LONG") {
-            tp1Proceeds = halfQty * sniperTp1Price * (1 - costPerFill);
-            partialPnl = tp1Proceeds - (halfQty * sniperEntryPrice);
-          } else {
-            tp1Proceeds = (halfQty * sniperEntryPrice) + (halfQty * (sniperEntryPrice - sniperTp1Price) * (1 - costPerFill));
-            partialPnl = tp1Proceeds - (halfQty * sniperEntryPrice);
-          }
+          if (exitDecision.cushionApplied) sniperLastCushionApplied = true;
+          const activeTp1Ratio = Math.max(0.1, Math.min(0.9, htfRegime.recommendedTp1Ratio ?? tp1Ratio));
+          const halfQty = sniperHeldQty * activeTp1Ratio;
+          const tp1Proceeds = BacktestService.calcExitProceeds(
+            sniperActiveSide,
+            halfQty,
+            sniperEntryPrice,
+            sniperTp1Price,
+            costPerFill,
+          );
+          const tp1InvestPortion = sniperInitialInvest * activeTp1Ratio;
+          const partialPnl = tp1Proceeds - tp1InvestPortion;
           sniperTp1Proceeds = tp1Proceeds;
           sniperTp1Cost = halfQty * sniperTp1Price * costPerFill;
-          sniperTp1PnlPct = (partialPnl / (halfQty * sniperEntryPrice)) * 100;
+          sniperTp1PnlPct = tp1InvestPortion > 0 ? (partialPnl / tp1InvestPortion) * 100 : 0;
           sniperCash += tp1Proceeds;
           sniperHeldQty -= halfQty;
           highestSinceTp1 = c.high;
           lowestSinceTp1 = c.low;
-          sniperStopLossPrice = sniperEntryPrice;
+          const { nextSl, hitIntrabarBe } = BacktestService.resolvePostTp1StopLoss(
+            sniperActiveSide,
+            sniperEntryPrice,
+            sniperStopLossPrice,
+            exitDecision.newStopLossPrice,
+            c,
+            intrabarMode,
+          );
+          sniperStopLossPrice = nextSl;
 
           markers.push({
             time: c.time,
             position: sniperActiveSide === "LONG" ? "aboveBar" : "belowBar",
             color: "#06b6d4",
             shape: "circle",
-            text: `🎯 SNIPER TP1 (${Math.round(tp1Ratio * 100)}%) @ $${sniperTp1Price.toFixed(4)} (+${sniperTp1PnlPct.toFixed(2)}%)`,
+            text: `🎯 SNIPER TP1 (${Math.round(activeTp1Ratio * 100)}%) @ $${sniperTp1Price.toFixed(4)} (${sniperTp1PnlPct >= 0 ? "+" : ""}${sniperTp1PnlPct.toFixed(2)}%)`,
           });
+
+          if (hitIntrabarBe && sniperHeldQty > 0) {
+            const exitPrice = sniperStopLossPrice;
+            tradeCounter++;
+            const exitCost = sniperHeldQty * exitPrice * costPerFill;
+            const secondHalfProceeds = BacktestService.calcExitProceeds(
+              sniperActiveSide,
+              sniperHeldQty,
+              sniperEntryPrice,
+              exitPrice,
+              costPerFill,
+            );
+            const totalProceeds = sniperTp1Proceeds + secondHalfProceeds;
+            const totalInvest = sniperInitialInvest;
+            const pnlQuote = totalProceeds - totalInvest;
+            const pnlPct = totalInvest > 0 ? (pnlQuote / totalInvest) * 100 : 0;
+            sniperCash += secondHalfProceeds;
+            const tradeTotalCost = sniperTradeCost + sniperTp1Cost + exitCost;
+            totalFeesQuote += tradeTotalCost;
+
+            if (pnlQuote >= 0) { grossProfit += pnlQuote; wins++; }
+            else {
+              grossLoss += Math.abs(pnlQuote);
+              losses++;
+              recentSlTimes.push(c.time);
+              if (enableCircuitBreaker) {
+                recentSlTimes = recentSlTimes.filter((t) => t >= c.time - 12 * 3600);
+                if (recentSlTimes.length >= 2) {
+                  cooldownUntilTs = c.time + 6 * 3600;
+                }
+              }
+            }
+
+            trades.push({
+              id: tradeCounter,
+              subsystem: "SNIPER",
+              side: sniperActiveSide,
+              entryTime: candles[sniperEntryIdx].time,
+              entryPrice: sniperEntryPrice,
+              stopLossPrice: sniperStopLossPrice,
+              fanSpreadAtEntry: ribbonStates[sniperEntryIdx].fanSpreadPct,
+              tp1Time: sniperTp1Time,
+              tp1Price: sniperTp1Price,
+              tp1PnlPct: sniperTp1PnlPct,
+              exitTime: c.time,
+              exitPrice,
+              exitType: "TP1+SL_BE",
+              pnlQuote,
+              pnlPct,
+              holdingBars: barsHeld,
+              cushionApplied: sniperLastCushionApplied,
+              costQuote: tradeTotalCost,
+            });
+            markers.push({
+              time: c.time,
+              position: sniperActiveSide === "LONG" ? "belowBar" : "aboveBar",
+              color: "#f59e0b",
+              shape: sniperActiveSide === "LONG" ? "arrowDown" : "arrowUp",
+              text: `🟡 SNIPER SL BE #${tradeCounter} @ $${exitPrice.toFixed(4)} (${pnlPct.toFixed(2)}%)`,
+            });
+            lastSniperExitBar = i;
+            sniperHeldQty = 0;
+            sniperTp1Hit = false;
+            sniperTp1Proceeds = 0;
+            sniperTp1Cost = 0;
+          }
         }
       }
 
       // ── 4. EVALUATE SNIPER ENTRY ──
-      if (sniperHeldQty === 0 && sniperCash >= sniperInitialCap * 0.8 && !isCircuitActive && i > lastSniperExitBar) {
+      if (isTradingActive && !isBtcSitOut && sniperHeldQty === 0 && sniperCash >= 10 && !isCircuitActive && i > lastSniperExitBar) {
         const modularDecision = MaFanCoreRules.evaluateModularEntry({
           tradeMode: "dual",
           tradeDirection,
@@ -3094,21 +3580,24 @@ export class BacktestService {
 
         if (modularDecision.shouldEnter) {
           sniperActiveSide = modularDecision.positionSide ?? "LONG";
+          sniperEngineType = modularDecision.engineType;
+          sniperTp1TargetPrice = modularDecision.tp1TargetPrice;
+          sniperLastCushionApplied = false;
           sniperEntryPrice = modularDecision.entryPrice;
           sniperInitialSlPrice = modularDecision.stopLossPrice;
           sniperStopLossPrice = modularDecision.stopLossPrice;
           sniperEntryIdx = i;
-          const invest = sniperInitialCap;
+          const invest = sniperCash * 0.98;
           sniperInitialInvest = invest;
           sniperHeldQty = (invest / sniperEntryPrice) * (1 - costPerFill);
           sniperCash -= invest;
           sniperTradeCost = invest * costPerFill;
           sniperTp1Proceeds = 0;
           sniperTp1Cost = 0;
-          highestSinceEntry = c.high;
-          lowestSinceEntry = c.low;
-          highestSinceTp1 = 0;
-          lowestSinceTp1 = 0;
+          highestSinceEntry = sniperEntryPrice;
+          lowestSinceEntry = sniperEntryPrice;
+          highestSinceTp1 = sniperEntryPrice;
+          lowestSinceTp1 = sniperEntryPrice;
           sniperTp1Hit = false;
 
           markers.push({
@@ -3116,22 +3605,24 @@ export class BacktestService {
             position: sniperActiveSide === "LONG" ? "belowBar" : "aboveBar",
             color: "#f59e0b",
             shape: sniperActiveSide === "LONG" ? "arrowUp" : "arrowDown",
-            text: `🎯 SNIPER ${sniperActiveSide} @ $${sniperEntryPrice.toFixed(4)}`,
+            text: `🎯 SNIPER ${sniperEngineType || sniperActiveSide} @ $${sniperEntryPrice.toFixed(4)}`,
           });
         }
       }
 
-      // ── 5. COMBINED EQUITY CURVE & MAX DD ──
-      const gridInvVal = heldLots.reduce((s, l) => s + (l.qty * c.close), 0);
+      // ── 5. COMBINED EQUITY CURVE & MAX DD (with exit fee MTM) ──
+      const gridInvVal = heldLots.reduce((s, l) => s + (l.qty * c.close * (1 - costPerFill)), 0);
       const sniperPosVal = sniperHeldQty > 0
-        ? (sniperActiveSide === "LONG"
-            ? sniperHeldQty * c.close
-            : (sniperHeldQty * sniperEntryPrice) + (sniperHeldQty * (sniperEntryPrice - c.close)))
+        ? BacktestService.calcExitProceeds(sniperActiveSide, sniperHeldQty, sniperEntryPrice, c.close, costPerFill)
         : 0;
       const curEquity = gridCash + gridInvVal + sniperCash + sniperPosVal;
       if (curEquity > peakEquity) peakEquity = curEquity;
       const dd = peakEquity > 0 ? ((peakEquity - curEquity) / peakEquity) * 100 : 0;
       if (dd > maxDrawdownPct) maxDrawdownPct = dd;
+      if (isTradingActive && (i % 6 === 0 || i === candles.length - 1)) {
+        hybridEquityCurve.push({ time: c.time, equity: Number(curEquity.toFixed(2)) });
+      }
+      dow.addCandle(c);
     }
 
     // End of simulation liquidation & open positions settlement
@@ -3140,15 +3631,21 @@ export class BacktestService {
 
     if (sniperHeldQty > 0) {
       const exitPrice = lastPrice;
-      const proceeds = sniperActiveSide === "LONG"
-        ? sniperHeldQty * exitPrice * (1 - costPerFill)
-        : (sniperHeldQty * sniperEntryPrice) + (sniperHeldQty * (sniperEntryPrice - lastPrice) * (1 - costPerFill));
-      const invest = sniperHeldQty * sniperEntryPrice;
-      const pnlQuote = proceeds - invest;
-      const pnlPct = invest > 0 ? (pnlQuote / invest) * 100 : 0;
-      sniperCash += proceeds;
+      const remainingProceeds = BacktestService.calcExitProceeds(
+        sniperActiveSide,
+        sniperHeldQty,
+        sniperEntryPrice,
+        exitPrice,
+        costPerFill,
+      );
+      const totalProceeds = sniperTp1Proceeds + remainingProceeds;
+      const totalInvest = sniperInitialInvest;
+      const pnlQuote = totalProceeds - totalInvest;
+      const pnlPct = totalInvest > 0 ? (pnlQuote / totalInvest) * 100 : 0;
+      sniperCash += remainingProceeds;
       const exitCost = sniperHeldQty * exitPrice * costPerFill;
-      totalFeesQuote += (sniperHeldQty * sniperEntryPrice * costPerFill) + exitCost;
+      const tradeTotalCost = sniperTradeCost + sniperTp1Cost + exitCost;
+      totalFeesQuote += tradeTotalCost;
 
       if (pnlQuote >= 0) {
         grossProfit += pnlQuote;
@@ -3166,21 +3663,24 @@ export class BacktestService {
         entryTime,
         entryPrice: sniperEntryPrice,
         stopLossPrice: sniperStopLossPrice,
-        fanSpreadAtEntry: 0,
+        fanSpreadAtEntry: ribbonStates[sniperEntryIdx]?.fanSpreadPct ?? 0,
+        tp1Time: sniperTp1Hit ? sniperTp1Time : undefined,
+        tp1Price: sniperTp1Hit ? sniperTp1Price : undefined,
+        tp1PnlPct: sniperTp1Hit ? sniperTp1PnlPct : undefined,
         exitTime: lastTime,
         exitPrice,
-        exitType: "OPEN",
+        exitType: sniperTp1Hit ? "TP1+OPEN" : "OPEN",
         pnlQuote,
         pnlPct,
         holdingBars: candles.length - 1 - sniperEntryIdx,
-        costQuote: (sniperHeldQty * sniperEntryPrice * costPerFill) + exitCost,
+        costQuote: tradeTotalCost,
       });
     }
 
     for (const lot of heldLots) {
       const exitPrice = lastPrice;
       const proceeds = lot.qty * exitPrice * (1 - costPerFill);
-      const invest = lot.qty * lot.buyPrice;
+      const invest = lot.investQuote;
       const pnlQuote = proceeds - invest;
       const pnlPct = invest > 0 ? (pnlQuote / invest) * 100 : 0;
       gridCash += proceeds;
@@ -3208,7 +3708,7 @@ export class BacktestService {
         exitType: "OPEN",
         pnlQuote,
         pnlPct,
-        holdingBars: candles.length - 1 - (candles.findIndex((x) => x.time === lot.entryTime) || 0),
+        holdingBars: Math.max(0, candles.length - 1 - lot.entryIdx),
         costQuote: lot.costQuote + exitCost,
         channelFloor: lot.floorAtEntry,
         channelCeil: lot.ceilingAtEntry,
@@ -3246,12 +3746,15 @@ export class BacktestService {
       grossPnlQuote: Number((netPnlQuote + totalFeesQuote).toFixed(2)),
     };
 
+    const finalCandles = (opts.trimWarmupPrefix && startIdx > 0) ? candles.slice(startIdx) : candles;
+    const finalEvaluations = (opts.trimWarmupPrefix && startIdx > 0) ? evaluations.slice(startIdx) : evaluations;
+
     const record: BacktestRecord = {
       id: `bt_dual_${Date.now()}`,
       createdAt: new Date().toISOString(),
       symbol,
       timeframe,
-      candleCount: candles.length,
+      candleCount: finalCandles.length,
       spreadThreshold: isAuto
         ? (rollingSpreadCount > 0 ? Number((rollingSpreadSum / rollingSpreadCount).toFixed(2)) : spread)
         : spread,
@@ -3264,8 +3767,602 @@ export class BacktestService {
       summary,
       trades,
       markers: markers.sort((a, b) => a.time - b.time),
-      candles,
-      evaluations,
+      candles: finalCandles,
+      evaluations: finalEvaluations,
+      equityCurve: hybridEquityCurve,
+    };
+
+    if (opts.saveToHistory !== false) {
+      this.saveRecord(record);
+    }
+
+    return record;
+  }
+
+  /**
+   * Run simulation for Swing Trade Strategy (Dow Structure Major LL Retest / HL Base / TL Breakout R:R Engine)
+   */
+  public static runSwingTradeSimulation(
+    candles: Candle[],
+    opts: {
+      symbol: string;
+      timeframe?: string;
+      initialCapital?: number;
+      costModel?: { feePctPerSide: number; slippagePctPerFill: number };
+      saveToHistory?: boolean;
+      channelMode?: "DOW_SWINGS" | "DOW_ATR_CLAMP" | "FIXED_PCT_CLAMP" | "DONCHIAN_ATR" | "VOLUME_PROFILE_HTF";
+      vpLookbackBars?: number;
+      minChannelWidthPct?: number;
+      maxChannelWidthPct?: number;
+      floorBufferPct?: number;
+      donchianPeriod?: number;
+      swingConfig?: Partial<SwingStrategyConfig>;
+      btcCandles?: Candle[];
+      downtrendSitOutMode?: "off" | "btc1d" | "btc4h" | "dual";
+      warmupBars?: number;
+      trimWarmupPrefix?: boolean;
+    }
+  ): BacktestRecord {
+    const symbol = opts.symbol.toUpperCase().replace(/[\/\-_:]/g, "");
+    const timeframe = opts.timeframe || "15m";
+    const initialCapital = opts.initialCapital ?? 200;
+
+    const feePct = opts.costModel?.feePctPerSide ?? 0.075;
+    const slipPct = opts.costModel?.slippagePctPerFill ?? 0.01;
+    const costPerFill = (feePct + slipPct) / 100;
+    const makerCostPerFill = feePct / 100;
+
+    const swingCfg: SwingStrategyConfig = {
+      minRiskReward: opts.swingConfig?.minRiskReward ?? 2.0,
+      stopLossBufferPct: opts.swingConfig?.stopLossBufferPct ?? 0.5,
+      maxPositionPct: opts.swingConfig?.maxPositionPct ?? 60.0,
+      tp1CloseRatio: opts.swingConfig?.tp1CloseRatio ?? 0.5,
+      tp1TargetType: opts.swingConfig?.tp1TargetType ?? "CENTER_POC",
+      tp2TargetType: opts.swingConfig?.tp2TargetType ?? "SWING_HIGH_HH",
+      trailingActivationPct: opts.swingConfig?.trailingActivationPct ?? 1.5,
+      trailingPullbackPct: opts.swingConfig?.trailingPullbackPct ?? 0.8,
+      enableHlBaseEntry: opts.swingConfig?.enableHlBaseEntry ?? true,
+      enableTrendlineBreakoutEntry: opts.swingConfig?.enableTrendlineBreakoutEntry ?? false,
+      enableSupportRetestEntry: opts.swingConfig?.enableSupportRetestEntry ?? true,
+      enableBearishReversalExit: opts.swingConfig?.enableBearishReversalExit ?? true,
+      bearishReversalMinProfitPct: opts.swingConfig?.bearishReversalMinProfitPct ?? 0.35,
+      bearishReversalResistanceTolerancePct: opts.swingConfig?.bearishReversalResistanceTolerancePct ?? 0.8,
+      orderExecutionMode: opts.swingConfig?.orderExecutionMode ?? "MAKER_LIMIT",
+    };
+
+    const isMakerMode = swingCfg.orderExecutionMode === "MAKER_LIMIT";
+    const entryCostRate = isMakerMode ? makerCostPerFill : costPerFill;
+    const tpCostRate = isMakerMode ? makerCostPerFill : costPerFill;
+
+    const btcSitOutCtx = BacktestService.prepareBtcSitOutContext(opts.btcCandles);
+    const defaultWarmup = Math.min(100, Math.floor(candles.length / 4));
+    const startIdx = Math.max(
+      0,
+      Math.min(
+        candles.length > 0 ? candles.length - 1 : 0,
+        opts.warmupBars !== undefined ? opts.warmupBars : defaultWarmup,
+      ),
+    );
+    const warmup = Math.min(defaultWarmup, startIdx > 0 ? startIdx : defaultWarmup);
+    const dow = new DowStructureEngine(3, true, opts.maxChannelWidthPct ?? 25.0, 300);
+
+    const ribbonStates = RibbonEngine.computeAllRibbonStates(candles);
+    const exhaustionStates = ExhaustionEngine.computeAllExhaustion(candles);
+    const atrs = calcATR(candles, 14);
+    const evaluations: BacktestEvaluationItem[] = new Array(candles.length);
+
+    for (let k = 0; k < warmup; k++) {
+      const cK = candles[k];
+      if (!cK) continue;
+      dow.addCandle(cK);
+      const ribK = ribbonStates[k];
+      const exhK = exhaustionStates[k];
+      if (ribK && exhK) {
+        evaluations[k] = {
+          time: cK.time,
+          fanSpreadPct: ribK.fanSpreadPct,
+          isFanningDown: ribK.isFanningDown,
+          isHookUp: ribK.isHookUp,
+          rsi: exhK.rsi,
+          rsiSma: exhK.rsiSma,
+          isOversoldExhaustion: exhK.isOversoldExhaustion,
+          ema4: ribK.ema4,
+          ema8: ribK.ema8,
+          ema16: ribK.ema16,
+          ema25: ribK.ema25,
+          ema75: ribK.ema75,
+          ema200: ribK.ema200,
+        };
+      }
+    }
+
+    let cash = initialCapital;
+    let peakEquity = initialCapital;
+    let maxDrawdownPct = 0;
+    let tradeCounter = 0;
+    let wins = 0;
+    let losses = 0;
+    let grossProfit = 0;
+    let grossLoss = 0;
+    let totalFeesQuote = 0;
+
+    const trades: BacktestTrade[] = [];
+    const markers: BacktestMarker[] = [];
+    const equityCurve: Array<{ time: number; equity: number }> = [];
+
+    let consumedBreakoutTlKey: string | undefined = undefined;
+    let pendingEntry: {
+      price: number;
+      stopLossPrice: number;
+      tp1Price: number;
+      tp2Price: number;
+      signalType: string;
+      reason: string;
+      riskRewardRatio: number;
+      tlKey?: string;
+    } | null = null;
+
+    let pos: {
+      id: number;
+      entryTime: number;
+      entryIdx: number;
+      entryPrice: number;
+      initialQty: number;
+      qty: number;
+      investQuote: number;
+      entryCost: number;
+      stopLossPrice: number;
+      tp1Price: number;
+      tp2Price: number;
+      tp1Executed: boolean;
+      tp1Time?: number;
+      tp1FillPrice?: number;
+      tp1Proceeds: number;
+      tp1ExitCost: number;
+      highestPriceSinceEntry: number;
+      trailingStopActive: boolean;
+      riskRewardRatio: number;
+      signalType: string;
+      fanSpreadAtEntry: number;
+    } | null = null;
+
+    const closePosition = (exitPrice: number, exitTime: number, barIdx: number, exitType: string, exitCostRate: number, color: string, icon: string) => {
+      if (!pos) return;
+      const remProceeds = pos.qty * exitPrice * (1 - exitCostRate);
+      const remExitCost = pos.qty * exitPrice * exitCostRate;
+      cash += remProceeds;
+      const totalProceeds = pos.tp1Proceeds + remProceeds;
+      const pnlQuote = totalProceeds - pos.investQuote;
+      const pnlPct = pos.investQuote > 0 ? (pnlQuote / pos.investQuote) * 100 : 0;
+      const costQuote = pos.entryCost + pos.tp1ExitCost + remExitCost;
+      totalFeesQuote += costQuote;
+
+      if (pnlQuote >= 0) {
+        grossProfit += pnlQuote;
+        wins++;
+      } else {
+        grossLoss += Math.abs(pnlQuote);
+        losses++;
+      }
+
+      const tp1PnlPct = pos.tp1Executed && pos.tp1FillPrice
+        ? ((pos.tp1FillPrice - pos.entryPrice) / pos.entryPrice) * 100
+        : undefined;
+      const exitDiffPct = ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100;
+      const isSlExit = exitType.includes("SL") || exitType === "TL_REJECTION";
+
+      trades.push({
+        id: pos.id,
+        subsystem: "SNIPER",
+        side: "LONG",
+        entryTime: pos.entryTime,
+        entryPrice: pos.entryPrice,
+        stopLossPrice: pos.stopLossPrice,
+        fanSpreadAtEntry: pos.fanSpreadAtEntry,
+        tp1Time: pos.tp1Executed ? pos.tp1Time : undefined,
+        tp1Price: pos.tp1Executed ? pos.tp1FillPrice : undefined,
+        tp1PnlPct,
+        tp2Time: !isSlExit && pos.tp1Executed ? exitTime : undefined,
+        tp2Price: !isSlExit && pos.tp1Executed ? exitPrice : undefined,
+        tp2PnlPct: !isSlExit && pos.tp1Executed ? exitDiffPct : undefined,
+        slTime: isSlExit ? exitTime : undefined,
+        slPrice: isSlExit ? exitPrice : undefined,
+        slPnlPct: isSlExit ? exitDiffPct : undefined,
+        exitTime,
+        exitPrice,
+        exitType,
+        pnlQuote,
+        pnlPct,
+        holdingBars: Math.max(0, barIdx - pos.entryIdx),
+        costQuote,
+        rewardRiskAtEntry: pos.riskRewardRatio,
+      });
+
+      markers.push({
+        time: exitTime,
+        position: pnlQuote >= 0 ? "aboveBar" : "belowBar",
+        color,
+        shape: pnlQuote >= 0 ? "arrowDown" : "circle",
+        text: `${icon} ${exitType} #${pos.id} @ $${exitPrice.toFixed(4)} (${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%)`,
+      });
+      pos = null;
+    };
+
+    for (let i = warmup; i < candles.length; i++) {
+      const c = candles[i]!;
+      const isTradingActive = i >= startIdx;
+      const prevIdx = Math.max(0, i - 1);
+      const prevBar = candles[prevIdx]!;
+      const rib = ribbonStates[i];
+      const exh = exhaustionStates[i];
+      if (rib && exh) {
+        evaluations[i] = {
+          time: c.time,
+          fanSpreadPct: rib.fanSpreadPct,
+          isFanningDown: rib.isFanningDown,
+          isHookUp: rib.isHookUp,
+          rsi: exh.rsi,
+          rsiSma: exh.rsiSma,
+          isOversoldExhaustion: exh.isOversoldExhaustion,
+          ema4: rib.ema4,
+          ema8: rib.ema8,
+          ema16: rib.ema16,
+          ema25: rib.ema25,
+          ema75: rib.ema75,
+          ema200: rib.ema200,
+        };
+      }
+
+      const isBtcSitOut = BacktestService.isBtcSitOutActive(btcSitOutCtx, opts.downtrendSitOutMode, c.time);
+      const curAtr = atrs[prevIdx] ?? (prevBar.close * 0.004);
+      const atrPct = prevBar.close > 0 ? (curAtr / prevBar.close) * 100 : 0.4;
+      const dynamicMinWidth = Math.max(opts.minChannelWidthPct ?? 4.0, atrPct * 3.0);
+      const volumeProfile = opts.channelMode === "VOLUME_PROFILE_HTF"
+        ? VolumeProfileEngine.calculate(dow.getCandles(), opts.vpLookbackBars ?? 192)
+        : undefined;
+      const structure = dow.getStructure(prevBar.close, undefined, {
+        useOnlyClosedCandles: true,
+        mode: opts.channelMode ?? "DONCHIAN_ATR",
+        donchianLookback: opts.donchianPeriod ?? 48,
+        minChannelWidthPct: dynamicMinWidth,
+        maxChannelWidthPct: opts.maxChannelWidthPct ?? 25.0,
+        floorBufferPct: opts.floorBufferPct ?? 0.0,
+        volumeProfile,
+      });
+
+      let enteredThisBar = false;
+
+      // 1. Check resting Maker Limit pending entry before evaluating new setups
+      if (!pos && pendingEntry && isTradingActive && !isBtcSitOut) {
+        if (c.open <= pendingEntry.stopLossPrice || c.open > pendingEntry.price * 1.020) {
+          if (pendingEntry.tlKey) consumedBreakoutTlKey = pendingEntry.tlKey;
+          pendingEntry = null;
+        } else if (c.low <= pendingEntry.price) {
+          const budget = cash * (Math.min(100, Math.max(1, swingCfg.maxPositionPct)) / 100);
+          if (budget >= 5 && cash >= budget * 0.999) {
+            const fillPrice = pendingEntry.price;
+            const investQuote = Math.min(cash, budget);
+            const fillQty = (investQuote / fillPrice) * (1 - entryCostRate);
+            const entryCost = investQuote * entryCostRate;
+            cash -= investQuote;
+            tradeCounter++;
+            const safeTp1 = Math.max(pendingEntry.tp1Price, fillPrice * 1.002);
+            const safeTp2 = Math.max(pendingEntry.tp2Price, safeTp1 * 1.005);
+            pos = {
+              id: tradeCounter,
+              entryTime: c.time,
+              entryIdx: i,
+              entryPrice: fillPrice,
+              initialQty: fillQty,
+              qty: fillQty,
+              investQuote,
+              entryCost,
+              stopLossPrice: pendingEntry.stopLossPrice,
+              tp1Price: safeTp1,
+              tp2Price: safeTp2,
+              tp1Executed: false,
+              tp1Proceeds: 0,
+              tp1ExitCost: 0,
+              highestPriceSinceEntry: fillPrice,
+              trailingStopActive: false,
+              riskRewardRatio: pendingEntry.riskRewardRatio,
+              signalType: pendingEntry.signalType,
+              fanSpreadAtEntry: rib?.fanSpreadPct ?? 0,
+            };
+            if (pendingEntry.tlKey) consumedBreakoutTlKey = pendingEntry.tlKey;
+            enteredThisBar = true;
+            markers.push({
+              time: c.time,
+              position: "belowBar",
+              color: "#10b981",
+              shape: "arrowUp",
+              text: `🎯 SWING BUY #${tradeCounter} (${pendingEntry.signalType}) @ $${fillPrice.toFixed(4)}`,
+            });
+          }
+          pendingEntry = null;
+        }
+      }
+
+      // 2. If still flat, evaluate setup causally on prevBar & prior closed candles
+      if (!pos && !pendingEntry && isTradingActive && !isBtcSitOut && dow.getCandles().length >= 15) {
+        const signal = SwingSignalDetector.evaluateSetup(
+          prevBar.close,
+          structure,
+          swingCfg,
+          dow.getCandles(),
+          consumedBreakoutTlKey,
+        );
+
+        if (signal.hasSignal && signal.stopLossPrice > 0) {
+          const tlKey = signal.signalType === "TL_BREAKOUT" && structure.downtrendLine?.p1 && structure.downtrendLine?.p2
+            ? `${structure.downtrendLine.p1.time}_${structure.downtrendLine.p2.time}`
+            : undefined;
+          const desiredEntry = signal.entryPrice > 0 ? signal.entryPrice : prevBar.close;
+
+          if (isMakerMode && desiredEntry < c.open * 0.9998 && desiredEntry > signal.stopLossPrice) {
+            if (c.low <= desiredEntry) {
+              // Fills on bar open/intrabar pullback
+              const budget = cash * (Math.min(100, Math.max(1, swingCfg.maxPositionPct)) / 100);
+              if (budget >= 5 && cash >= budget * 0.999) {
+                const investQuote = Math.min(cash, budget);
+                const fillQty = (investQuote / desiredEntry) * (1 - entryCostRate);
+                const entryCost = investQuote * entryCostRate;
+                cash -= investQuote;
+                tradeCounter++;
+                const safeTp1 = Math.max(signal.tp1Price, desiredEntry * 1.002);
+                const safeTp2 = Math.max(signal.tp2Price, safeTp1 * 1.005);
+                pos = {
+                  id: tradeCounter,
+                  entryTime: c.time,
+                  entryIdx: i,
+                  entryPrice: desiredEntry,
+                  initialQty: fillQty,
+                  qty: fillQty,
+                  investQuote,
+                  entryCost,
+                  stopLossPrice: signal.stopLossPrice,
+                  tp1Price: safeTp1,
+                  tp2Price: safeTp2,
+                  tp1Executed: false,
+                  tp1Proceeds: 0,
+                  tp1ExitCost: 0,
+                  highestPriceSinceEntry: desiredEntry,
+                  trailingStopActive: false,
+                  riskRewardRatio: signal.riskRewardRatio,
+                  signalType: signal.signalType || "SWING",
+                  fanSpreadAtEntry: rib?.fanSpreadPct ?? 0,
+                };
+                if (tlKey) consumedBreakoutTlKey = tlKey;
+                enteredThisBar = true;
+                markers.push({
+                  time: c.time,
+                  position: "belowBar",
+                  color: "#10b981",
+                  shape: "arrowUp",
+                  text: `🎯 SWING BUY #${tradeCounter} (${pos.signalType}) @ $${desiredEntry.toFixed(4)}`,
+                });
+              }
+            } else if (c.open <= desiredEntry * 1.020 && c.open > signal.stopLossPrice) {
+              pendingEntry = {
+                price: desiredEntry,
+                stopLossPrice: signal.stopLossPrice,
+                tp1Price: signal.tp1Price,
+                tp2Price: signal.tp2Price,
+                signalType: signal.signalType || "SWING",
+                reason: signal.reason,
+                riskRewardRatio: signal.riskRewardRatio,
+                tlKey,
+              };
+            }
+          } else if (c.open > signal.stopLossPrice) {
+            // Immediate fill at bar open
+            const entryExecPrice = c.open;
+            const budget = cash * (Math.min(100, Math.max(1, swingCfg.maxPositionPct)) / 100);
+            if (budget >= 5 && cash >= budget * 0.999) {
+              const investQuote = Math.min(cash, budget);
+              const fillQty = (investQuote / entryExecPrice) * (1 - entryCostRate);
+              const entryCost = investQuote * entryCostRate;
+              cash -= investQuote;
+              tradeCounter++;
+              const safeTp1 = Math.max(signal.tp1Price, entryExecPrice * 1.002);
+              const safeTp2 = Math.max(signal.tp2Price, safeTp1 * 1.005);
+              pos = {
+                id: tradeCounter,
+                entryTime: c.time,
+                entryIdx: i,
+                entryPrice: entryExecPrice,
+                initialQty: fillQty,
+                qty: fillQty,
+                investQuote,
+                entryCost,
+                stopLossPrice: signal.stopLossPrice,
+                tp1Price: safeTp1,
+                tp2Price: safeTp2,
+                tp1Executed: false,
+                tp1Proceeds: 0,
+                tp1ExitCost: 0,
+                highestPriceSinceEntry: entryExecPrice,
+                trailingStopActive: false,
+                riskRewardRatio: signal.riskRewardRatio,
+                signalType: signal.signalType || "SWING",
+                fanSpreadAtEntry: rib?.fanSpreadPct ?? 0,
+              };
+              if (tlKey) consumedBreakoutTlKey = tlKey;
+              enteredThisBar = true;
+              markers.push({
+                time: c.time,
+                position: "belowBar",
+                color: "#10b981",
+                shape: "arrowUp",
+                text: `🎯 SWING BUY #${tradeCounter} (${pos.signalType}) @ $${entryExecPrice.toFixed(4)}`,
+              });
+            }
+          }
+        }
+      }
+
+      // 3. Manage Active Position (Pessimistic SL check before TP; trailing/reversal/TL escape after TP1 or on subsequent bars)
+      if (pos) {
+        // Hard Stop Loss / Trailing Stop check
+        if (c.low <= pos.stopLossPrice) {
+          const exitPrice = Math.min(c.open, pos.stopLossPrice);
+          const exitType = pos.tp1Executed ? "TP1+SL_BE" : (pos.trailingStopActive ? "RATCHET_SL" : "SL");
+          closePosition(
+            exitPrice,
+            c.time,
+            i,
+            exitType,
+            costPerFill,
+            pos.tp1Executed ? "#f59e0b" : "#ef4444",
+            pos.tp1Executed ? "🟡" : "🔴",
+          );
+        }
+
+        if (pos && !enteredThisBar) {
+          pos.highestPriceSinceEntry = Math.max(pos.highestPriceSinceEntry, c.high);
+
+          // TP1 Partial Exit
+          if (!pos.tp1Executed && c.high >= pos.tp1Price) {
+            const ratio = swingCfg.tp1CloseRatio > 0 && swingCfg.tp1CloseRatio < 1 ? swingCfg.tp1CloseRatio : 0.5;
+            const exitQty = pos.qty * ratio;
+            const tp1ExecPrice = pos.tp1Price;
+            const grossTp1 = exitQty * tp1ExecPrice * (1 - tpCostRate);
+            const feeTp1 = exitQty * tp1ExecPrice * tpCostRate;
+            cash += grossTp1;
+            pos.tp1Proceeds += grossTp1;
+            pos.tp1ExitCost += feeTp1;
+            pos.qty -= exitQty;
+            pos.tp1Executed = true;
+            pos.tp1Time = c.time;
+            pos.tp1FillPrice = tp1ExecPrice;
+            if (tp1ExecPrice >= pos.entryPrice) {
+              pos.stopLossPrice = Math.max(pos.stopLossPrice, pos.entryPrice);
+            }
+            markers.push({
+              time: c.time,
+              position: "aboveBar",
+              color: "#3b82f6",
+              shape: "circle",
+              text: `🎯 TP1 (${Math.round(ratio * 100)}%) #${pos.id} @ $${tp1ExecPrice.toFixed(4)}`,
+            });
+          }
+
+          // TP2 Full Exit
+          if (pos && pos.tp1Executed && c.high >= pos.tp2Price && pos.qty > 1e-12) {
+            closePosition(pos.tp2Price, c.time, i, "TP1+TP2", tpCostRate, "#10b981", "🚀");
+          }
+
+          // Post-TP1 Trailing Stop update (applies from bar close / next bar forward)
+          if (pos && pos.tp1Executed) {
+            const peakGainPct = ((pos.highestPriceSinceEntry - pos.entryPrice) / pos.entryPrice) * 100;
+            if (peakGainPct >= swingCfg.trailingActivationPct) {
+              pos.trailingStopActive = true;
+              const newTrail = pos.highestPriceSinceEntry * (1 - swingCfg.trailingPullbackPct / 100);
+              if (newTrail > pos.stopLossPrice) {
+                pos.stopLossPrice = newTrail;
+              }
+            }
+          }
+
+          // Closed-candle Structural Resistance & Bearish Reversal Escapes (Evaluated at bar i close)
+          if (pos) {
+            const closeProfitPct = ((c.close - pos.entryPrice) / pos.entryPrice) * 100;
+            const dt = structure.downtrendLine;
+            if (dt && !structure.downtrendBreakoutConfirmed && dt.currentLinePrice > 0) {
+              if (c.high >= dt.currentLinePrice * 0.996 && closeProfitPct >= 0.4) {
+                pos.stopLossPrice = Math.max(pos.stopLossPrice, pos.entryPrice * 1.001);
+              }
+              if (closeProfitPct >= 0.5 && c.high >= dt.currentLinePrice * 0.996 && c.close < c.open && c.close < prevBar.close) {
+                closePosition(c.close, c.time, i, pos.tp1Executed ? "TP1+TL_REJECTION" : "TL_REJECTION", costPerFill, "#f97316", "🛡️");
+              }
+            }
+
+            if (pos && swingCfg.enableBearishReversalExit && closeProfitPct >= swingCfg.bearishReversalMinProfitPct) {
+              const tol = swingCfg.bearishReversalResistanceTolerancePct / 100;
+              const resistances = [structure.upperBound, dt?.currentLinePrice, pos.tp1Price, pos.tp2Price]
+                .filter((r): r is number => typeof r === "number" && Number.isFinite(r) && r > 0);
+              const nearRes = resistances.some((r) => c.high >= r * (1 - tol) || c.close >= r * (1 - tol));
+              if (nearRes) {
+                const closedSlice = [...dow.getCandles(), { ...c, isClosed: true }];
+                const rev = SwingSignalDetector.checkBearishReversal(closedSlice);
+                if (rev.isReversal) {
+                  closePosition(c.close, c.time, i, pos.tp1Executed ? "TP1+BEARISH_REV" : "BEARISH_REV", costPerFill, "#f59e0b", "🕯️");
+                }
+              }
+            }
+          }
+        }
+      }
+
+      const curEquity = cash + (pos ? pos.qty * c.close * (1 - costPerFill) : 0);
+      if (curEquity > peakEquity) peakEquity = curEquity;
+      const dd = peakEquity > 0 ? ((peakEquity - curEquity) / peakEquity) * 100 : 0;
+      if (dd > maxDrawdownPct) maxDrawdownPct = dd;
+      equityCurve.push({ time: c.time, equity: Number(curEquity.toFixed(4)) });
+
+      dow.addCandle(c);
+    }
+
+    // Settle any still-open position at end of window
+    if (pos && candles.length > 0) {
+      const lastC = candles[candles.length - 1]!;
+      closePosition(
+        lastC.close,
+        lastC.time,
+        candles.length - 1,
+        pos.tp1Executed ? "TP1+OPEN" : "OPEN",
+        costPerFill,
+        "#6366f1",
+        "📦",
+      );
+    }
+
+    const finalCapital = cash;
+    const netPnlQuote = finalCapital - initialCapital;
+    const netPnlPct = initialCapital > 0 ? (netPnlQuote / initialCapital) * 100 : 0;
+    const winRate = trades.length > 0 ? (wins / trades.length) * 100 : 0;
+    const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? 99 : 0;
+    const avgBarsHeld = trades.length > 0 ? Math.round(trades.reduce((a, b) => a + b.holdingBars, 0) / trades.length) : 0;
+    const pnlPcts = trades.map((t) => t.pnlPct);
+    const bestTradePct = pnlPcts.length > 0 ? Math.max(...pnlPcts) : 0;
+    const worstTradePct = pnlPcts.length > 0 ? Math.min(...pnlPcts) : 0;
+
+    const summary: BacktestSummary = {
+      initialCapital,
+      finalCapital: Number(finalCapital.toFixed(2)),
+      netPnlQuote: Number(netPnlQuote.toFixed(2)),
+      netPnlPct: Number(netPnlPct.toFixed(2)),
+      totalTrades: trades.length,
+      winTrades: wins,
+      lossTrades: losses,
+      winRate: Number(winRate.toFixed(1)),
+      profitFactor: Number(profitFactor.toFixed(2)),
+      maxDrawdownPct: Number(maxDrawdownPct.toFixed(2)),
+      avgBarsHeld,
+      bestTradePct: Number(bestTradePct.toFixed(2)),
+      worstTradePct: Number(worstTradePct.toFixed(2)),
+      totalFeesQuote: Number(totalFeesQuote.toFixed(2)),
+      grossPnlQuote: Number((netPnlQuote + totalFeesQuote).toFixed(2)),
+    };
+
+    const finalCandles = (opts.trimWarmupPrefix && startIdx > 0) ? candles.slice(startIdx) : candles;
+    const finalEvaluations = (opts.trimWarmupPrefix && startIdx > 0) ? evaluations.slice(startIdx) : evaluations;
+
+    const record: BacktestRecord = {
+      id: `bt_swing_${Date.now()}`,
+      createdAt: new Date().toISOString(),
+      symbol,
+      timeframe,
+      candleCount: finalCandles.length,
+      spreadThreshold: 0,
+      isAutoCalibrated: false,
+      lockChannelInPosition: false,
+      summary,
+      trades,
+      markers: markers.sort((a, b) => a.time - b.time),
+      candles: finalCandles,
+      evaluations: finalEvaluations,
+      equityCurve,
     };
 
     if (opts.saveToHistory !== false) {
@@ -3309,7 +4406,7 @@ export class BacktestService {
       fastCutThresholdPct?: number;
       stagnationBars?: number;
       maxSlPct?: number;
-      tradeMode?: "dip_hunter" | "trend_rider" | "dual" | "dynamic_grid" | "dual_hybrid";
+      tradeMode?: "dip_hunter" | "trend_rider" | "dual" | "dynamic_grid" | "dual_hybrid" | "swing_trade";
       tradeDirection?: "long" | "short" | "both";
       exitInfoLag?: 0 | 1;
       warmupBars?: number;
@@ -3324,6 +4421,7 @@ export class BacktestService {
       regimeFilterMode?: "SIDEWAY_ONLY" | "NO_DOWNTREND" | "UPTREND_AND_SIDEWAY" | "OFF";
       lockChannelInPosition?: boolean;
       channelMode?: "DOW_SWINGS" | "DOW_ATR_CLAMP" | "FIXED_PCT_CLAMP" | "DONCHIAN_ATR" | "VOLUME_PROFILE_HTF";
+      vpLookbackBars?: number;
       donchianPeriod?: number;
       minChannelWidthPct?: number;
       maxChannelWidthPct?: number;
@@ -3338,7 +4436,7 @@ export class BacktestService {
       buyLevelPcts?: number[];
       sellLevelPcts?: number[];
       buyWeights?: number[];
-      zoneExitMode?: "PORTFOLIO_AVG" | "ORIGINAL_TARGETS" | "PER_ZONE";
+      zoneExitMode?: "PORTFOLIO_AVG" | "ORIGINAL_TARGETS" | "PER_ZONE" | "HYBRID_ZONE_RECOVERY" | "AVG_PROFIT_ALL";
       minNetProfitPct?: number;
       tp1TargetMode?: "EMA25" | "EMA75" | "EMA200";
       lockBreakevenAtEma200?: boolean;
@@ -3348,8 +4446,31 @@ export class BacktestService {
       minRelStrengthVsBtc24h?: number;
       btcCandles?: Candle[];
       downtrendSitOutMode?: "off" | "btc1d" | "btc4h" | "dual";
+      gridHtfGovernor?: "off" | "1h_ema200" | "4h_ema75";
+      swingConfig?: Partial<SwingStrategyConfig>;
     }
   ): BacktestRecord {
+    if (opts.tradeMode === "swing_trade") {
+      return BacktestService.runSwingTradeSimulation(candles, {
+        symbol: opts.symbol,
+        timeframe: opts.timeframe,
+        initialCapital: opts.initialCapital,
+        costModel: opts.costModel,
+        saveToHistory: opts.saveToHistory,
+        channelMode: opts.channelMode,
+        vpLookbackBars: opts.vpLookbackBars,
+        minChannelWidthPct: opts.minChannelWidthPct,
+        maxChannelWidthPct: opts.maxChannelWidthPct,
+        floorBufferPct: opts.floorBufferPct,
+        donchianPeriod: opts.donchianPeriod,
+        swingConfig: opts.swingConfig,
+        btcCandles: opts.btcCandles,
+        downtrendSitOutMode: opts.downtrendSitOutMode,
+        warmupBars: opts.warmupBars,
+        trimWarmupPrefix: opts.trimWarmupPrefix,
+      });
+    }
+
     if (opts.tradeMode === "dynamic_grid") {
       return BacktestService.runDynamicGridSimulation(candles, {
         symbol: opts.symbol,
@@ -3360,6 +4481,7 @@ export class BacktestService {
         saveToHistory: opts.saveToHistory,
         enableBaseConfirmationFilter: opts.enableBaseConfirmationFilter,
         channelMode: opts.channelMode,
+        vpLookbackBars: opts.vpLookbackBars,
         donchianPeriod: opts.donchianPeriod,
         minChannelWidthPct: opts.minChannelWidthPct,
         maxChannelWidthPct: opts.maxChannelWidthPct,
@@ -3377,6 +4499,11 @@ export class BacktestService {
         buyWeights: opts.buyWeights,
         regimeFilterMode: opts.regimeFilterMode,
         enableGridTrailingStop: opts.enableGridTrailingStop,
+        warmupBars: opts.warmupBars,
+        trimWarmupPrefix: opts.trimWarmupPrefix,
+        btcCandles: opts.btcCandles,
+        downtrendSitOutMode: opts.downtrendSitOutMode,
+        gridHtfGovernor: opts.gridHtfGovernor,
       });
     }
 
@@ -3403,11 +4530,18 @@ export class BacktestService {
         enableFastCut: opts.enableFastCut,
         fastCutThresholdPct: opts.fastCutThresholdPct,
         maxSlPct: opts.maxSlPct,
+        tp1TargetMode: opts.tp1TargetMode,
+        breakevenFeeBufferPct: opts.breakevenFeeBufferPct,
+        cushionMode: opts.cushionMode,
+        cushionThresholdPct: opts.cushionThresholdPct,
+        tp1MinProfitPct: opts.tp1MinProfitPct,
+        intrabarMode: opts.intrabarMode,
         precomputed: opts.precomputed,
         candlesHtf: opts.candlesHtf,
         enableBaseConfirmationFilter: opts.enableBaseConfirmationFilter,
         lockChannelInPosition: opts.lockChannelInPosition,
         channelMode: opts.channelMode,
+        vpLookbackBars: opts.vpLookbackBars,
         donchianPeriod: opts.donchianPeriod,
         minChannelWidthPct: opts.minChannelWidthPct,
         maxChannelWidthPct: opts.maxChannelWidthPct,
@@ -3424,6 +4558,11 @@ export class BacktestService {
         buyWeights: opts.buyWeights,
         regimeFilterMode: opts.regimeFilterMode,
         enableGridTrailingStop: opts.enableGridTrailingStop,
+        gridHtfGovernor: opts.gridHtfGovernor,
+        warmupBars: opts.warmupBars,
+        trimWarmupPrefix: opts.trimWarmupPrefix,
+        btcCandles: opts.btcCandles,
+        downtrendSitOutMode: opts.downtrendSitOutMode,
       });
     }
 
@@ -3499,6 +4638,8 @@ export class BacktestService {
     let tp1Time = 0;
     let tp1Qty = 0;
     let activeSide: "LONG" | "SHORT" = "LONG";
+    let activeEngineType: EntryDecision["engineType"] | undefined = undefined;
+    let activeTp1TargetPrice: number | undefined = undefined;
     let highestSinceTp1 = 0;
     let highestSinceEntry = 0;
     let lowestSinceTp1 = 0;
@@ -3574,27 +4715,7 @@ export class BacktestService {
       }
     }
 
-    const btc4h = (opts.btcCandles && opts.btcCandles.length > 0) ? BacktestService.aggregateCandles(opts.btcCandles, 240) : [];
-    const btc4hCloses = btc4h.map((c) => c.close);
-    const btc4hEma75 = calcEMA(btc4hCloses, 75);
-
-    const btc1d = (opts.btcCandles && opts.btcCandles.length > 0) ? BacktestService.aggregateCandles(opts.btcCandles, 1440) : [];
-    const btc1dCloses = btc1d.map((c) => c.close);
-    const btc1dEma25 = calcEMA(btc1dCloses, 25);
-
-    function getClosedHtfIdx(arr: Candle[], durationSec: number, targetSec: number) {
-      let lo = 0, hi = arr.length - 1, ans = -1;
-      while (lo <= hi) {
-        const mid = (lo + hi) >> 1;
-        if (arr[mid].time + durationSec <= targetSec) {
-          ans = mid;
-          lo = mid + 1;
-        } else {
-          hi = mid - 1;
-        }
-      }
-      return ans;
-    }
+    const btcSitOutCtx = BacktestService.prepareBtcSitOutContext(opts.btcCandles);
 
     for (let i = startIdx; i < candles.length; i++) {
       const c = candles[i]!;
@@ -3726,6 +4847,8 @@ export class BacktestService {
           lowestPriceSinceTp1: lowestSinceTp1,
           lowestPriceSinceEntry: lowestSinceEntry,
           positionSide: activeSide,
+          engineType: activeEngineType,
+          tp1TargetPrice: activeTp1TargetPrice,
           ribbon: ribbonX,
           prevRibbon: prevRibbonX,
           exhaustion: exhX,
@@ -3758,9 +4881,7 @@ export class BacktestService {
         // 1. TP2 Exit (Macro Runner / Trailing Stop)
         if (exitDecision.action === "TP2") {
           const exitP = exitDecision.exitPrice;
-          const proceeds = activeSide === "LONG"
-            ? heldQty * exitP * (1 - costPerFill)
-            : (heldQty * entryPrice) + (heldQty * (entryPrice - exitP) * (1 - costPerFill));
+          const proceeds = BacktestService.calcExitProceeds(activeSide, heldQty, entryPrice, exitP, costPerFill);
           cash += proceeds;
           tradeProceeds += proceeds;
 
@@ -3821,9 +4942,7 @@ export class BacktestService {
         // 2. Stop Loss Exit
         if (exitDecision.action === "SL") {
           const exitP = exitDecision.exitPrice;
-          const proceeds = activeSide === "LONG"
-            ? heldQty * exitP * (1 - costPerFill)
-            : (heldQty * entryPrice) + (heldQty * (entryPrice - exitP) * (1 - costPerFill));
+          const proceeds = BacktestService.calcExitProceeds(activeSide, heldQty, entryPrice, exitP, costPerFill);
           cash += proceeds;
           tradeProceeds += proceeds;
 
@@ -3905,9 +5024,7 @@ export class BacktestService {
           tp1Price = exitDecision.exitPrice;
           tp1Time = c.time;
           tp1Qty = heldQty * activeTp1RatioX;
-          const tp1Proceeds = activeSide === "LONG"
-            ? tp1Qty * tp1Price * (1 - costPerFill)
-            : (tp1Qty * entryPrice) + (tp1Qty * (entryPrice - tp1Price) * (1 - costPerFill));
+          const tp1Proceeds = BacktestService.calcExitProceeds(activeSide, tp1Qty, entryPrice, tp1Price, costPerFill);
           cash += tp1Proceeds;
           tradeProceeds += tp1Proceeds;
           heldQty -= tp1Qty;
@@ -3917,11 +5034,15 @@ export class BacktestService {
           if (exitDecision.cushionApplied) {
             lastCushionApplied = true;
           }
-          if (exitDecision.newStopLossPrice) {
-            stopLossPrice = activeSide === "LONG"
-              ? Math.max(stopLossPrice, exitDecision.newStopLossPrice)
-              : Math.min(stopLossPrice, exitDecision.newStopLossPrice);
-          }
+          const { nextSl, hitIntrabarBe } = BacktestService.resolvePostTp1StopLoss(
+            activeSide,
+            entryPrice,
+            stopLossPrice,
+            exitDecision.newStopLossPrice,
+            c,
+            intrabarMode,
+          );
+          stopLossPrice = nextSl;
 
           const tp1PnlCalc = activeSide === "LONG" ? ((tp1Price - entryPrice) / entryPrice) * 100 : ((entryPrice - tp1Price) / entryPrice) * 100;
 
@@ -3934,21 +5055,9 @@ export class BacktestService {
             text: `🔵 TP1 (${(activeTp1RatioX * 100).toFixed(0)}%) #${activeTradeId} (${activeSide}) @ $${tp1Price.toFixed(2)} (+${tp1PnlCalc.toFixed(2)}%)`,
           });
 
-          // Intra-candle Breakeven SL check:
-          let hitIntrabarBe = false;
-          if (activeSide === "LONG") {
-            hitIntrabarBe = intrabarMode === "closeBased" ? c.close <= stopLossPrice : intrabarMode === "pessimistic" ? c.low <= stopLossPrice : false;
-          } else {
-            hitIntrabarBe = intrabarMode === "closeBased" ? c.close >= stopLossPrice : intrabarMode === "pessimistic" ? c.high >= stopLossPrice : false;
-          }
-
-          const isBeTrigger = exitDecision.newStopLossPrice && (activeSide === "LONG" ? exitDecision.newStopLossPrice > entryPrice : exitDecision.newStopLossPrice < entryPrice) && hitIntrabarBe;
-
-          if (isBeTrigger) {
+          if (hitIntrabarBe) {
             const exitP = stopLossPrice;
-            const beProceeds = activeSide === "LONG"
-              ? heldQty * exitP * (1 - costPerFill)
-              : (heldQty * entryPrice) + (heldQty * (entryPrice - exitP) * (1 - costPerFill));
+            const beProceeds = BacktestService.calcExitProceeds(activeSide, heldQty, entryPrice, exitP, costPerFill);
             cash += beProceeds;
             tradeProceeds += beProceeds;
 
@@ -4008,21 +5117,11 @@ export class BacktestService {
       }
 
       // ─── POSITION ENTRY (MODULAR TWO-WAY ENGINE) ──────────────────────
-      let isBtcDowntrend = false;
-      if (opts.downtrendSitOutMode && opts.downtrendSitOutMode !== "off" && opts.btcCandles && opts.btcCandles.length > 0) {
-        const idx4h = getClosedHtfIdx(btc4h, 14400, c.time);
-        const idx1d = getClosedHtfIdx(btc1d, 86400, c.time);
-        const pass4h = idx4h >= 75 ? btc4h[idx4h].close >= btc4hEma75[idx4h] : true;
-        const pass1d = idx1d >= 25 ? btc1d[idx1d].close >= btc1dEma25[idx1d] : true;
-
-        if (opts.downtrendSitOutMode === "dual") {
-          isBtcDowntrend = !pass4h || !pass1d;
-        } else if (opts.downtrendSitOutMode === "btc1d") {
-          isBtcDowntrend = !pass1d;
-        } else if (opts.downtrendSitOutMode === "btc4h") {
-          isBtcDowntrend = !pass4h;
-        }
-      }
+      const isBtcDowntrend = BacktestService.isBtcSitOutActive(
+        btcSitOutCtx,
+        opts.downtrendSitOutMode,
+        c.time,
+      );
 
       if (heldQty === 0 && cash >= 10) {
         if (opts.onlyEntryIdx !== undefined && i !== opts.onlyEntryIdx) {
@@ -4074,6 +5173,8 @@ export class BacktestService {
           stopLossPrice = initialSlPrice;
           rrAtEntry = entryDecision.rewardRisk;
           activeSide = entryDecision.positionSide ?? "LONG";
+          activeEngineType = entryDecision.engineType;
+          activeTp1TargetPrice = entryDecision.tp1TargetPrice;
 
           const invest = cash * 0.98;
           heldQty = (invest / entryPrice) * (1 - costPerFill);
@@ -4083,9 +5184,9 @@ export class BacktestService {
           tp1Qty = 0;
           tp1Filled = false;
           highestSinceTp1 = entryPrice;
-          highestSinceEntry = c.high;
+          highestSinceEntry = entryPrice;
           lowestSinceTp1 = entryPrice;
-          lowestSinceEntry = c.low;
+          lowestSinceEntry = entryPrice;
           lastCushionApplied = false;
 
           // Buy / Short Marker
@@ -4114,14 +5215,20 @@ export class BacktestService {
     if (heldQty > 0 && entryIdx >= 0 && candles.length > 0) {
       const lastCandle = candles[candles.length - 1]!;
       const currentPrice = lastCandle.close;
-      const unrealizedProceeds = activeSide === "LONG"
-        ? heldQty * currentPrice * (1 - costPerFill)
-        : (heldQty * entryPrice) + (heldQty * (entryPrice - currentPrice) * (1 - costPerFill));
+      const unrealizedProceeds = BacktestService.calcExitProceeds(activeSide, heldQty, entryPrice, currentPrice, costPerFill);
       const totalPnlQuote = (tradeProceeds + unrealizedProceeds) - tradeInvest;
       const tradePnlPct = tradeInvest > 0 ? (totalPnlQuote / tradeInvest) * 100 : 0;
       const barsHeld = candles.length - 1 - entryIdx;
       const costQuote = (tradeInvest * costPerFill) + (tp1Filled ? tp1Qty * tp1Price * costPerFill : 0) + (heldQty * currentPrice * costPerFill);
       const tp1PnlCalc = tp1Filled ? (activeSide === "LONG" ? ((tp1Price - entryPrice) / entryPrice) * 100 : ((entryPrice - tp1Price) / entryPrice) * 100) : undefined;
+
+      if (totalPnlQuote >= 0) {
+        grossProfit += totalPnlQuote;
+        wins++;
+      } else {
+        grossLoss += Math.abs(totalPnlQuote);
+        losses++;
+      }
 
       trades.push({
         id: activeTradeId,
@@ -4149,16 +5256,12 @@ export class BacktestService {
     // Performance Summary Calculations
     const lastPrice = candles.length > 0 ? candles[candles.length - 1]!.close : 0;
     const endPositionVal = heldQty > 0
-      ? (activeSide === "LONG"
-          ? heldQty * lastPrice * (1 - costPerFill)
-          : (heldQty * entryPrice) + (heldQty * (entryPrice - lastPrice) * (1 - costPerFill)))
+      ? BacktestService.calcExitProceeds(activeSide, heldQty, entryPrice, lastPrice, costPerFill)
       : 0;
     const finalCapital = cash + endPositionVal;
     const netPnlQuote = finalCapital - initialCapital;
     const netPnlPct = (netPnlQuote / initialCapital) * 100;
-    const closedTrades = trades.filter((t) => t.exitType !== "OPEN" && t.exitType !== "TP1+OPEN");
-    const totalClosed = closedTrades.length;
-    const winRate = totalClosed > 0 ? (wins / totalClosed) * 100 : 0;
+    const winRate = trades.length > 0 ? (wins / trades.length) * 100 : 0;
     const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? 99.9 : 0;
     const avgBarsHeld = trades.length > 0 ? Math.round(trades.reduce((a, b) => a + b.holdingBars, 0) / trades.length) : 0;
 
@@ -4379,7 +5482,7 @@ export class BacktestService {
         const fetchLimit = limit + 1200;
         btcCandles = isAlpaca
           ? await this.fetchAlpacaCandles("SPY", timeframe, fetchLimit)
-          : await this.fetchBinanceCandles("BTCUSDT", "5m", fetchLimit);
+          : await this.fetchBinanceCandles("BTCUSDT", timeframe, fetchLimit);
       } catch (err: any) {
         console.warn(`[MarketScanner] ⚠️ Could not fetch benchmark candles for Macro Defense: ${err?.message}`);
       }
@@ -4397,7 +5500,8 @@ export class BacktestService {
             const sym = cand.symbol;
             const supTf = opts.supervisorTimeframe ?? "15m";
             const isAutoSpread = opts.spreadThreshold === "auto" || !opts.spreadThreshold;
-            const warmupPrefixBars = isAutoSpread ? 1200 : 0;
+            const isDowEngineMode = opts.tradeMode === "dynamic_grid" || opts.tradeMode === "dual_hybrid" || opts.tradeMode === "swing_trade";
+            const warmupPrefixBars = isAutoSpread ? 1200 : (isDowEngineMode ? 200 : 0);
             const fetchLimit = limit + warmupPrefixBars;
             const tfMinutes = timeframe === "1m" ? 1 : timeframe === "5m" ? 5 : timeframe === "15m" ? 15 : 60;
             const htfMinutes = supTf === "1h" ? 60 : 15;
@@ -4408,7 +5512,7 @@ export class BacktestService {
               isAlpaca ? this.fetchAlpacaCandles(sym, supTf, htfLimit).catch(() => []) : this.fetchBinanceCandles(sym, supTf, htfLimit).catch(() => []),
             ]);
             if (!candles || candles.length < 50) return;
-            const actualWarmup = isAutoSpread ? Math.max(0, candles.length - limit) : 0;
+            const actualWarmup = warmupPrefixBars > 0 ? Math.max(0, candles.length - limit) : 0;
 
             const symCostModel = opts.costModel ?? (
               isAlpaca
@@ -4448,17 +5552,20 @@ export class BacktestService {
               tradeMode: opts.tradeMode ?? "dip_hunter",
               tradeDirection: opts.tradeDirection ?? "long",
               warmupBars: actualWarmup,
-              trimWarmupPrefix: isAutoSpread && actualWarmup > 0,
+              trimWarmupPrefix: actualWarmup > 0,
               enableBaseConfirmationFilter: opts.enableBaseConfirmationFilter,
               lockChannelInPosition: opts.lockChannelInPosition,
               capitalZones: opts.capitalZones ?? 2,
               gridCutLossMode: opts.gridCutLossMode ?? "none",
               channelMode: opts.channelMode ?? "DONCHIAN_ATR",
+              vpLookbackBars: opts.vpLookbackBars,
               donchianPeriod: opts.donchianPeriod ?? 48,
               minChannelWidthPct: opts.minChannelWidthPct ?? 2.0,
               maxChannelWidthPct: opts.maxChannelWidthPct ?? 25.0,
               zoneMinDropPct: opts.zoneMinDropPct ?? 2.5,
               zoneStabilizeCandles: opts.zoneStabilizeCandles ?? 3,
+              gridHtfGovernor: opts.gridHtfGovernor,
+              swingConfig: opts.swingConfig,
             });
 
             let dna: any = undefined;
@@ -4484,6 +5591,25 @@ export class BacktestService {
                   gridStage = "⏳ รอย่อตัว (Mid-Box)";
                 } else {
                   gridStage = "🚀 โซนทำกำไร (Upper TP)";
+                }
+              }
+            }
+
+            if (opts.tradeMode === "dynamic_grid") {
+              if (
+                opts.maxChannelPos !== undefined &&
+                opts.maxChannelPos > 0 &&
+                opts.maxChannelPos < 0.99 &&
+                posInChannelPct !== undefined &&
+                posInChannelPct / 100 > opts.maxChannelPos
+              ) {
+                return;
+              }
+              if (opts.gridHtfGovernor && opts.gridHtfGovernor !== "off" && candles.length > 0) {
+                const lastC = candles[candles.length - 1]!;
+                const gCtx = BacktestService.prepareGridHtfGovernor(candles);
+                if (!BacktestService.isGridHtfGovernorPass(gCtx, opts.gridHtfGovernor, lastC.time + 14400)) {
+                  return;
                 }
               }
             }
@@ -5185,6 +6311,13 @@ export class BacktestService {
 
       // 🧬 1. Point-in-Time Rolling DNA Evaluation (Zero Look-Ahead)
       const evalCandles = candles.slice(Math.max(0, idx - 999), idx + 1);
+      if (sym !== activeSymbol && gridOpts?.gridHtfGovernor && gridOpts.gridHtfGovernor !== "off") {
+        const htfSlice = candles.slice(Math.max(0, idx - 1499), idx + 1);
+        const gCtx = BacktestService.prepareGridHtfGovernor(htfSlice);
+        if (!BacktestService.isGridHtfGovernorPass(gCtx, gridOpts.gridHtfGovernor, targetTime)) {
+          continue;
+        }
+      }
       const dna = this.evaluateGridDna(evalCandles, isAlpaca ? "STOCK" : "CRYPTO");
 
       if (sym !== activeSymbol) {
@@ -5489,7 +6622,7 @@ export class BacktestService {
       legIndex++;
       console.log(`[RotationBacktest] ▶️ [Leg #${legIndex}] Starting on ${activeSymbol} at ${new Date(currentLegStartTime * 1000).toISOString()} (cash=$${currentCash.toFixed(2)}, grade=${activeCandidate?.dnaGrade || "A"}, score=${activeCandidate?.compositeScore || 65})`);
 
-      let legStopReason: "INITIAL_SELECTION" | "POST_ROUND_EXIT" | "IDLE_CASH_TIMEOUT" | "SIGNAL_DISQUALIFIED" = "POST_ROUND_EXIT";
+      let legStopReason: "INITIAL_SELECTION" | "POST_ROUND_EXIT" | "IDLE_CASH_TIMEOUT" | "SIGNAL_DISQUALIFIED" = legIndex === 1 ? "INITIAL_SELECTION" : "POST_ROUND_EXIT";
       let nextCandidate: any = undefined;
       let nextSymbol: string | undefined = undefined;
       let nextSymbolScore = 0;
@@ -5557,15 +6690,24 @@ export class BacktestService {
             (c) => c.symbol !== activeSymbol && (c.dnaGrade === "S" || c.dnaGrade === "A") && c.compositeScore >= 50 && c.posRatio <= 0.55 && !isBanned(c.symbol)
           );
 
-          // 1. If current coin has degraded (AVOID, bear downtrend, score < 38, or degraded to Grade B in crypto):
-          const isCurrentDisqualified =
+          const timeSinceRot = state.time - lastRotationTime;
+
+          // 1a. Emergency structural disqualification (always allowed immediately to protect capital)
+          const isSevereDisqualified =
             !curItem ||
             curScore < 38 ||
             curItem.dnaGrade === "AVOID" ||
-            curItem.trendRegime === "BEAR_DOWNTREND" ||
-            (quote !== "USD" && curItem.dnaGrade === "B");
+            curItem.trendRegime === "BEAR_DOWNTREND";
 
-          if (isCurrentDisqualified) {
+          // 1b. Enforce rotation cooldown unconditionally BEFORE idle timeout or non-emergency Grade B switches
+          if (!isSevereDisqualified && timeSinceRot < cooldownSec) {
+            return false;
+          }
+
+          // 1c. Non-emergency Grade B crypto degradation only triggers after cooldown AND weak score (< 60)
+          const isSoftDisqualified = quote !== "USD" && curItem !== undefined && curItem.dnaGrade === "B" && curScore < 60;
+
+          if (isSevereDisqualified || isSoftDisqualified) {
             const bestPullback = pullbackCandidates[0];
             if (bestPullback && bestPullback.compositeScore >= 50) {
               console.log(
@@ -5593,8 +6735,6 @@ export class BacktestService {
             }
           }
 
-          const timeSinceRot = state.time - lastRotationTime;
-
           // 2. Idle Cash Patience Policy:
           // If holding cash waiting for entry dip on a strong Grade S/A coin still in lower/mid box (posRatio <= 0.52),
           // DO NOT abort unless we have waited at least 8 hours or price drifted away (posRatio > 0.58).
@@ -5604,8 +6744,6 @@ export class BacktestService {
             if (isPrimePullbackZone && timeSinceRot < minIdleWaitSec) {
               return false; // Patiently maintain resting limit buy orders in the channel!
             }
-          } else if (timeSinceRot < cooldownSec) {
-            return false;
           }
 
           // 3. Winning Horse Loyalty Policy:
@@ -5716,7 +6854,7 @@ export class BacktestService {
         startTime: currentLegStartTime,
         endTime: legEndTime,
         durationHours: Number(((legEndTime - currentLegStartTime) / 3600).toFixed(1)),
-        triggerReason: legIndex === 1 ? "INITIAL_SELECTION" : legStopReason,
+        triggerReason: legStopReason,
         entryScore: activeCandidate?.compositeScore || 65,
         dnaGrade: activeCandidate?.dnaGrade,
         dnaScore: activeCandidate?.dnaScore,
@@ -5950,7 +7088,7 @@ export class BacktestService {
         winningTrades,
         losingTrades,
         tradeWinRate: Number(tradeWinRate.toFixed(1)),
-        maxPortfolioDrawdownPct: Number(maxPortfolioDrawdownPct.toFixed(1)),
+        maxPortfolioDrawdownPct: Number(maxPortfolioDrawdownPct.toFixed(2)),
         profitFactor,
         totalFeesPaid: Number(totalFeesPaid.toFixed(2)),
         bestPairSymbol: pairContributions.length > 0 ? pairContributions[0].symbol : benchmarkSymbol,
@@ -5978,9 +7116,445 @@ export class BacktestService {
    * Run full-fidelity Autonomous Multi-Pair MA-Fan Reversal Portfolio Simulation
    * Evaluates Bottom Fan -> 8/16 Cross -> MA4 Pullback entries across a portfolio with strictly 0 look-ahead.
    */
+  public static resolvePortfolioEngine(
+    requested?: PortfolioEngineMode,
+    _isStockUniverse?: boolean,
+  ): "dip_hunter" | "ma_fan" {
+    if (requested === "dip_hunter") return "dip_hunter";
+    // Both Crypto and US Stocks converge to MA-Fan ("ma_fan", keeping "legacy_pullback" as backward-compatible alias)
+    return "ma_fan";
+  }
+
+  private static runDipHunterPortfolioSimulation(opts: {
+    universe: { symbol: string; candles: Candle[] }[];
+    btcCandles: Candle[];
+    maxSlots: number;
+    initialCapital: number;
+    tp1TargetMode?: "EMA25" | "EMA75" | "EMA200";
+    maxDisasterSlPct?: number;
+    downtrendSitOutMode: "off" | "btc1d" | "btc4h" | "dual";
+    rankBy: "RSI15" | "COMPOSITE_QUALITY";
+    costModel: { feePctPerSide: number; slippagePctPerFill: number };
+    isStockUniverse?: boolean;
+  }) {
+    const cm = opts.costModel;
+    const costPerFill = ((cm.feePctPerSide ?? 0) + (cm.slippagePctPerFill ?? 0)) / 100;
+    const maxSlots = Math.max(1, opts.maxSlots);
+    const initialCapital = Math.max(10, opts.initialCapital);
+    let cash = initialCapital;
+
+    const precalc = opts.universe
+      .map((u) => {
+        if (!u.candles || u.candles.length < 500) return null;
+        const c15 = BacktestService.aggregateCandles(u.candles, 15);
+        if (c15.length < 220) return null;
+        const timeMap15 = new Map<number, number>();
+        c15.forEach((c, idx) => timeMap15.set(c.time, idx));
+        const c1h = BacktestService.aggregateCandles(u.candles, 60);
+        return {
+          symbol: u.symbol,
+          c15,
+          timeMap15,
+          c1h,
+          ribbonStates: RibbonEngine.computeAllRibbonStates(c15),
+          exhaustionStates: ExhaustionEngine.computeAllExhaustion(c15),
+          atrs: calcATR(c15, 14),
+        };
+      })
+      .filter((x): x is NonNullable<typeof x> => x !== null);
+
+    if (precalc.length === 0) {
+      throw new Error("No eligible coins with sufficient history for Dip Hunter Portfolio simulation");
+    }
+
+    const btc15 = BacktestService.aggregateCandles(opts.btcCandles, 15);
+    const startT = Math.max(...precalc.map((c) => c.c15[220]?.time ?? 0), btc15[220]?.time ?? 0);
+    const endT = Math.min(...precalc.map((c) => c.c15[c.c15.length - 1]?.time ?? Infinity), btc15[btc15.length - 1]?.time ?? Infinity);
+    const btcStart = btc15.find((c) => c.time >= startT)?.close ?? 1;
+    const btcEnd = btc15.filter((c) => c.time <= endT).at(-1)?.close ?? btcStart;
+    const btcBuyHoldPct = btcStart > 0 ? ((btcEnd - btcStart) / btcStart) * 100 : 0;
+    const btcSitOutCtx = BacktestService.prepareBtcSitOutContext(opts.btcCandles);
+
+    interface ActiveDipPos {
+      symbol: string;
+      entryTime: number;
+      entryIdx: number;
+      entryPrice: number;
+      stopLossPrice: number;
+      engineType?: EntryDecision["engineType"];
+      tp1TargetPrice?: number;
+      allocatedCapital: number;
+      qty: number;
+      tp1Done: boolean;
+      realizedProceeds: number;
+      entryFeeQuote: number;
+      realizedExitFees: number;
+      highestSinceTp1: number;
+      highestSinceEntry: number;
+      lowestSinceTp1: number;
+      lowestSinceEntry: number;
+      troughPrice: number;
+      lastKnownPrice: number;
+      activeBarsHeld: number;
+    }
+
+    let activePositions: ActiveDipPos[] = [];
+    const completedTrades: Array<{
+      symbol: string;
+      entryTime: number;
+      exitTime: number;
+      entryPrice: number;
+      exitPrice: number;
+      stopLossPrice: number;
+      allocatedCapital: number;
+      netPnlQuote: number;
+      pnlPct: number;
+      costQuote: number;
+      holdingBars: number;
+      maePct: number;
+      holdHours: number;
+      isWin: boolean;
+      exitReason: string;
+    }> = [];
+
+    let peakEquity = initialCapital;
+    let maxDdPct = 0;
+    const equityCurve: Array<{ time: number; equity: number; symbol: string; drawdownPct: number }> = [
+      { time: startT, equity: Number(initialCapital.toFixed(2)), symbol: "PORTFOLIO", drawdownPct: 0 },
+    ];
+
+    let loopStep = 0;
+    for (let t = startT; t <= endT; t += 900) {
+      loopStep++;
+      const surviving: ActiveDipPos[] = [];
+
+      for (const pos of activePositions) {
+        const coin = precalc.find((c) => c.symbol === pos.symbol)!;
+        const idx = coin.timeMap15.get(t);
+        if (idx === undefined) {
+          surviving.push(pos);
+          continue;
+        }
+        const c = coin.c15[idx];
+        pos.activeBarsHeld++;
+        pos.lastKnownPrice = c.close;
+        pos.troughPrice = Math.min(pos.troughPrice, c.low);
+        pos.highestSinceEntry = Math.max(pos.highestSinceEntry, c.high);
+        pos.highestSinceTp1 = Math.max(pos.highestSinceTp1, c.high);
+        pos.lowestSinceEntry = Math.min(pos.lowestSinceEntry, c.low);
+        pos.lowestSinceTp1 = Math.min(pos.lowestSinceTp1, c.low);
+
+        const rib = coin.ribbonStates[idx]!;
+        const prevRib = idx > 0 ? coin.ribbonStates[idx - 1] : undefined;
+        const exh = coin.exhaustionStates[idx]!;
+        const prevExh = idx > 0 ? coin.exhaustionStates[idx - 1] : undefined;
+        const curAtr = coin.atrs[idx] ?? (c.close * 0.003);
+        const htf = RegimeSupervisor.evaluateHtfRegime(coin.c1h, "1h", c.time, 0.50);
+
+        const lifted = MaFanCoreRules.evaluateRatchetSl({
+          candles: coin.c15,
+          currentIndex: idx,
+          barsHeld: idx - pos.entryIdx,
+          currentSlPrice: pos.stopLossPrice,
+          currentPrice: c.close,
+          curAtr,
+          slBufferPct: 0.25,
+          useRatchetSl: true,
+          positionSide: "LONG",
+        });
+        if (lifted !== null && lifted > pos.stopLossPrice) {
+          pos.stopLossPrice = lifted;
+        }
+
+        const exitDec = MaFanCoreRules.evaluateExits({
+          highPrice: c.high,
+          lowPrice: c.low,
+          closePrice: c.close,
+          entryPrice: pos.entryPrice,
+          stopLossPrice: pos.stopLossPrice,
+          tp1Filled: pos.tp1Done,
+          highestPriceSinceTp1: pos.highestSinceTp1,
+          highestPriceSinceEntry: pos.highestSinceEntry,
+          lowestPriceSinceTp1: pos.lowestSinceTp1,
+          lowestPriceSinceEntry: pos.lowestSinceEntry,
+          positionSide: "LONG",
+          engineType: pos.engineType,
+          tp1TargetPrice: pos.tp1TargetPrice,
+          ribbon: rib,
+          prevRibbon: prevRib,
+          exhaustion: exh,
+          prevExhaustion: prevExh,
+          trailingPullbackPct: 0.45,
+          breakevenFeeBufferPct: 0.05,
+          isOverbought: exh.isOverboughtExhaustion,
+          isOversold: exh.isOversoldExhaustion,
+          barsHeld: idx - pos.entryIdx,
+          isHtfBull: !!htf.isBullish,
+          cushionMode: "htfBull",
+          enableFastCut: true,
+          fastCutThresholdPct: -0.80,
+          stagnationBars: 6,
+          tp1TargetMode: opts.tp1TargetMode,
+          maxDisasterSlPct: opts.maxDisasterSlPct,
+        });
+
+        if (exitDec.action === "NONE" && exitDec.newStopLossPrice && exitDec.newStopLossPrice > pos.stopLossPrice) {
+          pos.stopLossPrice = exitDec.newStopLossPrice;
+        }
+
+        let closed = false;
+        let finalExitP = c.close;
+        let reason = exitDec.reason;
+
+        if (exitDec.action === "TP2") {
+          closed = true;
+          finalExitP = exitDec.exitPrice;
+          reason = pos.tp1Done ? "TP1+TP2" : "TP2";
+        } else if (exitDec.action === "SL") {
+          closed = true;
+          finalExitP = exitDec.exitPrice;
+          if (pos.tp1Done && exitDec.exitPrice >= pos.entryPrice * 0.9995) {
+            reason = "TP1+SL_BE";
+          } else if (exitDec.reason.includes("Fast Cut") || exitDec.reason.includes("Stagnation")) {
+            reason = "TECH_FAST_CUT";
+          } else {
+            reason = "SL";
+          }
+        } else if (exitDec.action === "TP1") {
+          const tp1Ratio = Math.max(0.1, Math.min(0.9, htf.recommendedTp1Ratio ?? 0.50));
+          const q1 = pos.qty * tp1Ratio;
+          const gross1 = q1 * exitDec.exitPrice;
+          const fee1 = gross1 * costPerFill;
+          const net1 = gross1 - fee1;
+          cash += net1;
+          pos.realizedProceeds += net1;
+          pos.realizedExitFees += fee1;
+          pos.qty -= q1;
+          pos.tp1Done = true;
+          pos.highestSinceTp1 = c.high;
+          pos.lowestSinceTp1 = c.low;
+          const { nextSl, hitIntrabarBe } = BacktestService.resolvePostTp1StopLoss(
+            "LONG",
+            pos.entryPrice,
+            pos.stopLossPrice,
+            exitDec.newStopLossPrice,
+            c,
+            "closeBased",
+          );
+          pos.stopLossPrice = nextSl;
+          if (hitIntrabarBe) {
+            closed = true;
+            finalExitP = pos.stopLossPrice;
+            reason = "TP1+SL_BE";
+          }
+        }
+
+        if (closed) {
+          const finalGross = pos.qty * finalExitP;
+          const finalFee = finalGross * costPerFill;
+          const finalNet = finalGross - finalFee;
+          cash += finalNet;
+          const totalProceeds = pos.realizedProceeds + finalNet;
+          const netPnlQuote = totalProceeds - pos.allocatedCapital;
+          const netPnlPct = (netPnlQuote / pos.allocatedCapital) * 100;
+          const maePct = ((pos.troughPrice - pos.entryPrice) / pos.entryPrice) * 100;
+          const holdHours = opts.isStockUniverse ? pos.activeBarsHeld * 0.25 : (t - pos.entryTime) / 3600;
+          const costQuote = pos.entryFeeQuote + pos.realizedExitFees + finalFee;
+          completedTrades.push({
+            symbol: pos.symbol,
+            entryTime: pos.entryTime,
+            exitTime: t,
+            entryPrice: pos.entryPrice,
+            exitPrice: finalExitP,
+            stopLossPrice: pos.stopLossPrice,
+            allocatedCapital: pos.allocatedCapital,
+            netPnlQuote,
+            pnlPct: netPnlPct,
+            costQuote,
+            holdingBars: pos.activeBarsHeld,
+            maePct,
+            holdHours,
+            isWin: netPnlQuote > 0,
+            exitReason: reason,
+          });
+        } else {
+          surviving.push(pos);
+        }
+      }
+      activePositions = surviving;
+
+      const freeSlots = maxSlots - activePositions.length;
+      const isSitOut = BacktestService.isBtcSitOutActive(btcSitOutCtx, opts.downtrendSitOutMode, t);
+      if (freeSlots > 0 && !isSitOut) {
+        const cands: Array<{
+          symbol: string;
+          idx: number;
+          c: Candle;
+          decision: EntryDecision;
+          score: number;
+        }> = [];
+
+        for (const coin of precalc) {
+          if (activePositions.some((p) => p.symbol === coin.symbol)) continue;
+          const idx = coin.timeMap15.get(t);
+          if (idx === undefined || idx < 200) continue;
+          const c = coin.c15[idx];
+          const rib = coin.ribbonStates[idx]!;
+          const exh = coin.exhaustionStates[idx]!;
+          const curAtr = coin.atrs[idx] ?? (c.close * 0.003);
+          const htf = RegimeSupervisor.evaluateHtfRegime(coin.c1h, "1h", c.time, 0.50);
+          const atrPct = c.close > 0 ? (curAtr / c.close) * 100 : 0.2;
+          const reqSpread = Math.min(1.5, Math.max(0.25, atrPct * 1.25) * htf.spreadMultiplier);
+
+          const dec = MaFanCoreRules.evaluateModularEntry({
+            candles: coin.c15,
+            currentIndex: idx,
+            closePrice: c.close,
+            ribbon: rib,
+            exhaustion: exh,
+            requiredSpreadPct: reqSpread,
+            curAtr,
+            slBufferPct: 0.25,
+            minRewardRiskRatio: 0,
+            waterfallGuardMode: "combined",
+            isHtfBull: !!htf.isBullish,
+            macroGateMode: "off",
+            htfRegime: htf,
+            enableUpsideFloor: true,
+            circuitBreakerActive: false,
+            tradeMode: "dip_hunter",
+            tradeDirection: "long",
+          });
+
+          if (dec.shouldEnter) {
+            const score = opts.rankBy === "RSI15"
+              ? (100 - exh.rsi)
+              : ((dec.rewardRisk ?? 1) * 20 + (htf.isBullish ? 15 : 0) + 10);
+            cands.push({ symbol: coin.symbol, idx, c, decision: dec, score });
+          }
+        }
+
+        if (cands.length > 0) {
+          cands.sort((a, b) => b.score - a.score);
+          for (const p of cands.slice(0, freeSlots)) {
+            const currentFree = maxSlots - activePositions.length;
+            const alloc = cash / currentFree;
+            if (alloc < 1.0) continue;
+            cash -= alloc;
+            const entryFeeQuote = alloc * costPerFill;
+            const qty = (alloc * (1 - costPerFill)) / p.decision.entryPrice;
+            activePositions.push({
+              symbol: p.symbol,
+              entryTime: t,
+              entryIdx: p.idx,
+              entryPrice: p.decision.entryPrice,
+              stopLossPrice: p.decision.stopLossPrice,
+              engineType: p.decision.engineType,
+              tp1TargetPrice: p.decision.tp1TargetPrice,
+              allocatedCapital: alloc,
+              qty,
+              tp1Done: false,
+              realizedProceeds: 0,
+              entryFeeQuote,
+              realizedExitFees: 0,
+              highestSinceTp1: p.decision.entryPrice,
+              highestSinceEntry: p.decision.entryPrice,
+              lowestSinceTp1: p.decision.entryPrice,
+              lowestSinceEntry: p.decision.entryPrice,
+              troughPrice: Math.min(p.decision.entryPrice, p.c.low),
+              lastKnownPrice: p.c.close,
+              activeBarsHeld: 0,
+            });
+          }
+        }
+      }
+
+      let openVal = 0;
+      for (const pos of activePositions) {
+        openVal += pos.qty * pos.lastKnownPrice * (1 - costPerFill);
+      }
+      const eq = cash + openVal;
+      if (eq > peakEquity) peakEquity = eq;
+      const dd = peakEquity > 0 ? ((peakEquity - eq) / peakEquity) * 100 : 0;
+      if (dd > maxDdPct) maxDdPct = dd;
+      if (loopStep % 4 === 0 || t + 900 > endT) {
+        equityCurve.push({
+          time: t,
+          equity: Number(eq.toFixed(2)),
+          symbol: activePositions[0]?.symbol ?? "PORTFOLIO",
+          drawdownPct: Number(dd.toFixed(2)),
+        });
+      }
+    }
+
+    for (const pos of activePositions) {
+      const finalGross = pos.qty * pos.lastKnownPrice;
+      const finalFee = finalGross * costPerFill;
+      const finalNet = finalGross - finalFee;
+      cash += finalNet;
+      const totalProceeds = pos.realizedProceeds + finalNet;
+      const netPnlQuote = totalProceeds - pos.allocatedCapital;
+      const netPnlPct = (netPnlQuote / pos.allocatedCapital) * 100;
+      const maePct = ((pos.troughPrice - pos.entryPrice) / pos.entryPrice) * 100;
+      const costQuote = pos.entryFeeQuote + pos.realizedExitFees + finalFee;
+      completedTrades.push({
+        symbol: pos.symbol,
+        entryTime: pos.entryTime,
+        exitTime: endT,
+        entryPrice: pos.entryPrice,
+        exitPrice: pos.lastKnownPrice,
+        stopLossPrice: pos.stopLossPrice,
+        allocatedCapital: pos.allocatedCapital,
+        netPnlQuote,
+        pnlPct: netPnlPct,
+        costQuote,
+        holdingBars: pos.activeBarsHeld,
+        maePct,
+        holdHours: opts.isStockUniverse ? pos.activeBarsHeld * 0.25 : (endT - pos.entryTime) / 3600,
+        isWin: netPnlQuote > 0,
+        exitReason: "END_OF_PERIOD_MTM",
+      });
+    }
+
+    const netPnlQuote = cash - initialCapital;
+    const netPnlPct = (netPnlQuote / initialCapital) * 100;
+    const wins = completedTrades.filter((x) => x.isWin);
+    const losses = completedTrades.filter((x) => !x.isWin);
+    const sumW = wins.reduce((s, x) => s + x.pnlPct, 0);
+    const sumL = Math.abs(losses.reduce((s, x) => s + x.pnlPct, 0));
+    const profitFactor = sumL > 0 ? Number((sumW / sumL).toFixed(2)) : (sumW > 0 ? 99 : 0);
+    const winRate = completedTrades.length > 0 ? Number(((wins.length / completedTrades.length) * 100).toFixed(1)) : 0;
+    const avgHoldHours = completedTrades.length > 0 ? Number((completedTrades.reduce((s, x) => s + x.holdHours, 0) / completedTrades.length).toFixed(1)) : 0;
+    const avgMaePct = completedTrades.length > 0 ? Number((completedTrades.reduce((s, x) => s + x.maePct, 0) / completedTrades.length).toFixed(2)) : 0;
+    const totalFeesPaid = Number(completedTrades.reduce((s, x) => s + x.costQuote, 0).toFixed(2));
+    const calmarRatio = maxDdPct > 0 ? Number((netPnlPct / maxDdPct).toFixed(2)) : 0;
+
+    return {
+      initialCapital,
+      finalEquity: Number(cash.toFixed(2)),
+      netPnlQuote: Number(netPnlQuote.toFixed(2)),
+      netPnlPct: Number(netPnlPct.toFixed(2)),
+      maxDrawdownPct: Number(maxDdPct.toFixed(2)),
+      calmarRatio,
+      profitFactor,
+      totalTrades: completedTrades.length,
+      winningTrades: wins.length,
+      losingTrades: losses.length,
+      winRate,
+      avgHoldHours,
+      avgMaePct,
+      totalFeesPaid,
+      btcBuyHoldPct: Number(btcBuyHoldPct.toFixed(2)),
+      alphaVsBtcPct: Number((netPnlPct - btcBuyHoldPct).toFixed(2)),
+      equityCurve,
+      trades: completedTrades,
+    };
+  }
+
   public static runMaFanPortfolioSimulation(opts: {
     universe: { symbol: string; candles: Candle[] }[];
     btcCandles: Candle[];
+    portfolioEngine?: PortfolioEngineMode;
     maxSlots?: number;
     initialCapital?: number;
     limitPenetrationPct?: number;
@@ -5997,6 +7571,8 @@ export class BacktestService {
     maxDisasterSlPct?: number;
     maxHoldHours?: number;
     downtrendSitOutMode?: "off" | "btc1d" | "btc4h" | "dual";
+    costModel?: { feePctPerSide: number; slippagePctPerFill: number };
+    isStockUniverse?: boolean;
   }): {
     initialCapital: number;
     finalEquity: number;
@@ -6011,22 +7587,45 @@ export class BacktestService {
     winRate: number;
     avgHoldHours: number;
     avgMaePct: number;
+    totalFeesPaid: number;
     btcBuyHoldPct: number;
     alphaVsBtcPct: number;
+    equityCurve: Array<{ time: number; equity: number; symbol: string; drawdownPct: number }>;
     trades: {
       symbol: string;
       entryTime: number;
       exitTime: number;
       entryPrice: number;
       exitPrice: number;
+      stopLossPrice: number;
+      allocatedCapital: number;
+      netPnlQuote: number;
       pnlPct: number;
+      costQuote: number;
+      holdingBars: number;
       maePct: number;
       holdHours: number;
       isWin: boolean;
       exitReason: string;
     }[];
   } {
-    const costPerFill = (0.075 + 0.01) / 100;
+    const cm = opts.costModel ?? { feePctPerSide: 0.075, slippagePctPerFill: 0.01 };
+    const resolvedEngine = BacktestService.resolvePortfolioEngine(opts.portfolioEngine, opts.isStockUniverse);
+    if (resolvedEngine === "dip_hunter") {
+      return BacktestService.runDipHunterPortfolioSimulation({
+        universe: opts.universe,
+        btcCandles: opts.btcCandles,
+        maxSlots: opts.maxSlots ?? 3,
+        initialCapital: opts.initialCapital ?? 100,
+        tp1TargetMode: opts.tp1TargetMode,
+        maxDisasterSlPct: opts.maxDisasterSlPct,
+        downtrendSitOutMode: opts.downtrendSitOutMode ?? "dual",
+        rankBy: opts.rankBy ?? "COMPOSITE_QUALITY",
+        costModel: cm,
+        isStockUniverse: opts.isStockUniverse,
+      });
+    }
+    const costPerFill = ((cm.feePctPerSide ?? 0) + (cm.slippagePctPerFill ?? 0)) / 100;
     const penetration = (opts.limitPenetrationPct ?? 0.10) / 100;
     const maxSlots = Math.max(1, opts.maxSlots ?? 3);
     const initialCapital = Math.max(10, opts.initialCapital ?? 100);
@@ -6084,8 +7683,6 @@ export class BacktestService {
     }
 
     const btc15 = BacktestService.aggregateCandles(opts.btcCandles, 15);
-    const btcTimeMap = new Map<number, number>();
-    btc15.forEach((c, idx) => btcTimeMap.set(c.time, idx));
 
     const startT = Math.max(...precalc.map((c) => c.c15[220]?.time ?? 0), btc15[220]?.time ?? 0);
     const endT = Math.min(...precalc.map((c) => c.c15[c.c15.length - 1]?.time ?? Infinity), btc15[btc15.length - 1]?.time ?? Infinity);
@@ -6094,72 +7691,37 @@ export class BacktestService {
     const btcEnd = btc15.filter((c) => c.time <= endT).at(-1)?.close ?? btcStart;
     const btcBuyHoldPct = btcStart > 0 ? ((btcEnd - btcStart) / btcStart) * 100 : 0;
 
-    const btc4h = (opts.btcCandles && opts.btcCandles.length > 0) ? BacktestService.aggregateCandles(opts.btcCandles, 240) : [];
-    const btc4hCloses = btc4h.map((c) => c.close);
-    const btc4hEma75 = calcEMA(btc4hCloses, 75);
+    const btcSitOutCtx = BacktestService.prepareBtcSitOutContext(opts.btcCandles);
 
-    const btc1d = (opts.btcCandles && opts.btcCandles.length > 0) ? BacktestService.aggregateCandles(opts.btcCandles, 1440) : [];
-    const btc1dCloses = btc1d.map((c) => c.close);
-    const btc1dEma25 = calcEMA(btc1dCloses, 25);
-
-    function getClosedHtfIdx(arr: Candle[], durationSec: number, targetSec: number) {
-      let lo = 0, hi = arr.length - 1, ans = -1;
-      while (lo <= hi) {
-        const mid = (lo + hi) >> 1;
-        if (arr[mid].time + durationSec <= targetSec) {
-          ans = mid;
-          lo = mid + 1;
-        } else {
-          hi = mid - 1;
-        }
-      }
-      return ans;
-    }
-
-    // Precompute Breadth & BTC Macro at each 15m step (strictly known at idx - 1)
+    // Precompute Breadth & BTC/SPY Macro at each 15m step (strictly closed bar <= t - 900)
     const macroMap = new Map<number, { b25: number; btcNotDumping: boolean; btcRet24h: number; isBtcDowntrend: boolean }>();
     for (let t = startT; t <= endT; t += 900) {
       let a25 = 0, tot = 0;
       for (const c of precalc) {
-        if (c.symbol === "BTCUSDT") continue;
+        if (c.symbol === "BTCUSDT" || c.symbol === "SPY") continue;
         const idx = c.timeMap15.get(t);
         if (idx !== undefined && idx > 200) {
           tot++;
           if (c.c15[idx - 1].close > c.m25[idx - 1]) a25++;
         }
       }
-      const bIdx = btcTimeMap.get(t) ?? 200;
-      const prev = bIdx - 1;
-      let sma96 = btc15[prev]?.close ?? 1;
+      const prev = BacktestService.getClosedHtfIndexAt(btc15, 900, t);
+      let sma96 = prev >= 0 ? (btc15[prev]?.close ?? 1) : 1;
       if (prev >= 96) {
         let s = 0;
         for (let k = prev - 95; k <= prev; k++) s += btc15[k]?.close ?? 0;
         sma96 = s / 96;
       }
-      const btcClose = btc15[prev]?.close ?? 1;
+      const btcClose = prev >= 0 ? (btc15[prev]?.close ?? 1) : 1;
       const btcRet4h = prev >= 16 ? ((btcClose - btc15[prev - 16].open) / btc15[prev - 16].open) * 100 : 0;
       const btcRet24h = prev >= 96 ? ((btcClose - btc15[prev - 96].open) / btc15[prev - 96].open) * 100 : 0;
 
-      let isBtcDowntrend = false;
       const sitMode = opts.downtrendSitOutMode ?? "dual";
-      if (sitMode !== "off" && opts.btcCandles && opts.btcCandles.length > 0) {
-        const idx4h = getClosedHtfIdx(btc4h, 14400, t);
-        const idx1d = getClosedHtfIdx(btc1d, 86400, t);
-        const pass4h = idx4h >= 75 ? btc4h[idx4h].close >= btc4hEma75[idx4h] : true;
-        const pass1d = idx1d >= 25 ? btc1d[idx1d].close >= btc1dEma25[idx1d] : true;
-
-        if (sitMode === "dual") {
-          isBtcDowntrend = !pass4h || !pass1d;
-        } else if (sitMode === "btc1d") {
-          isBtcDowntrend = !pass1d;
-        } else if (sitMode === "btc4h") {
-          isBtcDowntrend = !pass4h;
-        }
-      }
+      const isBtcDowntrend = BacktestService.isBtcSitOutActive(btcSitOutCtx, sitMode, t);
 
       macroMap.set(t, {
         b25: tot > 0 ? (a25 / tot) * 100 : 50,
-        btcNotDumping: btcClose >= sma96 * 0.99 && btcRet4h >= -1.2,
+        btcNotDumping: prev < 96 ? true : (btcClose >= sma96 * 0.99 && btcRet4h >= -1.2),
         btcRet24h,
         isBtcDowntrend,
       });
@@ -6170,6 +7732,7 @@ export class BacktestService {
       entryTime: number;
       entryPrice: number;
       allocatedCapital: number;
+      stopLossPrice: number;
       qty: number;
       troughPrice: number;
       peakPrice: number;
@@ -6177,6 +7740,9 @@ export class BacktestService {
       beLocked: boolean;
       tp1Done: boolean;
       realizedProceeds: number;
+      entryFeeQuote: number;
+      realizedExitFees: number;
+      activeBarsHeld: number;
     }
 
     let activePositions: ActivePos[] = [];
@@ -6186,7 +7752,12 @@ export class BacktestService {
       exitTime: number;
       entryPrice: number;
       exitPrice: number;
+      stopLossPrice: number;
+      allocatedCapital: number;
+      netPnlQuote: number;
       pnlPct: number;
+      costQuote: number;
+      holdingBars: number;
       maePct: number;
       holdHours: number;
       isWin: boolean;
@@ -6195,13 +7766,16 @@ export class BacktestService {
 
     let peakEquity = initialCapital;
     let maxDdPct = 0;
+    const equityCurve: Array<{ time: number; equity: number; symbol: string; drawdownPct: number }> = [
+      { time: startT, equity: Number(initialCapital.toFixed(2)), symbol: "PORTFOLIO", drawdownPct: 0 },
+    ];
 
     interface CoinSetupState {
       hadBottomFan: boolean;
-      fanExpiryTime: number;
+      fanExpiryBar: number;
       waitingPullback: boolean;
-      pullbackExpiryTime: number;
-      waitFromTime: number;
+      pullbackExpiryBar: number;
+      waitFromBar: number;
       bottomLow: number;
     }
 
@@ -6210,17 +7784,18 @@ export class BacktestService {
     for (const c of precalc) {
       states.set(c.symbol, {
         hadBottomFan: false,
-        fanExpiryTime: 0,
+        fanExpiryBar: -1,
         waitingPullback: false,
-        pullbackExpiryTime: 0,
-        waitFromTime: 0,
+        pullbackExpiryBar: -1,
+        waitFromBar: -1,
         bottomLow: Infinity,
       });
-      p1Map.set(c.symbol, 0);
+      p1Map.set(c.symbol, -1);
     }
 
+    let loopStep = 0;
     for (let t = startT; t <= endT; t += 900) {
-      const closeT = t + 900;
+      loopStep++;
 
       // 1. Update Active Positions & Exits
       const surviving: ActivePos[] = [];
@@ -6232,6 +7807,7 @@ export class BacktestService {
           continue;
         }
         const c = coin.c15[idx];
+        pos.activeBarsHeld++;
         pos.lastKnownPrice = c.close;
         pos.troughPrice = Math.min(pos.troughPrice, c.low);
         pos.peakPrice = Math.max(pos.peakPrice, c.high);
@@ -6267,9 +7843,12 @@ export class BacktestService {
               pos.tp1Done = true;
               pos.beLocked = true;
               const halfQty = pos.qty * 0.5;
-              const proceedsHalf = halfQty * emaTargetPx * (1 - costPerFill);
+              const halfGross = halfQty * emaTargetPx;
+              const halfFee = halfGross * costPerFill;
+              const proceedsHalf = halfGross - halfFee;
               cash += proceedsHalf;
               pos.realizedProceeds += proceedsHalf;
+              pos.realizedExitFees += halfFee;
               pos.qty -= halfQty;
             }
           }
@@ -6289,26 +7868,36 @@ export class BacktestService {
           exitReason = "FULL_BULLISH_FAN";
         }
 
-        const holdHours = (t - pos.entryTime) / 3600;
-        if (!shouldCloseAll && opts.maxHoldHours && holdHours >= opts.maxHoldHours) {
+        const effectiveHoldHours = opts.isStockUniverse ? (pos.activeBarsHeld * 0.25) : ((t - pos.entryTime) / 3600);
+        if (!shouldCloseAll && opts.maxHoldHours && effectiveHoldHours >= opts.maxHoldHours) {
           shouldCloseAll = true;
           exitPrice = c.close;
           exitReason = "MAX_HOLD_HOURS";
         }
 
         if (shouldCloseAll) {
-          const finalProceeds = pos.qty * exitPrice * (1 - costPerFill);
+          const finalGross = pos.qty * exitPrice;
+          const finalFee = finalGross * costPerFill;
+          const finalProceeds = finalGross - finalFee;
           cash += finalProceeds;
           const totalProceeds = pos.realizedProceeds + finalProceeds;
-          const netPnlPct = ((totalProceeds - pos.allocatedCapital) / pos.allocatedCapital) * 100;
+          const netPnlQuote = totalProceeds - pos.allocatedCapital;
+          const netPnlPct = (netPnlQuote / pos.allocatedCapital) * 100;
           const maePct = ((pos.troughPrice - pos.entryPrice) / pos.entryPrice) * 100;
+          const holdHours = (t - pos.entryTime) / 3600;
+          const costQuote = pos.entryFeeQuote + pos.realizedExitFees + finalFee;
           completedTrades.push({
             symbol: pos.symbol,
             entryTime: pos.entryTime,
             exitTime: t,
             entryPrice: pos.entryPrice,
             exitPrice,
+            stopLossPrice: pos.stopLossPrice,
+            allocatedCapital: pos.allocatedCapital,
+            netPnlQuote,
             pnlPct: netPnlPct,
+            costQuote,
+            holdingBars: pos.activeBarsHeld,
             maePct,
             holdHours,
             isWin: netPnlPct > 0,
@@ -6348,16 +7937,17 @@ export class BacktestService {
         const c = coin.c15[idx];
         const isHeld = activePositions.some((p) => p.symbol === coin.symbol);
 
+        // Zero-lookahead 1h closed bar pointer: strictly <= t (completed BEFORE bar t opens)
         let p1 = p1Map.get(coin.symbol)!;
-        while (p1 + 1 < coin.c1h.length && coin.c1h[p1 + 1].time + 3600 <= closeT) p1++;
+        while (p1 + 1 < coin.c1h.length && coin.c1h[p1 + 1].time + 3600 <= t) p1++;
         p1Map.set(coin.symbol, p1);
 
-        if (!isHeld && isMacroOk && st.waitingPullback && t > st.waitFromTime && t <= st.pullbackExpiryTime) {
+        if (!isHeld && isMacroOk && st.waitingPullback && idx > st.waitFromBar && idx <= st.pullbackExpiryBar) {
           const prev = idx - 1;
           const limitP = coin.m4[prev];
           if (coin.m8[prev] >= coin.m16[prev] && c.low <= limitP * (1 - penetration)) {
             let pass = true;
-            if (opts.requireCoin1hRsi40 && coin.rsi1h[p1] < 40) pass = false;
+            if (opts.requireCoin1hRsi40 && p1 >= 14 && coin.rsi1h[p1] < 40) pass = false;
 
             let buyVolRatio12 = 1.0;
             if (pass) {
@@ -6403,7 +7993,7 @@ export class BacktestService {
           }
         }
 
-        if (st.waitingPullback && (t >= st.pullbackExpiryTime || coin.m8[idx] < coin.m16[idx])) {
+        if (st.waitingPullback && (idx >= st.pullbackExpiryBar || coin.m8[idx] < coin.m16[idx])) {
           st.waitingPullback = false;
         }
 
@@ -6416,10 +8006,10 @@ export class BacktestService {
 
         if (isBottomFan) {
           st.hadBottomFan = true;
-          st.fanExpiryTime = t + 20 * 900;
+          st.fanExpiryBar = idx + 20;
           st.bottomLow = Math.min(st.bottomLow, c.low);
         }
-        if (t > st.fanExpiryTime && !st.waitingPullback && !isHeld) {
+        if (idx > st.fanExpiryBar && !st.waitingPullback && !isHeld) {
           st.hadBottomFan = false;
           st.bottomLow = Infinity;
         }
@@ -6430,14 +8020,15 @@ export class BacktestService {
           const macdOk = coin.macdHist15[idx] > coin.macdHist15[idx - 1];
           if (rsiOk && macdOk) {
             st.waitingPullback = true;
-            st.waitFromTime = t;
-            st.pullbackExpiryTime = t + 12 * 900;
+            st.waitFromBar = idx;
+            st.pullbackExpiryBar = idx + 12;
           }
         }
       }
 
       // 3. Allocate free slots
       const freeSlots = maxSlots - activePositions.length;
+      const disasterSlEntry = opts.maxDisasterSlPct !== undefined ? opts.maxDisasterSlPct : 3.5;
       if (freeSlots > 0 && candidates.length > 0) {
         candidates.sort((a, b) => b.score - a.score);
         const chosen = candidates.slice(0, freeSlots);
@@ -6446,12 +8037,14 @@ export class BacktestService {
           const alloc = cash / currentFree;
           if (alloc < 1.0) continue;
           cash -= alloc;
+          const entryFeeQuote = alloc * costPerFill;
           const qty = (alloc * (1 - costPerFill)) / ch.entryPrice;
           activePositions.push({
             symbol: ch.symbol,
             entryTime: t,
             entryPrice: ch.entryPrice,
             allocatedCapital: alloc,
+            stopLossPrice: disasterSlEntry > 0 ? ch.entryPrice * (1 - disasterSlEntry / 100) : 0,
             qty,
             troughPrice: Math.min(ch.entryPrice, ch.barLow),
             peakPrice: Math.max(ch.entryPrice, ch.barHigh),
@@ -6459,6 +8052,9 @@ export class BacktestService {
             beLocked: false,
             tp1Done: false,
             realizedProceeds: 0,
+            entryFeeQuote,
+            realizedExitFees: 0,
+            activeBarsHeld: 0,
           });
           const st = states.get(ch.symbol)!;
           st.waitingPullback = false;
@@ -6466,31 +8062,48 @@ export class BacktestService {
         }
       }
 
-      // 4. Mark to market
+      // 4. Mark to market (with exit fee deduction)
       let openVal = 0;
       for (const pos of activePositions) {
-        openVal += pos.qty * pos.lastKnownPrice;
+        openVal += pos.qty * pos.lastKnownPrice * (1 - costPerFill);
       }
       const eq = cash + openVal;
       if (eq > peakEquity) peakEquity = eq;
-      const dd = ((peakEquity - eq) / peakEquity) * 100;
+      const dd = peakEquity > 0 ? ((peakEquity - eq) / peakEquity) * 100 : 0;
       if (dd > maxDdPct) maxDdPct = dd;
+      if (loopStep % 4 === 0 || t + 900 > endT) {
+        equityCurve.push({
+          time: t,
+          equity: Number(eq.toFixed(2)),
+          symbol: activePositions[0]?.symbol ?? "PORTFOLIO",
+          drawdownPct: Number(dd.toFixed(2)),
+        });
+      }
     }
 
     // Force MTM at end
     for (const pos of activePositions) {
-      const finalProceeds = pos.qty * pos.lastKnownPrice * (1 - costPerFill);
+      const finalGross = pos.qty * pos.lastKnownPrice;
+      const finalFee = finalGross * costPerFill;
+      const finalProceeds = finalGross - finalFee;
       cash += finalProceeds;
       const totalProceeds = pos.realizedProceeds + finalProceeds;
-      const netPnlPct = ((totalProceeds - pos.allocatedCapital) / pos.allocatedCapital) * 100;
+      const netPnlQuote = totalProceeds - pos.allocatedCapital;
+      const netPnlPct = (netPnlQuote / pos.allocatedCapital) * 100;
       const maePct = ((pos.troughPrice - pos.entryPrice) / pos.entryPrice) * 100;
+      const costQuote = pos.entryFeeQuote + pos.realizedExitFees + finalFee;
       completedTrades.push({
         symbol: pos.symbol,
         entryTime: pos.entryTime,
         exitTime: endT,
         entryPrice: pos.entryPrice,
         exitPrice: pos.lastKnownPrice,
+        stopLossPrice: pos.stopLossPrice,
+        allocatedCapital: pos.allocatedCapital,
+        netPnlQuote,
         pnlPct: netPnlPct,
+        costQuote,
+        holdingBars: pos.activeBarsHeld,
         maePct,
         holdHours: (endT - pos.entryTime) / 3600,
         isWin: netPnlPct > 0,
@@ -6508,6 +8121,7 @@ export class BacktestService {
     const winRate = completedTrades.length > 0 ? Number(((wins.length / completedTrades.length) * 100).toFixed(1)) : 0;
     const avgHoldHours = completedTrades.length > 0 ? Number((completedTrades.reduce((s, x) => s + x.holdHours, 0) / completedTrades.length).toFixed(1)) : 0;
     const avgMaePct = completedTrades.length > 0 ? Number((completedTrades.reduce((s, x) => s + x.maePct, 0) / completedTrades.length).toFixed(2)) : 0;
+    const totalFeesPaid = Number(completedTrades.reduce((s, x) => s + x.costQuote, 0).toFixed(2));
     const calmarRatio = maxDdPct > 0 ? Number((netPnlPct / maxDdPct).toFixed(2)) : 0;
 
     return {
@@ -6524,8 +8138,10 @@ export class BacktestService {
       winRate,
       avgHoldHours,
       avgMaePct,
+      totalFeesPaid,
       btcBuyHoldPct: Number(btcBuyHoldPct.toFixed(2)),
       alphaVsBtcPct: Number((netPnlPct - btcBuyHoldPct).toFixed(2)),
+      equityCurve,
       trades: completedTrades,
     };
   }
@@ -6569,9 +8185,10 @@ export class BacktestService {
     const btcSym = isAlpaca ? "SPY" : (quote === "FDUSD" ? "BTCFDUSD" : "BTCUSDT");
     let btcCandles = universeCandlesMap.get(btcSym);
     if (!btcCandles || btcCandles.length < 500) {
+      const benchLimit = Math.max(1500, simLimit + 900);
       btcCandles = isAlpaca
-        ? await this.fetchAlpacaCandles("SPY", "5m", simLimit + 600)
-        : await this.fetchBinanceCandles("BTCUSDT", "5m", simLimit + 600);
+        ? await this.fetchAlpacaCandles("SPY", "15m", benchLimit)
+        : await this.fetchBinanceCandles("BTCUSDT", "15m", benchLimit);
     }
 
     const excludeMemes = opts.excludeToxicMemes !== false;
@@ -6588,23 +8205,36 @@ export class BacktestService {
       }
     }
 
+    const resolvedEngine = BacktestService.resolvePortfolioEngine(opts.portfolioEngine, isAlpaca);
+    const engineLabel = resolvedEngine === "dip_hunter" ? "Dip Hunter" : "MA-Fan";
+
     this.rotationBtProgress = {
       phase: "simulating",
       completed: 60,
       total: 100,
       currentSymbol: "PORTFOLIO",
-      message: `กำลังจำลองพอร์ต MA-Fan Sniper (${universe.length} เหรียญ, ${maxSlots} ช่อง)...`,
+      message: `กำลังจำลองพอร์ต MA-Fan [${engineLabel}] (${universe.length} เหรียญ, ${maxSlots} ช่อง)...`,
     };
 
     const isNoTp1 = opts.tp1TargetMode === "none";
-    const tp1Target = isNoTp1 ? undefined : (opts.tp1TargetMode === "EMA75" ? "EMA75" : "EMA200");
+    const tp1Target: "EMA25" | "EMA75" | "EMA200" | undefined =
+      opts.tp1TargetMode === "none"
+        ? undefined
+        : !opts.tp1TargetMode || opts.tp1TargetMode === "auto"
+        ? (resolvedEngine === "dip_hunter" ? undefined : "EMA200")
+        : opts.tp1TargetMode;
     const disasterSl = opts.maxDisasterSlPct !== undefined && !isNaN(Number(opts.maxDisasterSlPct))
       ? Number(opts.maxDisasterSlPct)
       : 3.5;
 
+    const wrapperCostModel = (isAlpaca || quote === "FDUSD")
+      ? { feePctPerSide: 0, slippagePctPerFill: 0.01 }
+      : { feePctPerSide: 0.075, slippagePctPerFill: 0.01 };
+
     const simResult = this.runMaFanPortfolioSimulation({
       universe,
       btcCandles,
+      portfolioEngine: resolvedEngine,
       maxSlots,
       initialCapital,
       requireCoin1hRsi40: true,
@@ -6616,6 +8246,8 @@ export class BacktestService {
       partialTpAtEma200: isNoTp1 ? false : (opts.partialTpAtEma200 !== false),
       maxDisasterSlPct: disasterSl,
       downtrendSitOutMode: opts.downtrendSitOutMode ?? "dual",
+      costModel: wrapperCostModel,
+      isStockUniverse: isAlpaca,
     });
 
     this.rotationBtProgress = {
@@ -6626,11 +8258,9 @@ export class BacktestService {
       message: "กำลังประมวลผลสถิติและไทม์ไลน์พอร์ต...",
     };
 
-    // Convert trades to legs
+    // Convert trades to legs (using actual compounded trade capital, PnL, and fees)
     const legs: RotationLegRecord[] = [];
     const allTrades: Array<BacktestTrade & { symbol: string; legIndex: number }> = [];
-
-    const slotCapital = initialCapital / maxSlots;
 
     for (let i = 0; i < simResult.trades.length; i++) {
       const t = simResult.trades[i];
@@ -6638,20 +8268,20 @@ export class BacktestService {
       const coinCandles = universeCandlesMap.get(t.symbol) || [];
       const legCandles = coinCandles.filter((c) => c.time >= t.entryTime - 3600 * 4 && c.time <= t.exitTime + 3600 * 2);
 
-      const netPnlQuote = Number(((t.pnlPct / 100) * slotCapital).toFixed(2));
+      const netPnlQuote = Number(t.netPnlQuote.toFixed(2));
       const bTrade: BacktestTrade = {
         id: legIndex,
         entryTime: t.entryTime,
         entryPrice: t.entryPrice,
-        stopLossPrice: t.entryPrice * 0.88,
+        stopLossPrice: t.stopLossPrice,
         fanSpreadAtEntry: 0.5,
         exitTime: t.exitTime,
         exitPrice: t.exitPrice,
         exitType: t.exitReason,
         pnlQuote: netPnlQuote,
         pnlPct: Number(t.pnlPct.toFixed(2)),
-        holdingBars: Math.round(t.holdHours * 12),
-        costQuote: Number((slotCapital * 0.0017).toFixed(2)),
+        holdingBars: t.holdingBars,
+        costQuote: Number(t.costQuote.toFixed(2)),
       };
 
       allTrades.push({ ...bTrade, symbol: t.symbol, legIndex });
@@ -6681,8 +8311,8 @@ export class BacktestService {
         durationHours: Number(t.holdHours.toFixed(1)),
         triggerReason: i === 0 ? "INITIAL_SELECTION" : "POST_ROUND_EXIT",
         entryScore: 85,
-        startingCapital: Number(slotCapital.toFixed(2)),
-        endingCapital: Number((slotCapital + netPnlQuote).toFixed(2)),
+        startingCapital: Number(t.allocatedCapital.toFixed(2)),
+        endingCapital: Number((t.allocatedCapital + t.netPnlQuote).toFixed(2)),
         netPnlQuote,
         netPnlPct: Number(t.pnlPct.toFixed(2)),
         tradesCount: 1,
@@ -6697,7 +8327,7 @@ export class BacktestService {
       });
     }
 
-    // Per-pair contribution
+    // Per-pair contribution (using exact compounded trade PnL)
     const pairMap = new Map<string, { legsCount: number; hours: number; tradesCount: number; wins: number; pnlQuote: number; pnlPctSum: number }>();
     for (const t of simResult.trades) {
       let p = pairMap.get(t.symbol);
@@ -6710,7 +8340,7 @@ export class BacktestService {
       p.tradesCount++;
       if (t.isWin) p.wins++;
       p.pnlPctSum += t.pnlPct;
-      p.pnlQuote += (t.pnlPct / 100) * slotCapital;
+      p.pnlQuote += t.netPnlQuote;
     }
 
     const pairContributions: PairContributionItem[] = Array.from(pairMap.entries()).map(([symbol, d]) => ({
@@ -6723,30 +8353,7 @@ export class BacktestService {
       totalNetPnlPct: Number(d.pnlPctSum.toFixed(2)),
     })).sort((a, b) => b.totalNetPnlQuote - a.totalNetPnlQuote);
 
-    // Build equity curve
-    let runningEquity = initialCapital;
-    let peakEq = initialCapital;
-    const sortedTrades = [...simResult.trades].sort((a, b) => a.exitTime - b.exitTime);
-    const equityCurve: Array<{ time: number; equity: number; symbol: string; drawdownPct: number }> = [
-      {
-        time: sortedTrades[0]?.entryTime ? sortedTrades[0].entryTime - 900 : Math.floor(Date.now() / 1000) - simLimit * 300,
-        equity: initialCapital,
-        symbol: "PORTFOLIO",
-        drawdownPct: 0,
-      },
-    ];
-
-    for (const st of sortedTrades) {
-      runningEquity += (st.pnlPct / 100) * slotCapital;
-      if (runningEquity > peakEq) peakEq = runningEquity;
-      const dd = ((peakEq - runningEquity) / peakEq) * 100;
-      equityCurve.push({
-        time: st.exitTime,
-        equity: Number(runningEquity.toFixed(2)),
-        symbol: st.symbol,
-        drawdownPct: Number(dd.toFixed(2)),
-      });
-    }
+    const equityCurve = simResult.equityCurve;
 
     const result: MultiPairRotationResult = {
       id: `mafan_rot_${Date.now()}`,
@@ -6769,7 +8376,7 @@ export class BacktestService {
         tradeWinRate: simResult.winRate,
         maxPortfolioDrawdownPct: simResult.maxDrawdownPct,
         profitFactor: simResult.profitFactor,
-        totalFeesPaid: Number((simResult.totalTrades * 2 * slotCapital * 0.00075).toFixed(2)),
+        totalFeesPaid: simResult.totalFeesPaid,
         bestPairSymbol: pairContributions[0]?.symbol ?? "-",
         bestPairPnlPct: pairContributions[0]?.totalNetPnlPct ?? 0,
         benchmarkSinglePairSymbol: quote === "USD" ? "SPY" : "BTC",

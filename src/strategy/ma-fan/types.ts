@@ -112,6 +112,8 @@ export interface CalibrationResult {
 export interface MaFanPosition {
   symbol: string;
   positionSide?: "LONG" | "SHORT";
+  engineType?: "DIP_HUNTER" | "PEAK_HUNTER" | "TREND_RIDER_LONG" | "TREND_RIDER_SHORT";
+  tp1TargetPrice?: number;
   entryPrice: number;
   entryTime: number;
   totalQty: number;

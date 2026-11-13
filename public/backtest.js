@@ -98,9 +98,18 @@
     }
   }
 
-  // Update Scanner Macro Gate (BTC vs SPY)
+  // Update Scanner Macro Gate (BTC vs SPY) & Auto-Zero Fee for Alpaca US Stocks / FDUSD
   function updateScannerMacroGateUI(scope) {
     const isStock = scope === "alpaca_stocks";
+    const isZeroFeeScope = isStock || scope === "fdusd";
+    const feeSelect = document.getElementById("scFeeTier");
+    if (feeSelect) {
+      if (isZeroFeeScope) {
+        feeSelect.value = "zero";
+      } else if (feeSelect.value === "zero") {
+        feeSelect.value = "bnb";
+      }
+    }
     const label = document.getElementById("scGridMacroGateLabel");
     const select = document.getElementById("scGridMacroGate");
     if (label) {
@@ -1910,8 +1919,8 @@
     const tradeDirection = inpTradeDirection ? inpTradeDirection.value : "long";
     const enableBaseConfirmationFilter = inpBaseConfirmation ? inpBaseConfirmation.value === "on" : false;
     const lockChannelInPosition = inpLockChannel ? inpLockChannel.value === "locked" : false;
-    const capitalZones = inpCapitalZones ? Number(inpCapitalZones.value) : 4;
-    const gridCutLossMode = inpGridCutLossMode ? inpGridCutLossMode.value : "final_zone_floor";
+    const capitalZones = inpCapitalZones ? Number(inpCapitalZones.value) : 2;
+    const gridCutLossMode = inpGridCutLossMode ? inpGridCutLossMode.value : "none";
 
     const dayEstimate = limit >= 34000 ? "~120 วัน" : (limit >= 25000 ? "~90 วัน" : (limit >= 17000 ? "~60 วัน" : (limit >= 8000 ? "~30 วัน" : (limit >= 4000 ? "~15 วัน" : (limit >= 2000 ? "~7 วัน" : (limit >= 1000 ? "~3.5 วัน" : "~1.7 วัน"))))));
     loadingOverlay.style.display = "flex";
@@ -2091,9 +2100,10 @@
       // 1. Sync to Main Form
       if (target === "main" || target === "both") {
         if (cfg.symbol) setSymbolValue(cfg.symbol);
-        const isDynamicGrid = cfg.strategyType === "dynamic_grid" || cfg.strategyMode === "dynamic_grid";
+        const resolvedMode = resolveBacktestModeFromConfig(cfg);
+        const isStructuralMode = resolvedMode === "dynamic_grid" || resolvedMode === "swing_trade";
         if (inpTimeframe) {
-          inpTimeframe.value = isDynamicGrid
+          inpTimeframe.value = isStructuralMode
             ? (cfg.macroInterval || cfg.dowTimeframe || "15m")
             : (cfg.maFanExecutionTimeframe || "5m");
         }
@@ -2101,7 +2111,7 @@
           inpSpread.value = cfg.maFanAutoCalibrateSpreadOnSwitch !== false ? "auto" : String(cfg.maFanManualSpreadPct || 0.25);
         }
         if (inpBudget) {
-          const b = isDynamicGrid ? (cfg.maxInventoryQuote || 50) : (cfg.maFanMaxBudgetUsd || 200);
+          const b = resolvedMode === "dynamic_grid" ? (cfg.maxInventoryQuote || 50) : (cfg.maFanMaxBudgetUsd || 200);
           inpBudget.value = String(b);
         }
         if (inpSlMode) inpSlMode.value = cfg.maFanUseRatchetSl !== false ? "ratchet" : "fixed";
@@ -2109,7 +2119,7 @@
         if (inpUpsideFloor) inpUpsideFloor.value = cfg.maFanUpsideFloor !== false ? "on" : "off";
         if (inpMacroGate && cfg.maFanMacroGate) inpMacroGate.value = cfg.maFanMacroGate;
         if (inpTradeMode) {
-          inpTradeMode.value = isDynamicGrid ? "dynamic_grid" : (cfg.maFanTradeMode || "dip_hunter");
+          inpTradeMode.value = resolvedMode;
         }
         if (inpTradeDirection && cfg.maFanTradeDirection) inpTradeDirection.value = cfg.maFanTradeDirection;
         if (inpBaseConfirmation && cfg.enableBaseConfirmationFilter !== undefined) {
@@ -2134,7 +2144,13 @@
 
       // 2. Sync to Market Scanner
       if (target === "scanner" || target === "both") {
-        if (scTimeframe && cfg.maFanExecutionTimeframe) scTimeframe.value = cfg.maFanExecutionTimeframe;
+        const resolvedMode = resolveBacktestModeFromConfig(cfg);
+        const isStructuralMode = resolvedMode === "dynamic_grid" || resolvedMode === "swing_trade";
+        if (scTimeframe) {
+          scTimeframe.value = isStructuralMode
+            ? (cfg.macroInterval || cfg.dowTimeframe || "15m")
+            : (cfg.maFanExecutionTimeframe || scTimeframe.value || "5m");
+        }
         if (scSpread) {
           scSpread.value = cfg.maFanAutoCalibrateSpreadOnSwitch !== false ? "auto" : String(cfg.maFanManualSpreadPct || 0.25);
         }
@@ -2142,7 +2158,7 @@
         if (scCircuitBreaker) scCircuitBreaker.value = cfg.maFanCircuitBreaker !== false ? "on" : "off";
         if (scUpsideFloor) scUpsideFloor.value = cfg.maFanUpsideFloor !== false ? "on" : "off";
         if (scMacroGate && cfg.maFanMacroGate) scMacroGate.value = cfg.maFanMacroGate;
-        if (scTradeMode && (cfg.strategyType || cfg.maFanTradeMode)) scTradeMode.value = cfg.strategyType || cfg.maFanTradeMode;
+        if (scTradeMode) scTradeMode.value = resolvedMode;
         if (scTradeDirection && cfg.maFanTradeDirection) scTradeDirection.value = cfg.maFanTradeDirection;
         if (scBaseConfirmation && cfg.enableBaseConfirmationFilter !== undefined) {
           scBaseConfirmation.value = cfg.enableBaseConfirmationFilter ? "on" : "off";
@@ -2237,15 +2253,13 @@
         enableWaterfallKnifeGuard: enableBaseConfirmationFilter,
         enableTrendChannelGating: enableBaseConfirmationFilter,
         lockChannelInPosition,
-        capitalZones: inpCapitalZones ? (Number(inpCapitalZones.value) || 1) : 1,
+        capitalZones: inpCapitalZones ? (Number(inpCapitalZones.value) || 2) : 2,
         gridCutLossMode: inpGridCutLossMode ? inpGridCutLossMode.value : "none",
-        minChannelWidthPct: 6.0,
-        maxChannelWidthPct: 25.0,
         donchianPeriod: 48,
         channelMode: "DONCHIAN_ATR",
         sellProfitMode: "PORTFOLIO_AVG_PROFIT",
         requireProfitAboveAvgEntry: true,
-        ...(inpTradeMode && inpTradeMode.value ? { strategyType: inpTradeMode.value } : {}),
+        ...(inpTradeMode && inpTradeMode.value ? buildLiveStrategyPayload(inpTradeMode.value) : {}),
       };
 
       const res = await fetch("/api/config", {
@@ -2304,12 +2318,31 @@
     }
   }
 
+  function resolveBacktestModeFromConfig(cfg) {
+    if (!cfg) return "dual_hybrid";
+    const st = cfg.strategyType || cfg.strategyMode;
+    if (st === "dynamic_grid") return "dynamic_grid";
+    if (st === "swing_trade") return "swing_trade";
+    return cfg.maFanTradeMode || "dip_hunter";
+  }
+
+  function buildLiveStrategyPayload(mode) {
+    if (mode === "dynamic_grid") {
+      return { strategyType: "dynamic_grid", maFanTradeMode: "dynamic_grid" };
+    }
+    if (mode === "swing_trade") {
+      return { strategyType: "swing_trade" };
+    }
+    return { strategyType: "ma_ribbon", maFanTradeMode: mode || "dip_hunter" };
+  }
+
   // Apply optimal best-known presets for the selected engine
   function applyOptimalPreset(engine = "dual_hybrid", target = "both") {
+    const isStructural15m = engine === "dynamic_grid" || engine === "swing_trade";
     // 1. Main Backtest Form
     if (target === "main" || target === "both") {
       if (inpTradeMode) inpTradeMode.value = engine;
-      if (inpTimeframe) inpTimeframe.value = "5m";
+      if (inpTimeframe) inpTimeframe.value = isStructural15m ? "15m" : "5m";
       if (inpSpread) inpSpread.value = engine === "dynamic_grid" ? "0.25" : "0.50";
       if (inpSlMode) inpSlMode.value = "ratchet";
       if (inpMacroGate) inpMacroGate.value = "noDeepBear";
@@ -2324,13 +2357,13 @@
       if (inpCapitalZones) inpCapitalZones.value = "2";
       if (inpGridCutLossMode) inpGridCutLossMode.value = "none";
       if (inpLockChannel) inpLockChannel.value = "dynamic";
-      updateOptionVisibility(engine, ".bt-controls-bar");
+      updateOptionVisibility(engine, ".bt-controls");
     }
 
     // 2. Market Scanner Form
     if (target === "scanner" || target === "both") {
       if (scTradeMode) scTradeMode.value = engine;
-      if (scTimeframe) scTimeframe.value = "5m";
+      if (scTimeframe) scTimeframe.value = isStructural15m ? "15m" : "5m";
       if (scSpread) scSpread.value = engine === "dynamic_grid" ? "0.25" : "0.50";
       if (scSlMode) scSlMode.value = "ratchet";
       if (scMacroGate) scMacroGate.value = "noDeepBear";
@@ -2469,8 +2502,8 @@
     const isSetup = scanType === "mafan_setups";
     if (scStudioTitle) {
       scStudioTitle.textContent = isSetup
-        ? "⚡ MA-Fan Setup Scanner (สแกนหาตัวพร้อมเล่น - กางล่าง + กลับตัว)"
-        : "📊 MA-FOLD-FAN Market Scanner (จัดอันดับเหรียญทำกำไรสูงสุด)";
+        ? "⚡ MA-Ribbon Setup Scanner (สแกนหาตัวพร้อมเล่น - กางล่าง + กลับตัว)"
+        : "📊 MA-Ribbon Market Scanner (จัดอันดับเหรียญทำกำไรสูงสุด)";
     }
     if (scStudioSubtitle) {
       scStudioSubtitle.textContent = isSetup
@@ -2640,7 +2673,7 @@
         const scopeLabel = scope === "top100" ? "Top 100 USDT" : scope === "top50" ? "Top 50 USDT" : scope === "top20" ? "Top 20 USDT" : (isAlpaca ? "US Equities & ETFs" : scope.toUpperCase());
 
         if (scanType === "mafan_setups") {
-          if (scannerStatusText) scannerStatusText.textContent = `กำลังสแกนหาตัวพร้อมเล่น MA-Fan (${scopeLabel}) บน ${timeframe}...`;
+          if (scannerStatusText) scannerStatusText.textContent = `กำลังสแกนหาตัวพร้อมเล่น MA-Ribbon (${scopeLabel}) บน ${timeframe}...`;
           if (scannerCountText) scannerCountText.textContent = "กำลังวิเคราะห์แท่งเทียนหา Bottom Fan Exhaustion และสัญญาณกลับตัว...";
 
           pollInterval = setInterval(async () => {
@@ -2955,6 +2988,7 @@
           try {
             const payload = {
               symbol: sym,
+              strategyType: "ma_ribbon",
               maFanExecutionTimeframe: timeframe,
               maFanTradeMode: "dip_hunter",
               maFanTradeDirection: "long",
@@ -3148,8 +3182,7 @@
         try {
           const payload = {
             symbol: sym,
-            strategyType: "dynamic_grid",
-            maFanTradeMode: "dynamic_grid",
+            ...buildLiveStrategyPayload(tradeMode || "dynamic_grid"),
             dowTimeframe: timeframe,
             tradingTimeframe: timeframe,
             enableBaseConfirmationFilter,
@@ -3157,7 +3190,6 @@
             lockChannelInPosition,
             maxInventoryQuote: inpBudget ? Number(inpBudget.value) || 200 : 200,
             maxInventoryUsdso: inpBudget ? Number(inpBudget.value) || 200 : 200,
-            ...(tradeMode ? { strategyType: tradeMode } : {}),
           };
 
           const res = await fetch("/api/config", {
@@ -3252,8 +3284,13 @@
         if (scLockChannel && cfg.lockChannelInPosition !== undefined) {
           scLockChannel.value = cfg.lockChannelInPosition !== false ? "locked" : "dynamic";
         }
-        if (inpTradeMode && (cfg.strategyType || cfg.strategyMode)) {
-          inpTradeMode.value = cfg.strategyType || cfg.strategyMode;
+        const liveResolvedMode = resolveBacktestModeFromConfig(cfg);
+        if (inpTimeframe && (liveResolvedMode === "dynamic_grid" || liveResolvedMode === "swing_trade")) {
+          inpTimeframe.value = cfg.macroInterval || cfg.dowTimeframe || "15m";
+        }
+        if (inpTradeMode) {
+          inpTradeMode.value = liveResolvedMode;
+          updateOptionVisibility(liveResolvedMode, ".bt-controls");
         }
       })
       .catch(() => {});
@@ -3531,8 +3568,9 @@
         };
 
         if (portfolioMode === "mafan_portfolio") {
+          const portfolioEngine = document.getElementById("rotBtPortfolioEngine")?.value || "auto";
           const maxSlots = Number(document.getElementById("rotBtMaxSlots")?.value) || 3;
-          const tp1Target = document.getElementById("rotBtTp1Target")?.value || "EMA200";
+          const tp1Target = document.getElementById("rotBtTp1Target")?.value || "auto";
           const disasterSlVal = document.getElementById("rotBtDisasterSl")?.value || "3.5";
           const excludeToxicMemes = document.getElementById("rotBtExcludeMemes")?.value !== "false";
           const downtrendSitOutMode = document.getElementById("rotBtMacroGate")?.value || "dual";
@@ -3540,6 +3578,7 @@
 
           payload = {
             ...payload,
+            portfolioEngine,
             maxSlots,
             tp1TargetMode: tp1Target === "none" ? "none" : tp1Target,
             partialTpAtEma200: tp1Target !== "none",

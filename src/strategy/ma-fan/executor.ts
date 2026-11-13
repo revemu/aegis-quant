@@ -106,7 +106,9 @@ export class MaFanOrderExecutor {
     htfRegime: HtfRegime,
     fanSpreadPct: number,
     curAtr?: number,
-    engineType: "DIP_HUNTER" | "PEAK_HUNTER" | "TREND_RIDER_LONG" | "TREND_RIDER_SHORT" | "dip_hunter" | "trend_rider" = "dip_hunter"
+    engineType: "DIP_HUNTER" | "PEAK_HUNTER" | "TREND_RIDER_LONG" | "TREND_RIDER_SHORT" | "dip_hunter" | "trend_rider" = "dip_hunter",
+    tp1TargetPrice?: number,
+    stopLossOverride?: number,
   ): Promise<MaFanPosition | null> {
     const rawQty = budgetUsd / entryPrice;
     const qty = this.roundQty(rawQty);
@@ -123,11 +125,16 @@ export class MaFanOrderExecutor {
       return null;
     }
 
-    // Dynamic ATR SL Buffer: protect from extreme wicks below recent swing low
+    // Dynamic ATR SL Buffer: protect from extreme wicks below recent swing low (respecting core-rules stopLossOverride if provided)
     const slDist = Math.max(swingLowPrice * (this.slBufferPct / 100), (curAtr ?? 0) * 1.0);
-    const stopLossPrice = this.roundPrice(swingLowPrice - slDist);
+    const stopLossPrice = this.roundPrice(
+      stopLossOverride && stopLossOverride > 0 && stopLossOverride < entryPrice
+        ? stopLossOverride
+        : (swingLowPrice - slDist),
+    );
 
     const isTrendRider = engineType === "trend_rider" || engineType === "TREND_RIDER_LONG";
+    const normalizedEngineType: MaFanPosition["engineType"] = isTrendRider ? "TREND_RIDER_LONG" : "DIP_HUNTER";
     const logPrefix = isTrendRider ? "📈 [TREND_RIDER_LONG]" : "🟢 [BUY_SNIPER]";
     this.log(`${logPrefix} ${symbol} | Price: $${entryPrice.toFixed(4)} | Qty: ${qty} | SL: $${stopLossPrice.toFixed(4)} (Buffer: $${slDist.toFixed(4)}) | Spread: ${fanSpreadPct.toFixed(2)}% | DryRun: ${this.dryRun}`);
 
@@ -180,6 +187,8 @@ export class MaFanOrderExecutor {
     const position: MaFanPosition = {
       symbol,
       positionSide: "LONG",
+      engineType: normalizedEngineType,
+      tp1TargetPrice,
       entryPrice: fillPrice,
       entryTime: Date.now(),
       totalQty: finalHoldingQty,
@@ -223,7 +232,9 @@ export class MaFanOrderExecutor {
     htfRegime: HtfRegime,
     fanSpreadPct: number,
     curAtr?: number,
-    engineType: "DIP_HUNTER" | "PEAK_HUNTER" | "TREND_RIDER_LONG" | "TREND_RIDER_SHORT" | "dip_hunter" | "trend_rider" = "dip_hunter"
+    engineType: "DIP_HUNTER" | "PEAK_HUNTER" | "TREND_RIDER_LONG" | "TREND_RIDER_SHORT" | "dip_hunter" | "trend_rider" = "dip_hunter",
+    tp1TargetPrice?: number,
+    stopLossOverride?: number,
   ): Promise<MaFanPosition | null> {
     const rawQty = budgetUsd / entryPrice;
     const qty = this.roundQty(rawQty);
@@ -240,11 +251,16 @@ export class MaFanOrderExecutor {
       return null;
     }
 
-    // Dynamic ATR SL Buffer: protect from extreme wicks above recent swing high
+    // Dynamic ATR SL Buffer: protect from extreme wicks above recent swing high (respecting core-rules stopLossOverride if provided)
     const slDist = Math.max(swingHighPrice * (this.slBufferPct / 100), (curAtr ?? 0) * 1.0);
-    const stopLossPrice = this.roundPrice(swingHighPrice + slDist);
+    const stopLossPrice = this.roundPrice(
+      stopLossOverride && stopLossOverride > entryPrice
+        ? stopLossOverride
+        : (swingHighPrice + slDist),
+    );
 
     const isTrendRider = engineType === "trend_rider" || engineType === "TREND_RIDER_SHORT";
+    const normalizedEngineType: MaFanPosition["engineType"] = isTrendRider ? "TREND_RIDER_SHORT" : "PEAK_HUNTER";
     const logPrefix = isTrendRider ? "📉 [TREND_RIDER_SHORT]" : "🔴 [PEAK_HUNTER_SHORT]";
     this.log(`${logPrefix} ${symbol} | Price: $${entryPrice.toFixed(4)} | Qty: ${qty} | SL: $${stopLossPrice.toFixed(4)} (Buffer: $${slDist.toFixed(4)}) | Spread: ${fanSpreadPct.toFixed(2)}% | DryRun: ${this.dryRun}`);
 
@@ -287,6 +303,8 @@ export class MaFanOrderExecutor {
     const position: MaFanPosition = {
       symbol,
       positionSide: "SHORT",
+      engineType: normalizedEngineType,
+      tp1TargetPrice,
       entryPrice: fillPrice,
       entryTime: Date.now(),
       totalQty: finalHoldingQty,

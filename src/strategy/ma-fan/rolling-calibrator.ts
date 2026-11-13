@@ -175,10 +175,12 @@ export class RollingSpreadCalibrator {
     let tp1ProceedsPerInvest = 0;
     let remQtyAfterTp1PerInvest = initialQtyPerInvest;
     let highestSinceTp1 = entryPrice;
+    let highestSinceEntry = entryPrice;
 
     for (let k = entryIdx + 1; k < candles.length; k++) {
       const c = candles[k]!;
       if (c.high > highestSinceTp1) highestSinceTp1 = c.high;
+      if (c.high > highestSinceEntry) highestSinceEntry = c.high;
       const barsHeld = k - entryIdx;
       const curAtr = atrs[k] || c.close * 0.003;
 
@@ -198,6 +200,7 @@ export class RollingSpreadCalibrator {
 
       const htf = htfRegimes[k]!;
       const exitDecision = MaFanCoreRules.evaluateExits({
+        engineType: "DIP_HUNTER",
         highPrice: c.high,
         lowPrice: c.low,
         closePrice: c.close,
@@ -205,7 +208,11 @@ export class RollingSpreadCalibrator {
         stopLossPrice,
         tp1Filled,
         highestPriceSinceTp1: highestSinceTp1,
+        highestPriceSinceEntry: highestSinceEntry,
         ribbon: ribbons[k]!,
+        prevRibbon: k > 0 ? ribbons[k - 1] : undefined,
+        exhaustion: exhaustions[k],
+        prevExhaustion: k > 0 ? exhaustions[k - 1] : undefined,
         trailingPullbackPct: opts.trailingPullbackPct,
         breakevenFeeBufferPct: opts.breakevenFeeBufferPct,
         isOverbought: exhaustions[k]?.isOverboughtExhaustion,
