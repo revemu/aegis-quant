@@ -9710,3 +9710,19 @@ When investigating live production behavior, debugging issues, or analyzing trad
      - หน้าตั้งค่า (`Settings Modal`): เพิ่มตัวเลือก `🚀 MA-Fan Portfolio` ใน `#cfg_strategyType` และแท็บ `#tab-portfolio` (`tabBtnPortfolio`).
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.74`** ใน `package.json` และ `src/version.ts`
+
+---
+
+## 320. v0.3.0.75 — Portfolio Slot/Radar Field Parity, Exchange-Scoped Rounds/PnL & Sit-Out Option Keys (`public/app.js`, `public/index.html`, `src/db.ts`, `src/strategy/ma-fan-portfolio/index.ts`)
+
+- **แก้ไขบั๊กที่ตรวจพบจากการตรวจสอบข้อมูลสดบนเซิร์ฟเวอร์ `:3334`**:
+  1. **แถบ 3 Slots และ Sidebar Radar/Checklist (`public/app.js`)**:
+     - แก้ `updatePortfolioUI()` ให้กรองเฉพาะ `slot.status === "HOLDING"` เมื่อแสดงการ์ดที่ถืออยู่ ส่วนช่อง `EMPTY` ดึง `emptyInfo.nextCandidate` และ `emptyInfo.readyBudget` มาแสดงอย่างถูกต้อง
+     - ปรับชื่อฟิลด์ให้ตรงกับ Telemetry API ของ `MaFanPortfolioStrategy` 100%: `unrealizedPnlPct`, `phaseText`, `price` (เรดาร์), `rsi1h`, `buyVolRatio12`, `distanceToEma200Pct`, `breadthAboveEma25Pct`, และ stage `BOTTOM_FAN`
+  2. **แก้ค่า Dropdown `Macro Sit-Out Filter` (`public/index.html`)**:
+     - เปลี่ยนค่า `<option>` ของ `4H Only` และ `Daily Only` ใน `#cfg_portfolioSitOutMode` จาก `"4h_only"` / `"daily_only"` ให้ตรงกับ `evaluateBenchmarkSitOut()` เป็น `"btc4h"` และ `"btc1d"`
+  3. **แยกประวัติเทรด/รอบเทรด/Realized PnL ตาม Exchange ในโหมด `ALL` (`src/db.ts`, `src/strategy/ma-fan-portfolio/index.ts`)**:
+     - เพิ่ม `BotDatabase.matchesCurrentExchange(o)` เพื่อกรองออเดอร์เฉพาะกระดานปัจจุบันเมื่อเรียก `getTrades(..., "ALL")`, `getOrderActivity(..., "ALL")`, และ `getTradeRounds("ALL")` ป้องกันประวัติ `ERAFDUSD` เก่าจาก Binance ปนเข้ามาในหน้า Alpaca Portfolio
+     - ใน `MaFanPortfolioStrategy.emitTelemetryTick()` คำนวณ `realizedPnl` / `tradeRealizedPnl` จากรอบเทรดที่กรองตามกระดานแล้ว
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.75`** ใน `package.json` และ `src/version.ts`

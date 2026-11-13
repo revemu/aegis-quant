@@ -1356,6 +1356,16 @@ export class MaFanPortfolioStrategy implements IStrategy {
     const sumLoss = Math.abs(closedRounds.filter((r) => (r.netPnlQuote ?? r.grossPnlQuote ?? 0) <= 0).reduce((s, r) => s + (r.netPnlQuote ?? r.grossPnlQuote ?? 0), 0));
     const profitFactor = sumLoss > 0 ? sumWin / sumLoss : (sumWin > 0 ? 99 : 0);
 
+    // Prevent stale single-symbol realizedPnl (e.g. from another exchange) from polluting Portfolio KPI
+    const effectiveRealizedPnl =
+      roundsData.summary.totalRounds > 0
+        ? roundsData.summary.totalNetPnlQuote
+        : (this.slots.length > 0 ? this.realizedPnl : 0);
+    const effectiveTradeRealizedPnl =
+      roundsData.summary.totalRounds > 0
+        ? roundsData.summary.totalGrossPnlQuote
+        : (this.slots.length > 0 ? this.tradeRealizedPnl : 0);
+
     const roundsSummary = {
       winRate: roundsData.summary.winRatePct,
       wins: roundsData.summary.winRounds,
@@ -1416,10 +1426,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
       isMarketClosed: this.isMarketClosed,
       marketClock: this.marketClock,
       unrealizedPnl: totalUnrealizedPnl,
-      realizedPnl: this.realizedPnl,
-      tradeRealizedPnl: this.tradeRealizedPnl,
-      netPnlQuote: this.realizedPnl,
-      netPnlUsdso: this.realizedPnl,
+      realizedPnl: effectiveRealizedPnl,
+      tradeRealizedPnl: effectiveTradeRealizedPnl,
+      netPnlQuote: effectiveRealizedPnl,
+      netPnlUsdso: effectiveRealizedPnl,
       avgEntry: inspectedSlot?.entryPrice || 0,
       baseHeld: this.slots.reduce((s, x) => s + x.qty, 0),
       inventoryQuote: totalHeldValue,

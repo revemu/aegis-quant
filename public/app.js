@@ -1409,25 +1409,27 @@
       elBar.style.display = "grid";
       const cardsHtml = [];
       for (let i = 0; i < maxSlots; i++) {
-        const slot = activeSlots.find((s) => s.slotIndex === i);
+        const slotEntry = activeSlots.find((s) => s.slotIndex === i);
+        const slot = slotEntry && slotEntry.status === "HOLDING" ? slotEntry : null;
+        const emptyInfo = slotEntry && slotEntry.status === "EMPTY" ? slotEntry : null;
         if (slot) {
           const isInspected = slot.symbol === inspected;
           const pnl = Number(slot.unrealizedPnl || 0);
-          const pnlPct = Number(slot.unrealizedPct || 0);
+          const pnlPct = Number(slot.unrealizedPnlPct ?? slot.unrealizedPct ?? 0);
           const pnlColor = pnl >= 0 ? "#4ade80" : "#f87171";
           const sign = pnl >= 0 ? "+" : "-";
           const sl = Number(slot.stopLossPrice || 0);
           const tp1 = Number(slot.tp1TargetPrice || slot.emas?.ema200 || 0);
           const cur = Number(slot.currentPrice || slot.entryPrice || 0);
-          let progPct = 50;
-          if (tp1 > sl && sl > 0) {
-            progPct = Math.max(4, Math.min(100, ((cur - sl) / (tp1 - sl)) * 100));
+          let progPct = Number(slot.progressPct);
+          if (!Number.isFinite(progPct)) {
+            progPct = (tp1 > sl && sl > 0) ? Math.max(4, Math.min(100, ((cur - sl) / (tp1 - sl)) * 100)) : 50;
           }
           const stageTag = slot.tp1Done
             ? "✅ TP1 Hit • Runner"
             : slot.beLocked
               ? "🛡️ BE Locked"
-              : "⏳ Hunting EMA200";
+              : (slot.phaseText || "⏳ Hunting EMA200");
           cardsHtml.push(`
             <div class="pf-slot-card ${isInspected ? "pf-slot-active" : ""}" data-pf-sym="${slot.symbol}">
               <div class="pf-slot-top">
@@ -1454,11 +1456,16 @@
             </div>
           `);
         } else {
-          const nextCand = radar.find((r) => !activeSlots.some((s) => s.symbol === r.symbol));
+          const holdingSyms = new Set(activeSlots.filter((s) => s.status === "HOLDING" && s.symbol).map((s) => s.symbol));
+          const nextCand = emptyInfo?.nextCandidate || radar.find((r) => !holdingSyms.has(r.symbol));
+          const readyBudgetStr = emptyInfo?.readyBudget > 0
+            ? `~$${Math.round(emptyInfo.readyBudget).toLocaleString()}`
+            : `~${Math.round(100 / maxSlots)}%`;
+          const candPrice = Number(nextCand?.price ?? nextCand?.livePrice ?? 0);
           const emptyHint = macro.isSitOut
-            ? `🛡️ Macro Sit-Out (${macro.benchmarkSymbol || "SPY"})`
+            ? `🛡️ Macro Sit-Out (${macro.benchmarkSymbol || "SPY"})${nextCand ? ` • เฝ้าดู ${nextCand.symbol}` : ""}`
             : nextCand
-              ? `ถัดไป: ${nextCand.symbol} (${nextCand.stage === "PULLBACK_READY" ? "⚡ READY" : `Score ${Number(nextCand.score || 0).toFixed(1)}`})`
+              ? `ถัดไป: ${nextCand.symbol}${candPrice > 0 ? ` ($${fmtPrice(candPrice)})` : ""} • ${nextCand.stage === "PULLBACK_READY" ? "⚡ READY" : `${nextCand.stage} (Sc ${Number(nextCand.score || 0).toFixed(1)})`}`
               : `กำลังสแกน ${macro.universeCount || 49} ตัว...`;
           cardsHtml.push(`
             <div class="pf-slot-card pf-slot-empty">
@@ -1467,10 +1474,10 @@
                   <span class="pf-slot-badge" style="background:rgba(148,163,184,0.12); color:#94a3b8; border-color:rgba(148,163,184,0.25);">SLOT ${i + 1}</span>
                   <span class="pf-slot-symbol" style="color:#64748b; font-size:14px;">ว่าง (Standby Cash)</span>
                 </div>
-                <span style="font-size:11px; color:#64748b;">งบ ~${Math.round(100 / maxSlots)}%</span>
+                <span style="font-size:11px; color:#64748b;">งบ ${readyBudgetStr}</span>
               </div>
               <div style="font-size:11px; color:#94a3b8; margin-top:4px;">${emptyHint}</div>
-              <div style="font-size:10px; color:#64748b;">รอ EMA4 Pullback + 1H RSI ≥ 40 + Vol ≥ 1.3x</div>
+              <div style="font-size:10px; color:#64748b;">รอ Bottom Fan ➔ EMA4 Pullback • 1H RSI ≥ 40 • Vol ≥ 1.3x</div>
             </div>
           `);
         }
@@ -1507,11 +1514,14 @@
           : `🟢 Macro Filter: ${macro.benchmarkSymbol || "SPY"} ผ่านเกณฑ์เปิดรับสัญญาณ`;
       }
       if (elMacroSub) {
-        elMacroSub.textContent = macro.reason || `Universe ${macro.universeCount || 0} ตัว`;
+        const breadthStr = macro.breadthAboveEma25Pct !== undefined
+          ? ` • Breadth > EMA25: ${Number(macro.breadthAboveEma25Pct).toFixed(0)}%`
+          : "";
+        elMacroSub.textContent = `${macro.reason || `Universe ${macro.universeCount || 0} ตัว`}${breadthStr}`;
       }
 
       const inspectedRadar = radar.find((r) => r.symbol === inspected) || radar[0];
-      const inspectedSlot = activeSlots.find((s) => s.symbol === inspected);
+      const inspectedSlot = activeSlots.find((s) => s.status === "HOLDING" && s.symbol === inspected);
       const elChkTitle = document.getElementById("pfChecklistTitle");
       const elChkStage = document.getElementById("pfChecklistStage");
       const elChkGrid = document.getElementById("pfChecklistGrid");
@@ -1525,13 +1535,29 @@
 
       if (elChkGrid) {
         if (inspectedRadar) {
+          const rStage = inspectedRadar.stage || "SCANNING";
+          const hasBottomFan = Boolean(
+            inspectedRadar.hadBottomFan ||
+            rStage === "BOTTOM_FAN" ||
+            rStage === "WAITING_PULLBACK" ||
+            rStage === "PULLBACK_READY",
+          );
+          const hasPullbackHook = Boolean(
+            inspectedRadar.waitingPullback ||
+            rStage === "WAITING_PULLBACK" ||
+            rStage === "PULLBACK_READY",
+          );
+          const rsi1h = Number(inspectedRadar.rsi1h ?? inspectedRadar.htfRsi ?? 0);
+          const volRatio = Number(inspectedRadar.buyVolRatio12 ?? inspectedRadar.volRatio12 ?? 0);
+          const rs24h = Number(inspectedRadar.relStrength24h ?? 0);
+          const sc = Number(inspectedRadar.score ?? 0);
           const checks = [
-            { label: "Bottom Fan", ok: inspectedRadar.hadBottomFan },
-            { label: "EMA4 Hook", ok: inspectedRadar.waitingPullback || inspectedRadar.stage === "PULLBACK_READY" },
-            { label: "1H RSI ≥ 40", ok: (inspectedRadar.htfRsi || 0) >= 40, val: Number(inspectedRadar.htfRsi || 0).toFixed(0) },
-            { label: "Vol ≥ 1.3x", ok: (inspectedRadar.volRatio12 || 0) >= 1.3, val: `${Number(inspectedRadar.volRatio12 || 0).toFixed(2)}x` },
-            { label: "RS 24h ≥ -1%", ok: (inspectedRadar.relStrength24h || 0) >= -1.0, val: `${Number(inspectedRadar.relStrength24h || 0).toFixed(1)}%` },
-            { label: "Score", ok: (inspectedRadar.score || 0) > 0, val: Number(inspectedRadar.score || 0).toFixed(1) },
+            { label: "Bottom Fan", ok: hasBottomFan },
+            { label: "EMA4 Hook", ok: hasPullbackHook },
+            { label: "1H RSI ≥ 40", ok: rsi1h >= 40, val: rsi1h.toFixed(0) },
+            { label: "Vol ≥ 1.3x", ok: volRatio >= 1.3, val: `${volRatio.toFixed(2)}x` },
+            { label: "RS 24h ≥ -1%", ok: rs24h >= -1.0, val: `${rs24h >= 0 ? "+" : ""}${rs24h.toFixed(1)}%` },
+            { label: "Score", ok: sc > 0, val: sc.toFixed(1) },
           ];
           elChkGrid.innerHTML = checks.map((c) => `
             <div class="pf-chk-item ${c.ok ? "is-pass" : "is-fail"}">
@@ -1552,12 +1578,12 @@
           elRadarList.innerHTML = '<div class="pf-chk-empty">กำลังซิงค์แท่งเทียน 15m/1h ของ Universe...</div>';
         } else {
           elRadarList.innerHTML = radar.map((item) => {
-            const isHeld = activeSlots.some((s) => s.symbol === item.symbol);
+            const isHeld = activeSlots.some((s) => s.status === "HOLDING" && s.symbol === item.symbol);
             const stageCls = isHeld
               ? "pf-stage-held"
               : item.stage === "PULLBACK_READY"
                 ? "pf-stage-ready"
-                : item.stage === "WAITING_PULLBACK"
+                : (item.stage === "WAITING_PULLBACK" || item.stage === "BOTTOM_FAN")
                   ? "pf-stage-wait"
                   : "pf-stage-watch";
             const stageLbl = isHeld
@@ -1566,8 +1592,11 @@
                 ? "READY"
                 : item.stage === "WAITING_PULLBACK"
                   ? "PULLBACK"
-                  : "WATCH";
-            const dist200 = Number(item.distToEma200Pct || 0);
+                  : item.stage === "BOTTOM_FAN"
+                    ? "FAN"
+                    : "WATCH";
+            const itemPx = Number(item.price ?? item.livePrice ?? 0);
+            const dist200 = Number(item.distanceToEma200Pct ?? item.distToEma200Pct ?? 0);
             return `
               <div class="pf-radar-row ${item.symbol === inspected ? "is-inspected" : ""}" data-radar-sym="${item.symbol}" title="คลิกเพื่อดูกราฟและ EMA 6 เส้นของ ${item.symbol}">
                 <div class="pf-radar-left">
@@ -1575,7 +1604,7 @@
                   <span class="pf-radar-stage ${stageCls}">${stageLbl}</span>
                 </div>
                 <div class="pf-radar-right">
-                  <div style="color:#e2e8f0; font-weight:700;">$${fmtPrice(item.livePrice)}</div>
+                  <div style="color:#e2e8f0; font-weight:700;">$${fmtPrice(itemPx)}</div>
                   <div style="color:#94a3b8; font-size:10px;">Sc ${Number(item.score || 0).toFixed(1)} • E200 ${dist200 >= 0 ? "+" : ""}${dist200.toFixed(1)}%</div>
                 </div>
               </div>

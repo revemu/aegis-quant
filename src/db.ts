@@ -2417,10 +2417,40 @@ export class BotDatabase {
     return list.slice(0, limit);
   }
 
+  public matchesCurrentExchange(o: UnifiedOrderRecord): boolean {
+    const ex = String(this.data.settings?.exchange || "binance").toLowerCase();
+    const sym = String(o.symbol || "").toUpperCase();
+    const quote = String(o.quoteAsset || "").toUpperCase();
+    const reason = String(o.reason || "");
+    const feeAsset = String(o.feeAsset || "").toUpperCase();
+    const isDexOrder =
+      sym.includes(":") ||
+      quote === "USDSO" ||
+      Boolean(o.explorerUrl?.includes("somnia")) ||
+      Boolean(o.txHash?.startsWith("0x"));
+    const isBinanceOrder =
+      !isDexOrder &&
+      (quote === "FDUSD" ||
+        quote === "USDT" ||
+        quote === "USDC" ||
+        sym.endsWith("FDUSD") ||
+        sym.endsWith("USDT") ||
+        sym.endsWith("USDC") ||
+        feeAsset === "BNB" ||
+        reason.includes("Binance"));
+
+    if (ex === "dreamdex") return isDexOrder;
+    if (ex === "binance") return isBinanceOrder;
+    if (ex === "alpaca") return !isDexOrder && !isBinanceOrder;
+    return true;
+  }
+
   public getTrades(limit = 5000, symbol?: string): UnifiedOrderRecord[] {
     let list = this.data.orders
       .filter((o) => o.status === "FILLED" || o.fillTime !== undefined || ["BUY_FILL", "SELL_FILL", "CUT", "TAKE_PROFIT", "SNIPE_BUY", "SNIPE_SELL"].includes(o.action));
-    if (symbol && symbol !== "ALL" && symbol !== "__PORTFOLIO__") {
+    if (symbol === "ALL" || symbol === "__PORTFOLIO__") {
+      list = list.filter((o) => this.matchesCurrentExchange(o));
+    } else if (symbol) {
       list = list.filter((o) => this.matchesSymbol(o, symbol));
     }
     return list.slice(0, limit);
@@ -2428,7 +2458,9 @@ export class BotDatabase {
 
   public getOrderActivity(limit = 5000, symbol?: string): UnifiedOrderRecord[] {
     let list = this.data.orders;
-    if (symbol && symbol !== "ALL" && symbol !== "__PORTFOLIO__") {
+    if (symbol === "ALL" || symbol === "__PORTFOLIO__") {
+      list = list.filter((o) => this.matchesCurrentExchange(o));
+    } else if (symbol) {
       list = list.filter((o) => this.matchesSymbol(o, symbol));
     }
     return list.slice(0, limit);
@@ -2439,6 +2471,7 @@ export class BotDatabase {
     if (activeSym === "ALL" || activeSym === "__PORTFOLIO__") {
       const grouped = new Map<string, UnifiedOrderRecord[]>();
       for (const o of this.data.orders) {
+        if (!this.matchesCurrentExchange(o)) continue;
         const sym = String(o.symbol || o.baseAsset || "UNKNOWN").toUpperCase().replace(/[\/\-_:]/g, "");
         const arr = grouped.get(sym) || [];
         arr.push(o);
