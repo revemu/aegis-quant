@@ -276,6 +276,7 @@ export interface IStrategy {
   getChartCandles?(): Candle[];
   getHtfChartCandles?(): Candle[];
   getPortfolioRadarSnapshot?(): any;
+  getLearningReport?(): Promise<any>;
 
   // Portfolio & Balances
   lastFlatCashTime?: number;

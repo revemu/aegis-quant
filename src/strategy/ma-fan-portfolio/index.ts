@@ -11,6 +11,7 @@ import { AlpacaPortfolioWsClient } from "../../exchange/alpaca/ws.js";
 import type { Candle } from "../../market-structure.js";
 import type { AtrSource } from "../../types.js";
 import { BotDatabase, getDatabase, type PortfolioSlotRecord, type UnifiedOrderRecord } from "../../db.js";
+import { LearningEngine } from "../../learning-engine.js";
 import type { IStrategy, Lot, MarketClockInfo, StrategyContext, StrategyEvent, StrategyType } from "../types.js";
 import type {
   CoinSetupState,
@@ -41,6 +42,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
   private cfg: Config;
   private log: (msg: string) => void;
   private db: BotDatabase;
+  private learning: LearningEngine;
 
   private eventListeners: ((event: StrategyEvent) => void)[] = [];
   private isPaused: boolean = true;
@@ -102,9 +104,11 @@ export class MaFanPortfolioStrategy implements IStrategy {
     this.atrSource = context.atrSource;
     this.log = context.log ?? ((msg) => console.log(`[ma-fan-portfolio] ${msg}`));
     this.db = getDatabase({ dbPath: this.cfg.dbPath });
+    this.learning = new LearningEngine(this.db, this.log);
 
     this.inspectedSymbol = this.resolveInitialInspectedSymbol();
     this.reloadState();
+    void this.learning.ensureSymbolStatesLoaded();
   }
 
   private resolveInitialInspectedSymbol(): string {
@@ -612,6 +616,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
       radar: this.radarList.slice(0, 20),
       inspectedSymbol: this.inspectedSymbol,
     };
+  }
+
+  public async getLearningReport() {
+    return this.learning.buildReport(this.cfg);
   }
 
   // ── Wallet & Position Sync ─────────────────────────────────────────────────
@@ -1126,10 +1134,12 @@ export class MaFanPortfolioStrategy implements IStrategy {
       const relStrength24h = coinRet24h - sitOutEval.benchmarkRet24h;
       const upperSpreadPct = m200 > 0 ? ((m200 - m75) / m200) * 100 : 0;
 
-      const score =
+      const baseScore =
         this.cfg.portfolioRankBy === "RSI15"
           ? rsi15
           : Math.min(3, buyVolRatio12) * 20 + Math.max(-5, Math.min(10, relStrength24h)) * 3 - upperSpreadPct * 10;
+      const score = baseScore + this.learning.getSymbolScorePenalty(sym, this.cfg);
+      const onLearningCooldown = this.learning.isSymbolOnCooldown(sym, this.cfg);
 
       const livePx = ind.livePrice || c.close;
       const distanceToEma4Pct = m4 > 0 ? ((livePx - m4) / m4) * 100 : 0;
@@ -1143,7 +1153,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
         stage = "HOLDING";
       } else if (st.waitingPullback && m8 >= m16) {
         if (livePx <= m4 * 1.001) {
-          if (passesFilters) {
+          if (onLearningCooldown) {
+            stage = "CROSS_8X16_FAIL_FILTERS";
+            filterNote = "Learning Cooldown";
+          } else if (passesFilters) {
             stage = "PULLBACK_READY";
           } else {
             stage = "CROSS_8X16_FAIL_FILTERS";
@@ -1182,7 +1195,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       };
       newRadar.push(cand);
 
-      if (!isHeld && stage === "PULLBACK_READY") {
+      if (!isHeld && stage === "PULLBACK_READY" && !onLearningCooldown) {
         entryCandidates.push({ sym, price: livePx, score, cand });
       }
     }
@@ -1200,6 +1213,18 @@ export class MaFanPortfolioStrategy implements IStrategy {
     this.radarList = newRadar;
     this.syncAlpacaWsSubscriptions();
 
+    // Learning Level 1 & 3: Record near-miss blocked signals & run periodic bounded learning cycle
+    const latestClosedBarSec = this.snapshots.get(this.inspectedSymbol)?.lastClosedTime || 0;
+    if (latestClosedBarSec > 0) {
+      void this.learning.recordBlockedSignals({
+        exchange: this.exchange.exchangeName,
+        barTimeSec: latestClosedBarSec,
+        macro: this.macroState,
+        candidates: newRadar,
+      });
+    }
+    void this.learning.runPeriodicCycle(this.cfg, (patch) => this.updateRuntimeSettings(patch));
+
     // 3. Allocate Free Slots if Entries Ready & Allowed
     const maxSlots = this.getMaxSlots();
     const freeSlots = maxSlots - this.slots.length;
@@ -1211,7 +1236,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
         const availCash = this.getAvailableBuyCash();
         const alloc = availCash / currentFree;
         if (alloc < 5) break;
-        await this.executeEntrySlot(ch.sym, ch.price, alloc, ch.score);
+        await this.executeEntrySlot(ch.sym, ch.price, alloc, ch.score, ch.cand);
       }
     }
   }
@@ -1261,7 +1286,13 @@ export class MaFanPortfolioStrategy implements IStrategy {
     return st;
   }
 
-  private async executeEntrySlot(symbol: string, refPrice: number, allocQuote: number, score: number): Promise<void> {
+  private async executeEntrySlot(
+    symbol: string,
+    refPrice: number,
+    allocQuote: number,
+    score: number,
+    entryCand?: PortfolioRadarCandidate,
+  ): Promise<void> {
     const usedIdx = new Set(this.slots.map((s) => s.slotIndex));
     let slotIndex = 0;
     while (usedIdx.has(slotIndex)) slotIndex++;
@@ -1359,6 +1390,18 @@ export class MaFanPortfolioStrategy implements IStrategy {
     };
     this.db.recordEvent(orderRec);
     this.emit({ type: "order", data: orderRec });
+    slot.learningJournalUid = await this.learning.onPortfolioEntry({
+      exchange: this.exchange.exchangeName,
+      symbol,
+      slotIndex,
+      entryTimeMs: slot.entryTime,
+      entryPrice: execPrice,
+      qty: execQty,
+      allocatedQuote: actualCost,
+      snapshot: entryCand ?? this.radarList.find((r) => r.symbol === symbol),
+      macro: this.macroState,
+      score,
+    });
     this.saveState(true);
     this.log(`🚀 [Slot ${slotIndex + 1}/${this.getMaxSlots()} ENTER] Bought ${execQty} ${symbol} @ $${execPrice.toFixed(2)} ($${actualCost.toFixed(2)}) | SL $${slPrice.toFixed(2)}`);
   }
@@ -1448,6 +1491,22 @@ export class MaFanPortfolioStrategy implements IStrategy {
     this.emit({ type: "order", data: orderRec });
 
     if (closeFullSlot || slot.qty <= 1e-6) {
+      const totalSlotPnl = slot.realizedProceeds - slot.allocatedCapital - slot.entryFeeQuote;
+      void this.learning.onPortfolioTradeClosed({
+        journalUid: slot.learningJournalUid,
+        exchange: this.exchange.exchangeName,
+        symbol: slot.symbol,
+        entryTimeMs: slot.entryTime,
+        exitTimeMs: Date.now(),
+        entryPrice: slot.entryPrice,
+        exitPrice: execPrice,
+        troughPrice: slot.troughPrice,
+        peakPrice: slot.peakPrice,
+        totalPnlQuote: totalSlotPnl,
+        allocatedQuote: slot.allocatedCapital,
+        exitReason: reason,
+        cfg: this.cfg,
+      });
       this.slots = this.slots.filter((s) => s.slotIndex !== slot.slotIndex);
       const st = this.setupStates.get(slot.symbol);
       if (st) {

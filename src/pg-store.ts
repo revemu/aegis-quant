@@ -63,6 +63,53 @@ export function filterChangedCandles(existing: Candle[], incoming: Candle[]): Ca
   return changed;
 }
 
+export interface LearningJournalRecord {
+  journalUid: string;
+  recordType: "TRADE" | "BLOCKED_SIGNAL";
+  exchange: string;
+  symbol: string;
+  status: "OPEN" | "CLOSED" | "PENDING_EVAL" | "EVALUATED";
+  entryTimeMs: number;
+  exitTimeMs?: number | null;
+  entryPrice: number;
+  exitPrice?: number | null;
+  qty?: number | null;
+  allocatedQuote?: number | null;
+  pnlQuote?: number | null;
+  pnlPct?: number | null;
+  maePct?: number | null;
+  mfePct?: number | null;
+  holdMinutes?: number | null;
+  exitReason?: string | null;
+  blockReason?: string | null;
+  features: Record<string, any>;
+  counterfactualPnlPct?: number | null;
+  counterfactualVerdict?: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL" | null;
+  updatedAt: number;
+}
+
+export interface SymbolLearningStateRecord {
+  symbol: string;
+  consecutiveSl: number;
+  wins: number;
+  losses: number;
+  totalPnlQuote: number;
+  scorePenalty: number;
+  cooldownUntilMs: number;
+  lastReason: string;
+  updatedAt: number;
+}
+
+export interface LearningAdjustmentRecord {
+  paramName: string;
+  oldValue: number;
+  newValue: number;
+  sampleSize: number;
+  rationale: string;
+  applied: boolean;
+  createdAt: number;
+}
+
 function sanitizeJson<T>(val: T): T {
   return JSON.parse(JSON.stringify(val ?? null)) as T;
 }
@@ -176,6 +223,75 @@ export class PgStore {
     await this.sql`
       CREATE INDEX IF NOT EXISTS idx_market_candles_lookup
       ON market_candles (exchange, symbol, timeframe, time_sec DESC)
+    `;
+
+    await this.sql`
+      CREATE TABLE IF NOT EXISTS trade_learning_journal (
+        instance_key TEXT NOT NULL,
+        journal_uid TEXT NOT NULL,
+        record_type TEXT NOT NULL,
+        exchange TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        status TEXT NOT NULL,
+        entry_time_ms BIGINT NOT NULL,
+        exit_time_ms BIGINT,
+        entry_price DOUBLE PRECISION NOT NULL,
+        exit_price DOUBLE PRECISION,
+        qty DOUBLE PRECISION,
+        allocated_quote DOUBLE PRECISION,
+        pnl_quote DOUBLE PRECISION,
+        pnl_pct DOUBLE PRECISION,
+        mae_pct DOUBLE PRECISION,
+        mfe_pct DOUBLE PRECISION,
+        hold_minutes DOUBLE PRECISION,
+        exit_reason TEXT,
+        block_reason TEXT,
+        features_json JSONB NOT NULL,
+        counterfactual_pnl_pct DOUBLE PRECISION,
+        counterfactual_verdict TEXT,
+        updated_at BIGINT NOT NULL,
+        PRIMARY KEY (instance_key, journal_uid)
+      )
+    `;
+
+    await this.sql`
+      CREATE INDEX IF NOT EXISTS idx_learning_journal_type_ts
+      ON trade_learning_journal (instance_key, record_type, status, entry_time_ms DESC)
+    `;
+
+    await this.sql`
+      CREATE TABLE IF NOT EXISTS symbol_learning_state (
+        instance_key TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        consecutive_sl INT NOT NULL DEFAULT 0,
+        wins INT NOT NULL DEFAULT 0,
+        losses INT NOT NULL DEFAULT 0,
+        total_pnl_quote DOUBLE PRECISION NOT NULL DEFAULT 0,
+        score_penalty DOUBLE PRECISION NOT NULL DEFAULT 0,
+        cooldown_until_ms BIGINT NOT NULL DEFAULT 0,
+        last_reason TEXT NOT NULL DEFAULT '',
+        updated_at BIGINT NOT NULL,
+        PRIMARY KEY (instance_key, symbol)
+      )
+    `;
+
+    await this.sql`
+      CREATE TABLE IF NOT EXISTS learning_adjustments (
+        id SERIAL PRIMARY KEY,
+        instance_key TEXT NOT NULL,
+        param_name TEXT NOT NULL,
+        old_value DOUBLE PRECISION NOT NULL,
+        new_value DOUBLE PRECISION NOT NULL,
+        sample_size INT NOT NULL,
+        rationale TEXT NOT NULL,
+        applied BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at BIGINT NOT NULL
+      )
+    `;
+
+    await this.sql`
+      CREATE INDEX IF NOT EXISTS idx_learning_adjustments_inst_ts
+      ON learning_adjustments (instance_key, created_at DESC)
     `;
   }
 
@@ -735,6 +851,299 @@ export class PgStore {
     });
 
     return rows.length;
+  }
+
+  // ── Learning Engine Journal, Cooldowns & Adjustment Audit ────────────────
+
+  public async upsertLearningJournalBatch(entries: LearningJournalRecord[]): Promise<void> {
+    if (this.closed || entries.length === 0) return;
+
+    const dedup = new Map<string, LearningJournalRecord>();
+    for (const e of entries) {
+      if (!e.journalUid) continue;
+      dedup.set(e.journalUid, e);
+    }
+    const list = Array.from(dedup.values());
+    if (list.length === 0) return;
+
+    const rows = list.map((e) => ({
+      instance_key: this.instanceKey,
+      journal_uid: e.journalUid,
+      record_type: e.recordType,
+      exchange: e.exchange.toLowerCase(),
+      symbol: e.symbol.toUpperCase(),
+      status: e.status,
+      entry_time_ms: Math.floor(e.entryTimeMs),
+      exit_time_ms: e.exitTimeMs !== undefined && e.exitTimeMs !== null ? Math.floor(e.exitTimeMs) : null,
+      entry_price: Number(e.entryPrice) || 0,
+      exit_price: e.exitPrice !== undefined && e.exitPrice !== null ? Number(e.exitPrice) : null,
+      qty: e.qty !== undefined && e.qty !== null ? Number(e.qty) : null,
+      allocated_quote: e.allocatedQuote !== undefined && e.allocatedQuote !== null ? Number(e.allocatedQuote) : null,
+      pnl_quote: e.pnlQuote !== undefined && e.pnlQuote !== null ? Number(e.pnlQuote) : null,
+      pnl_pct: e.pnlPct !== undefined && e.pnlPct !== null ? Number(e.pnlPct) : null,
+      mae_pct: e.maePct !== undefined && e.maePct !== null ? Number(e.maePct) : null,
+      mfe_pct: e.mfePct !== undefined && e.mfePct !== null ? Number(e.mfePct) : null,
+      hold_minutes: e.holdMinutes !== undefined && e.holdMinutes !== null ? Number(e.holdMinutes) : null,
+      exit_reason: e.exitReason ?? null,
+      block_reason: e.blockReason ?? null,
+      features_json: this.sql.json(sanitizeJson(e.features || {}) as any),
+      counterfactual_pnl_pct:
+        e.counterfactualPnlPct !== undefined && e.counterfactualPnlPct !== null ? Number(e.counterfactualPnlPct) : null,
+      counterfactual_verdict: e.counterfactualVerdict ?? null,
+      updated_at: Math.floor(e.updatedAt || Date.now()),
+    }));
+
+    for (let i = 0; i < rows.length; i += 200) {
+      const chunk = rows.slice(i, i + 200);
+      await this.sql`
+        INSERT INTO trade_learning_journal ${this.sql(
+          chunk,
+          "instance_key",
+          "journal_uid",
+          "record_type",
+          "exchange",
+          "symbol",
+          "status",
+          "entry_time_ms",
+          "exit_time_ms",
+          "entry_price",
+          "exit_price",
+          "qty",
+          "allocated_quote",
+          "pnl_quote",
+          "pnl_pct",
+          "mae_pct",
+          "mfe_pct",
+          "hold_minutes",
+          "exit_reason",
+          "block_reason",
+          "features_json",
+          "counterfactual_pnl_pct",
+          "counterfactual_verdict",
+          "updated_at",
+        )}
+        ON CONFLICT (instance_key, journal_uid) DO UPDATE SET
+          status = EXCLUDED.status,
+          exit_time_ms = COALESCE(EXCLUDED.exit_time_ms, trade_learning_journal.exit_time_ms),
+          exit_price = COALESCE(EXCLUDED.exit_price, trade_learning_journal.exit_price),
+          pnl_quote = COALESCE(EXCLUDED.pnl_quote, trade_learning_journal.pnl_quote),
+          pnl_pct = COALESCE(EXCLUDED.pnl_pct, trade_learning_journal.pnl_pct),
+          mae_pct = COALESCE(EXCLUDED.mae_pct, trade_learning_journal.mae_pct),
+          mfe_pct = COALESCE(EXCLUDED.mfe_pct, trade_learning_journal.mfe_pct),
+          hold_minutes = COALESCE(EXCLUDED.hold_minutes, trade_learning_journal.hold_minutes),
+          exit_reason = COALESCE(EXCLUDED.exit_reason, trade_learning_journal.exit_reason),
+          counterfactual_pnl_pct = COALESCE(EXCLUDED.counterfactual_pnl_pct, trade_learning_journal.counterfactual_pnl_pct),
+          counterfactual_verdict = COALESCE(EXCLUDED.counterfactual_verdict, trade_learning_journal.counterfactual_verdict),
+          updated_at = EXCLUDED.updated_at
+      `;
+    }
+  }
+
+  public async closeLearningTrade(params: {
+    journalUid: string;
+    exitTimeMs: number;
+    exitPrice: number;
+    pnlQuote: number;
+    pnlPct: number;
+    maePct: number;
+    mfePct: number;
+    holdMinutes: number;
+    exitReason: string;
+  }): Promise<void> {
+    if (this.closed || !params.journalUid) return;
+    await this.sql`
+      UPDATE trade_learning_journal
+      SET
+        status = 'CLOSED',
+        exit_time_ms = ${Math.floor(params.exitTimeMs)},
+        exit_price = ${Number(params.exitPrice)},
+        pnl_quote = ${Number(params.pnlQuote)},
+        pnl_pct = ${Number(params.pnlPct)},
+        mae_pct = ${Number(params.maePct)},
+        mfe_pct = ${Number(params.mfePct)},
+        hold_minutes = ${Number(params.holdMinutes)},
+        exit_reason = ${params.exitReason},
+        updated_at = ${Date.now()}
+      WHERE instance_key = ${this.instanceKey}
+        AND journal_uid = ${params.journalUid}
+    `;
+  }
+
+  public async loadLearningJournal(
+    recordType: "TRADE" | "BLOCKED_SIGNAL",
+    status?: string,
+    limit = 300,
+  ): Promise<LearningJournalRecord[]> {
+    const safeLimit = Math.max(1, Math.min(limit, 2000));
+    const rows = status
+      ? await this.sql<any[]>`
+          SELECT * FROM trade_learning_journal
+          WHERE instance_key = ${this.instanceKey}
+            AND record_type = ${recordType}
+            AND status = ${status}
+          ORDER BY entry_time_ms DESC
+          LIMIT ${safeLimit}
+        `
+      : await this.sql<any[]>`
+          SELECT * FROM trade_learning_journal
+          WHERE instance_key = ${this.instanceKey}
+            AND record_type = ${recordType}
+          ORDER BY entry_time_ms DESC
+          LIMIT ${safeLimit}
+        `;
+
+    return rows.map((r) => ({
+      journalUid: String(r.journal_uid),
+      recordType: r.record_type,
+      exchange: String(r.exchange),
+      symbol: String(r.symbol),
+      status: r.status,
+      entryTimeMs: Number(r.entry_time_ms),
+      exitTimeMs: r.exit_time_ms !== null ? Number(r.exit_time_ms) : null,
+      entryPrice: Number(r.entry_price),
+      exitPrice: r.exit_price !== null ? Number(r.exit_price) : null,
+      qty: r.qty !== null ? Number(r.qty) : null,
+      allocatedQuote: r.allocated_quote !== null ? Number(r.allocated_quote) : null,
+      pnlQuote: r.pnl_quote !== null ? Number(r.pnl_quote) : null,
+      pnlPct: r.pnl_pct !== null ? Number(r.pnl_pct) : null,
+      maePct: r.mae_pct !== null ? Number(r.mae_pct) : null,
+      mfePct: r.mfe_pct !== null ? Number(r.mfe_pct) : null,
+      holdMinutes: r.hold_minutes !== null ? Number(r.hold_minutes) : null,
+      exitReason: r.exit_reason ?? null,
+      blockReason: r.block_reason ?? null,
+      features: typeof r.features_json === "string" ? JSON.parse(r.features_json) : (r.features_json || {}),
+      counterfactualPnlPct: r.counterfactual_pnl_pct !== null ? Number(r.counterfactual_pnl_pct) : null,
+      counterfactualVerdict: r.counterfactual_verdict ?? null,
+      updatedAt: Number(r.updated_at),
+    }));
+  }
+
+  public async loadPendingBlockedSignals(beforeEntryMs: number, limit = 150): Promise<LearningJournalRecord[]> {
+    const safeLimit = Math.max(1, Math.min(limit, 500));
+    const rows = await this.sql<any[]>`
+      SELECT * FROM trade_learning_journal
+      WHERE instance_key = ${this.instanceKey}
+        AND record_type = 'BLOCKED_SIGNAL'
+        AND status = 'PENDING_EVAL'
+        AND entry_time_ms <= ${Math.floor(beforeEntryMs)}
+      ORDER BY entry_time_ms ASC
+      LIMIT ${safeLimit}
+    `;
+    return rows.map((r) => ({
+      journalUid: String(r.journal_uid),
+      recordType: "BLOCKED_SIGNAL",
+      exchange: String(r.exchange),
+      symbol: String(r.symbol),
+      status: "PENDING_EVAL",
+      entryTimeMs: Number(r.entry_time_ms),
+      entryPrice: Number(r.entry_price),
+      blockReason: r.block_reason ?? null,
+      features: typeof r.features_json === "string" ? JSON.parse(r.features_json) : (r.features_json || {}),
+      updatedAt: Number(r.updated_at),
+    }));
+  }
+
+  public async updateBlockedEvaluations(
+    updates: Array<{
+      journalUid: string;
+      counterfactualPnlPct: number;
+      counterfactualVerdict: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL";
+      maePct: number;
+      mfePct: number;
+    }>,
+  ): Promise<void> {
+    if (this.closed || updates.length === 0) return;
+    const nowMs = Date.now();
+    await this.sql.begin(async (tx) => {
+      const q = tx as unknown as Sql;
+      for (const u of updates) {
+        await q`
+          UPDATE trade_learning_journal
+          SET
+            status = 'EVALUATED',
+            counterfactual_pnl_pct = ${u.counterfactualPnlPct},
+            counterfactual_verdict = ${u.counterfactualVerdict},
+            mae_pct = ${u.maePct},
+            mfe_pct = ${u.mfePct},
+            updated_at = ${nowMs}
+          WHERE instance_key = ${this.instanceKey}
+            AND journal_uid = ${u.journalUid}
+        `;
+      }
+    });
+  }
+
+  public async loadSymbolLearningStates(): Promise<SymbolLearningStateRecord[]> {
+    const rows = await this.sql<any[]>`
+      SELECT * FROM symbol_learning_state
+      WHERE instance_key = ${this.instanceKey}
+    `;
+    return rows.map((r) => ({
+      symbol: String(r.symbol).toUpperCase(),
+      consecutiveSl: Number(r.consecutive_sl || 0),
+      wins: Number(r.wins || 0),
+      losses: Number(r.losses || 0),
+      totalPnlQuote: Number(r.total_pnl_quote || 0),
+      scorePenalty: Number(r.score_penalty || 0),
+      cooldownUntilMs: Number(r.cooldown_until_ms || 0),
+      lastReason: String(r.last_reason || ""),
+      updatedAt: Number(r.updated_at || 0),
+    }));
+  }
+
+  public async upsertSymbolLearningState(rec: SymbolLearningStateRecord): Promise<void> {
+    if (this.closed) return;
+    const sym = rec.symbol.toUpperCase().trim();
+    if (!sym) return;
+    await this.sql`
+      INSERT INTO symbol_learning_state (
+        instance_key, symbol, consecutive_sl, wins, losses,
+        total_pnl_quote, score_penalty, cooldown_until_ms, last_reason, updated_at
+      ) VALUES (
+        ${this.instanceKey}, ${sym}, ${rec.consecutiveSl}, ${rec.wins}, ${rec.losses},
+        ${rec.totalPnlQuote}, ${rec.scorePenalty}, ${Math.floor(rec.cooldownUntilMs)}, ${rec.lastReason}, ${Math.floor(rec.updatedAt)}
+      )
+      ON CONFLICT (instance_key, symbol) DO UPDATE SET
+        consecutive_sl = EXCLUDED.consecutive_sl,
+        wins = EXCLUDED.wins,
+        losses = EXCLUDED.losses,
+        total_pnl_quote = EXCLUDED.total_pnl_quote,
+        score_penalty = EXCLUDED.score_penalty,
+        cooldown_until_ms = EXCLUDED.cooldown_until_ms,
+        last_reason = EXCLUDED.last_reason,
+        updated_at = EXCLUDED.updated_at
+    `;
+  }
+
+  public async recordLearningAdjustment(rec: LearningAdjustmentRecord): Promise<void> {
+    if (this.closed) return;
+    await this.sql`
+      INSERT INTO learning_adjustments (
+        instance_key, param_name, old_value, new_value, sample_size, rationale, applied, created_at
+      ) VALUES (
+        ${this.instanceKey}, ${rec.paramName}, ${rec.oldValue}, ${rec.newValue},
+        ${rec.sampleSize}, ${rec.rationale}, ${rec.applied}, ${Math.floor(rec.createdAt)}
+      )
+    `;
+  }
+
+  public async loadLearningAdjustments(limit = 50): Promise<LearningAdjustmentRecord[]> {
+    const safeLimit = Math.max(1, Math.min(limit, 200));
+    const rows = await this.sql<any[]>`
+      SELECT * FROM learning_adjustments
+      WHERE instance_key = ${this.instanceKey}
+      ORDER BY created_at DESC
+      LIMIT ${safeLimit}
+    `;
+    return rows.map((r) => ({
+      paramName: String(r.param_name),
+      oldValue: Number(r.old_value),
+      newValue: Number(r.new_value),
+      sampleSize: Number(r.sample_size),
+      rationale: String(r.rationale),
+      applied: Boolean(r.applied),
+      createdAt: Number(r.created_at),
+    }));
   }
 
   public async close(): Promise<void> {

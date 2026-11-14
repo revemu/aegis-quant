@@ -855,6 +855,10 @@ async function main(): Promise<void> {
     maxCandles: config.strategyType === "ma_ribbon" ? 1200 : (config.maxCandleCount ?? 600),
     getSettings: () => grid.getRuntimeConfig(),
     onUpdateSettings: (s) => onUpdateSettings(s),
+    onGetLearningReport: () =>
+      grid.getLearningReport
+        ? grid.getLearningReport()
+        : Promise.resolve({ supported: false, message: "Switch strategy to Portfolio mode to enable Learning Report." }),
     onPauseBot: (paused) => grid.setPaused(paused),
     getIsPaused: () => grid.getIsPaused(),
     onCancelAll: () => grid.cancelAllOrdersUser(),

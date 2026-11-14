@@ -70,6 +70,7 @@ export interface PortfolioSlotRecord {
   activeBarsHeld: number;
   tp1TargetPrice?: number;
   entryReason?: string;
+  learningJournalUid?: string;
 }
 
 export interface StrategyStateRecord {

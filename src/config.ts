@@ -434,6 +434,8 @@ export const defaultStrategyConfig = {
   portfolioMaxBudgetUsd: 0,
   /** Active symbol currently inspected on the main chart in portfolio mode. */
   portfolioInspectedSymbol: "",
+  /** Bounded Learning Engine Auto-Tuning mode: "dry_run_only" (safe default), "all", or "off". */
+  learningAutoTuneMode: "dry_run_only" as "dry_run_only" | "all" | "off",
 };
 
 /**
@@ -645,6 +647,9 @@ export function loadConfigFromDatabase(): typeof defaultStrategyConfig {
       if (saved.portfolioMaxHoldHours !== undefined) merged.portfolioMaxHoldHours = Math.max(0, Number(saved.portfolioMaxHoldHours) || 0);
       if (saved.portfolioMaxBudgetUsd !== undefined) merged.portfolioMaxBudgetUsd = Math.max(0, Number(saved.portfolioMaxBudgetUsd) || 0);
       if (typeof saved.portfolioInspectedSymbol === "string") merged.portfolioInspectedSymbol = saved.portfolioInspectedSymbol.toUpperCase().trim();
+      if (saved.learningAutoTuneMode === "dry_run_only" || saved.learningAutoTuneMode === "all" || saved.learningAutoTuneMode === "off") {
+        merged.learningAutoTuneMode = saved.learningAutoTuneMode;
+      }
       return merged;
     }
   } catch {

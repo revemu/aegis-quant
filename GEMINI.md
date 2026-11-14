@@ -9808,3 +9808,20 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - ปรับ `discoverBinancePortfolioSymbols` ใน `src/strategy/ma-fan-portfolio/universe.ts` ให้ใช้ `STABLE_TOKENS` (รวม `U`, `USD1`, `USD0`, `XUSD`, `PYUSD`, `PAXG`, `XAUT`, `RWUSD`, `BFUSD`, `USDE`, ฯลฯ จาก `src/backtest-service.ts`), `isSyntheticOrStock` (ตัดหุ้น Tokenized เช่น `SPCXBUSDT`, `NVDABUSDT` ฯลฯ จาก `src/pair-rotator.ts`) และ `getActiveBinanceTradingSymbols()` (กรองคู่ที่ไม่ได้ `TRADING`) ร่วมกับตัวสแกน Backtest โดยไม่ทำซ้ำ
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.82`** ใน `package.json` และ `src/version.ts`
+
+---
+
+## 327. v0.3.0.83 — PostgreSQL Learning Engine (Levels 1, 2 & 3) (`src/learning-engine.ts`, `src/pg-store.ts`)
+
+- **Level 1 — PostgreSQL Learning Journal & Symbol Memory (`src/pg-store.ts`, `src/db.ts`)**:
+  - เพิ่มตาราง `trade_learning_journal`, `symbol_learning_state` และ `learning_adjustments` (แยกตาม `instance_key`)
+  - บันทึก Feature Snapshot ณ ตอนเปิดไม้ (`score`, `rsi15`, `rsi1h`, `buyVolRatio12`, `relStrength24h`, `upperSpreadPct`, `distEma200Pct`, `macroPass4h/1d`) และบันทึกผลปิดไม้จริงพร้อม **`MAE %` / `MFE %`** และ `hold_minutes`
+  - บันทึกสัญญาณที่โดนบล็อก (`CROSS_8X16_FAIL_FILTERS`, `MACRO_SIT_OUT`) ใน status `PENDING_EVAL` และตรวจเฉลยจาก `market_candles` อัตโนมัติหลังครบ 4 ชม.
+- **Level 2 — Analytics & Learning Report Endpoint (`src/learning-engine.ts`, `src/server.ts`, `src/index.ts`)**:
+  - เพิ่ม `GET /api/learning/report` สรุป Win Rate, PnL, Average MAE/MFE, P80 Win MAE, สถิติเปรียบเทียบฟิลเตอร์ที่บล็อก (`savedPct` vs `missedWinPct`), Active Cooldowns, และประวัติการปรับค่า
+- **Level 3 — Bounded Self-Tuning (`src/strategy/ma-fan-portfolio/index.ts`, `src/config.ts`)**:
+  - เพิ่ม `learningAutoTuneMode` (ค่าเริ่มต้น `"dry_run_only"`)
+  - **Dynamic Symbol Cooldown**: พักเหรียญ/หุ้นที่โดน SL ติดกัน >= 2 ไม้และ PnL ติดลบ เป็นเวลา 48 ชม. (พร้อมหัก `-25` score และแสดง `Learning Cooldown` บน Radar)
+  - **Bounded SL Nudge**: ขยับ `portfolioDisasterSlPct` ในกรอบ `[2.5%, 5.0%]` ทีละไม่เกิน `±0.25%` จาก `WinMAE_P80 + 0.8%` เมื่อมี sample ปิดไม้ `>= 20` ไม้ และไม่ถี่กว่า 7 วัน/ครั้ง
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.83`** ใน `package.json` และ `src/version.ts`

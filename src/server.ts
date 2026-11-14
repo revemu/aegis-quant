@@ -37,6 +37,7 @@ export interface DashboardServerOptions {
   onInspectPortfolioSymbol?: (symbol: string) => Promise<any>;
   onClosePortfolioSlot?: (slotIndex: number) => Promise<any>;
   getPortfolioRadar?: () => any;
+  onGetLearningReport?: () => Promise<any>;
   maxCandles?: number;
 }
 
@@ -793,6 +794,25 @@ export class DashboardServer {
     }
 
     // Portfolio Mode APIs: Radar, Inspect Symbol, Close Slot
+    if (pathname === "/api/learning/report" && req.method === "GET") {
+      if (!this.opts.onGetLearningReport) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ supported: false, message: "Learning report is available in Portfolio mode." }));
+        return;
+      }
+      this.opts
+        .onGetLearningReport()
+        .then((report) => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ supported: true, ...report }));
+        })
+        .catch((err: any) => {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ supported: false, error: (err as Error).message }));
+        });
+      return;
+    }
+
     if (pathname === "/api/portfolio/radar" && req.method === "GET") {
       const radar = this.opts.getPortfolioRadar ? this.opts.getPortfolioRadar() : null;
       res.writeHead(200, { "Content-Type": "application/json" });
