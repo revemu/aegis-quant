@@ -9741,3 +9741,15 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - ปรับปรุง `updateSingleCandle()` / `updateSingleHtfCandle()` ใน `public/app.js` ผ่าน helper `applyActiveSingleCandleUpdate()` ให้รองรับการแก้แท่งที่เพิ่งปิดสมบูรณ์ย้อนหลัง 1 แท่งโดยไม่รีเซ็ต zoom/pan ของกราฟ และส่ง `cachedHtfCandles` ถูกต้องเมื่อดู TF สูง
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.76`** ใน `package.json` และ `src/version.ts`
+
+---
+
+## 322. v0.3.0.77 — Fix Alpaca WS `405 Symbol Limit Exceeded` (Subscribe `trades`-only <= 30 + Server Confirmation Tracking) (`src/exchange/alpaca/ws.ts`)
+
+- **สาเหตุที่พบจาก Log บน `:3334`**: Alpaca Basic Plan นับจำนวนช่องข้อมูลแยกตาม Channel (`trades` + `quotes`) การสมัครทั้ง `trades` และ `quotes` 30 ตัวพร้อมกันจึงถูกนับเป็น `60` ทำให้ติด `405: symbol limit exceeded`
+- **การแก้ไขใน `src/exchange/alpaca/ws.ts`**:
+  - เปลี่ยนมาสมัครเฉพาะ **`trades` (`{ action: "subscribe", trades: toAdd }`)** เพียง Channel เดียวต่อหุ้น เพื่อให้ได้ครบ **30 หุ้นเต็มโควตา** (ราคา Last Trade จริง)
+  - เก็บ `subscribedSymbols` ตามการยืนยันจาก `{ T: "subscription" }` ของ Alpaca เท่านั้น (ไม่อัปเดตล่วงหน้า) และป้องกันการส่งคำขอซ้ำระหว่างรอผล (`pendingSyncUntil` / `lastSyncedSignature`)
+  - หากเกิด `error 405` ให้ล้าง `subscribedSymbols` เพื่อให้ REST Snapshot fallback ทำงานต่อทันที พร้อมคูลดาวน์และลดเพดานชั่วคราวป้องกัน loop error
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.77`** ใน `package.json` และ `src/version.ts`

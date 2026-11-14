@@ -44,6 +44,9 @@ export class AlpacaPortfolioWsClient {
 
   private desiredSymbols: string[] = [];
   private subscribedSymbols = new Set<string>();
+  private lastSyncedSignature = "";
+  private pendingSyncUntil = 0;
+  private effectiveMaxSymbols = ALPACA_WS_MAX_SYMBOLS;
   private lastPriceBySymbol = new Map<string, number>();
   private lastTickTsBySymbol = new Map<string, number>();
   private quoteStateBySymbol = new Map<string, QuoteBookState>();
@@ -94,6 +97,9 @@ export class AlpacaPortfolioWsClient {
     this.connected = false;
     this.authenticated = false;
     this.subscribedSymbols.clear();
+    this.lastSyncedSignature = "";
+    this.pendingSyncUntil = 0;
+    this.effectiveMaxSymbols = ALPACA_WS_MAX_SYMBOLS;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
@@ -127,7 +133,7 @@ export class AlpacaPortfolioWsClient {
       if (!sym || seen.has(sym)) continue;
       seen.add(sym);
       cleanOrdered.push(sym);
-      if (cleanOrdered.length >= ALPACA_WS_MAX_SYMBOLS) break;
+      if (cleanOrdered.length >= this.effectiveMaxSymbols) break;
     }
     this.desiredSymbols = cleanOrdered;
     if (this.authenticated && this.ws?.readyState === WebSocket.OPEN) {
@@ -147,6 +153,9 @@ export class AlpacaPortfolioWsClient {
     this.connected = false;
     this.authenticated = false;
     this.subscribedSymbols.clear();
+    this.lastSyncedSignature = "";
+    this.pendingSyncUntil = 0;
+    this.effectiveMaxSymbols = ALPACA_WS_MAX_SYMBOLS;
 
     ws.on("open", () => {
       if (this.stopped || this.ws !== ws) return;
@@ -250,7 +259,17 @@ export class AlpacaPortfolioWsClient {
       const code = Number(msg.code || 0);
       const errMsg = String(msg.msg || "unknown error");
       this.log(`⚠️ Alpaca WS error (${code}): ${errMsg}`);
-      if (code === 406) {
+      if (code === 405) {
+        // Subscription rejected by plan limit: clear local confirmed state so REST fallback stays active,
+        // and reduce batch cap slightly before retrying after cooldown.
+        this.subscribedSymbols.clear();
+        this.lastSyncedSignature = "";
+        this.pendingSyncUntil = Date.now() + 10_000;
+        if (this.effectiveMaxSymbols > 15) {
+          this.effectiveMaxSymbols = 15;
+          this.desiredSymbols = this.desiredSymbols.slice(0, this.effectiveMaxSymbols);
+        }
+      } else if (code === 406) {
         // Connection limit exceeded (usually an orphaned session clearing within 60-90s)
         this.reconnectDelayMs = 75_000;
         try {
@@ -269,6 +288,7 @@ export class AlpacaPortfolioWsClient {
         if (clean) active.add(clean);
       }
       this.subscribedSymbols = active;
+      this.pendingSyncUntil = 0;
       return;
     }
 
@@ -330,7 +350,12 @@ export class AlpacaPortfolioWsClient {
   private syncSubscriptions(): void {
     if (!this.authenticated || this.ws?.readyState !== WebSocket.OPEN) return;
 
-    const desiredSet = new Set(this.desiredSymbols);
+    const targetSymbols = this.desiredSymbols.slice(0, this.effectiveMaxSymbols);
+    const sig = targetSymbols.join(",");
+    const now = Date.now();
+    if (now < this.pendingSyncUntil && (!this.lastSyncedSignature || sig === this.lastSyncedSignature)) return;
+
+    const desiredSet = new Set(targetSymbols);
     const toRemove = Array.from(this.subscribedSymbols).filter((s) => !desiredSet.has(s));
 
     if (toRemove.length > 0) {
@@ -341,25 +366,25 @@ export class AlpacaPortfolioWsClient {
           quotes: toRemove,
         }),
       );
-      for (const s of toRemove) {
-        this.subscribedSymbols.delete(s);
-      }
     }
 
-    const remainingCapacity = Math.max(0, ALPACA_WS_MAX_SYMBOLS - this.subscribedSymbols.size);
-    const toAdd = this.desiredSymbols.filter((s) => !this.subscribedSymbols.has(s)).slice(0, remainingCapacity);
+    const keptCount = Array.from(this.subscribedSymbols).filter((s) => desiredSet.has(s)).length;
+    const remainingCapacity = Math.max(0, this.effectiveMaxSymbols - keptCount);
+    const toAdd = targetSymbols.filter((s) => !this.subscribedSymbols.has(s)).slice(0, remainingCapacity);
 
     if (toAdd.length > 0) {
+      // Subscribe strictly to `trades` (1 slot per symbol vs trades+quotes counting 2x against Alpaca's 30 limit)
       this.ws.send(
         JSON.stringify({
           action: "subscribe",
           trades: toAdd,
-          quotes: toAdd,
         }),
       );
-      for (const s of toAdd) {
-        this.subscribedSymbols.add(s);
-      }
+    }
+
+    if (toRemove.length > 0 || toAdd.length > 0) {
+      this.lastSyncedSignature = sig;
+      this.pendingSyncUntil = now + 5_000;
     }
   }
 }
