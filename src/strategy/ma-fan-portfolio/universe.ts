@@ -3,6 +3,9 @@ import type { Config } from "../../config.js";
 import { calcEMA } from "../ma-fan/ribbon.js";
 import { calcMACD, calcRSI } from "../ma-fan/exhaustion.js";
 import { fetchAlpacaBars, fetchAlpacaMultiBars, fetchAlpacaMultiSnapshots, intervalToSeconds, normalizeStockSymbol } from "../../exchange/alpaca/feed.js";
+import { getActiveBinanceTradingSymbols } from "../../exchange/binance/client.js";
+import { STABLE_TOKENS } from "../../backtest-service.js";
+import { isSyntheticOrStock } from "../../pair-rotator.js";
 import { filterChangedCandles, mergeCandles, type PgStore } from "../../pg-store.js";
 import type { SymbolIndicatorSnapshot } from "./types.js";
 
@@ -24,10 +27,6 @@ export const US_STOCK_TOP25_UNIVERSE = [
   "AVGO", "AMD", "QCOM", "IBM", "CSCO", "KO", "PEP", "WMT", "PFE", "UNH",
   "JPM", "WFC", "V", "XOM", "T",
 ];
-
-const STABLE_TOKENS = new Set([
-  "USDT", "FDUSD", "USDC", "TUSD", "USDP", "DAI", "BUSD", "EURI", "EUR", "AEUR", "USD1", "RLUSD",
-]);
 
 export function resolvePortfolioUniverseSymbols(
   exchangeName: string,
@@ -95,14 +94,19 @@ export async function discoverBinancePortfolioSymbols(
   const bl = new Set(blacklist.map((s) => s.toUpperCase().trim()));
   const minVol = quoteAsset === "FDUSD" ? 500_000 : 3_000_000;
   try {
-    const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/api/v3/ticker/24hr`);
+    const [res, activeTradingSymbols] = await Promise.all([
+      fetch(`${baseUrl.replace(/\/+$/, "")}/api/v3/ticker/24hr`),
+      getActiveBinanceTradingSymbols().catch(() => new Set<string>()),
+    ]);
     if (!res.ok) return [];
     const tickers = (await res.json()) as Array<{ symbol: string; quoteVolume: string }>;
     const filtered = tickers.filter((t) => {
       const sym = String(t.symbol || "").toUpperCase();
+      if (activeTradingSymbols.size > 0 && !activeTradingSymbols.has(sym)) return false;
       if (!sym.endsWith(quoteAsset)) return false;
       const base = sym.slice(0, -quoteAsset.length);
       if (STABLE_TOKENS.has(base)) return false;
+      if (isSyntheticOrStock(sym)) return false;
       if (bl.has(sym)) return false;
       return Number(t.quoteVolume) >= minVol;
     });

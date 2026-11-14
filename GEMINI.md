@@ -9799,3 +9799,12 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - ปรับ `fetchAlpacaCandles` และ `fetchBinanceCandles` ให้อ่านจาก PostgreSQL `market_candles` ก่อน ถ้าข้อมูลเก่ากว่ากรอบเวลาให้ดึงต่อเฉพาะหางที่ขาด (incremental tail-fill) แล้ว upsert ลงตารางเดียวกันกับ Live Bot (เก็บ JSON disk cache ไว้เป็น fallback เมื่อไม่ได้ตั้ง `DATABASE_URL`)
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.81`** ใน `package.json` และ `src/version.ts`
+
+---
+
+## 326. v0.3.0.82 — Binance Live Portfolio Radar Stablecoin & Synthetic Stock Filter (`src/strategy/ma-fan-portfolio/universe.ts`)
+
+- **Shared Universe Filtering**:
+  - ปรับ `discoverBinancePortfolioSymbols` ใน `src/strategy/ma-fan-portfolio/universe.ts` ให้ใช้ `STABLE_TOKENS` (รวม `U`, `USD1`, `USD0`, `XUSD`, `PYUSD`, `PAXG`, `XAUT`, `RWUSD`, `BFUSD`, `USDE`, ฯลฯ จาก `src/backtest-service.ts`), `isSyntheticOrStock` (ตัดหุ้น Tokenized เช่น `SPCXBUSDT`, `NVDABUSDT` ฯลฯ จาก `src/pair-rotator.ts`) และ `getActiveBinanceTradingSymbols()` (กรองคู่ที่ไม่ได้ `TRADING`) ร่วมกับตัวสแกน Backtest โดยไม่ทำซ้ำ
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.82`** ใน `package.json` และ `src/version.ts`
