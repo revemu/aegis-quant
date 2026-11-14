@@ -830,8 +830,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
 
   private async refreshUniverseBars(): Promise<void> {
     const existingPrices = new Map<string, number>();
+    const existingCandles = new Map<string, { c15: Candle[]; c1h: Candle[] }>();
     for (const [sym, snap] of this.snapshots.entries()) {
       existingPrices.set(sym, snap.livePrice);
+      existingCandles.set(sym, { c15: snap.c15, c1h: snap.c1h });
     }
 
     const res = await fetchPortfolioUniverseAndBenchmark({
@@ -839,6 +841,14 @@ export class MaFanPortfolioStrategy implements IStrategy {
       cfg: this.cfg,
       alpacaCreds: this.resolveAlpacaCreds(),
       existingLivePrices: existingPrices,
+      existingCandles: existingCandles.size > 0 ? existingCandles : undefined,
+      existingBenchmarkCandles: {
+        c4h: this.benchmark4h,
+        c1d: this.benchmark1d,
+        c15: this.benchmark15m,
+      },
+      pgStore: this.db.getPgStore(),
+      log: (m) => this.log(m),
     });
 
     this.benchmarkSymbol = res.benchmarkSymbol;

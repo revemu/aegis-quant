@@ -15,6 +15,9 @@ import { VolumeProfileEngine } from "./market-structure/volume-profile.js";
 import { SwingSignalDetector } from "./strategy/swing/signals.js";
 import type { SwingStrategyConfig } from "./strategy/swing/config.js";
 import { getActiveBinanceTradingSymbols } from "./exchange/binance/client.js";
+import { intervalToSeconds } from "./exchange/alpaca/feed.js";
+import { getDatabase } from "./db.js";
+import { filterChangedCandles, mergeCandles, type PgStore } from "./pg-store.js";
 import { isSyntheticOrStock } from "./pair-rotator.js";
 
 export const STABLE_TOKENS = new Set([
@@ -491,6 +494,14 @@ export class BacktestService {
     return this.latestRotationResult;
   }
 
+  private static getPgStore(): PgStore | null {
+    try {
+      return getDatabase().getPgStore();
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * 🧬 Market DNA Evaluator for Dynamic Grid Suitability
    * Evaluates intrinsic structural price-action characteristics via Dual-Window Recency:
@@ -854,9 +865,34 @@ export class BacktestService {
       return cached.candles.slice(-limit);
     }
 
-    // 2. Persistent Disk Cache: check data/cache/klines/ for previously saved historical bars
+    const pg = this.getPgStore();
+    const ivSec = intervalToSeconds(interval);
+    const effectiveLimit = Math.max(3000, Math.min(8000, limit + 850));
+    let dbCandles: Candle[] = [];
+
+    // 2. PostgreSQL shared `market_candles` incremental cache
+    if (pg) {
+      try {
+        dbCandles = (await pg.loadMarketCandles("alpaca", cleanSym, interval, effectiveLimit)).filter(
+          (c) => c.isClosed !== false,
+        );
+        if (dbCandles.length >= limit) {
+          const lastCandleTime = dbCandles[dbCandles.length - 1]?.time || 0;
+          const ageSec = Math.floor(nowMs / 1000) - lastCandleTime;
+          if (ageSec < Math.max(ivSec, 900)) {
+            console.log(`[CandleFeed] 🐘 PG Cache HIT for Alpaca ${cleanSym} (${interval}) -> ${dbCandles.length} candles`);
+            this.candleCache.set(cacheKey, { timestamp: nowMs, candles: dbCandles });
+            return dbCandles.slice(-limit);
+          }
+        }
+      } catch (err) {
+        console.warn(`[CandleFeed] ⚠️ PG read fallback for Alpaca ${cleanSym}: ${(err as Error).message}`);
+      }
+    }
+
+    // 3. Persistent Disk Cache (fallback when PostgreSQL is not active)
     const diskPath = path.join(BacktestService.KLINE_CACHE_DIR, `alpaca_${cleanSym}_${interval}.json`);
-    if (!cached && fs.existsSync(diskPath)) {
+    if (!pg && !cached && fs.existsSync(diskPath)) {
       try {
         const raw = fs.readFileSync(diskPath, "utf8");
         const parsed = JSON.parse(raw);
@@ -877,12 +913,11 @@ export class BacktestService {
 
     // Map timeframe
     let tf = "15Min";
-    let intervalMinutes = 15;
-    if (interval === "1m") { tf = "1Min"; intervalMinutes = 1; }
-    else if (interval === "5m") { tf = "5Min"; intervalMinutes = 5; }
-    else if (interval === "15m") { tf = "15Min"; intervalMinutes = 15; }
-    else if (interval === "1h") { tf = "1Hour"; intervalMinutes = 60; }
-    else if (interval === "1d") { tf = "1Day"; intervalMinutes = 1440; }
+    if (interval === "1m") tf = "1Min";
+    else if (interval === "5m") tf = "5Min";
+    else if (interval === "15m") tf = "15Min";
+    else if (interval === "1h") tf = "1Hour";
+    else if (interval === "1d") tf = "1Day";
 
     // In US Equities: 6.5 trading hours/day (390 mins), 5 days/week.
     // On Alpaca IEX feed, 15m averages ~9-10 bars/calendar day across weekends & holidays.
@@ -893,17 +928,24 @@ export class BacktestService {
     else if (interval === "1h") barsPerCalendarDay = 4.6;
     else if (interval === "1d") barsPerCalendarDay = 0.71;
 
-    // For US stocks, fetch up to 3,000 bars using sort=desc so bars are guaranteed to be the most recent up to now!
-    const effectiveLimit = Math.max(3000, Math.min(8000, limit + 850));
+    const isIncremental = dbCandles.length >= limit;
+    const lastDbTime = isIncremental ? dbCandles[dbCandles.length - 1]?.time || 0 : 0;
     const daysBack = Math.max(120, Math.ceil(effectiveLimit / barsPerCalendarDay) + 30);
-    const startDate = new Date(nowMs - daysBack * 86400 * 1000);
+    const startDate =
+      isIncremental && lastDbTime > 0
+        ? new Date(Math.max(1, lastDbTime - ivSec * 2) * 1000)
+        : new Date(nowMs - daysBack * 86400 * 1000);
     const startIso = startDate.toISOString().split(".")[0] + "Z";
 
     const apiKey = process.env.ALPACA_API_KEY || "PKYAVG2YEWF3SWIPPJT3C42TVG";
     const apiSecret = process.env.ALPACA_API_SECRET || "2boZiaaqiLDfDEM9XSULbXq2iW69B9WcAEPu234MeuN2";
     const dataUrl = process.env.ALPACA_DATA_URL || "https://data.alpaca.markets";
 
-    console.log(`[CandleFeed] 📥 Alpaca ${cleanSym} (${interval}): Fetching up to ${effectiveLimit} bars (descending to now)...`);
+    console.log(
+      isIncremental
+        ? `[CandleFeed] 🐘 Alpaca ${cleanSym} (${interval}): Incremental sync from PG (${dbCandles.length} cached)...`
+        : `[CandleFeed] 📥 Alpaca ${cleanSym} (${interval}): Fetching up to ${effectiveLimit} bars (descending to now)...`,
+    );
 
     let candles: Candle[] = [];
     let pageToken: string | undefined = undefined;
@@ -943,21 +985,26 @@ export class BacktestService {
       attempts++;
     } while (pageToken && candles.length < effectiveLimit && attempts < 15);
 
-    const map = new Map<number, Candle>();
-    for (const c of candles) map.set(c.time, c);
-    const sorted = Array.from(map.values()).sort((a, b) => a.time - b.time);
+    const merged = mergeCandles(dbCandles, candles);
 
-    if (sorted.length > 0) {
-      this.candleCache.set(cacheKey, { timestamp: nowMs, candles: sorted });
-      try {
-        if (!fs.existsSync(BacktestService.KLINE_CACHE_DIR)) {
-          fs.mkdirSync(BacktestService.KLINE_CACHE_DIR, { recursive: true });
+    if (merged.length > 0) {
+      this.candleCache.set(cacheKey, { timestamp: nowMs, candles: merged });
+      if (pg) {
+        const changed = filterChangedCandles(dbCandles, candles);
+        if (changed.length > 0) {
+          await pg.upsertMarketCandles("alpaca", cleanSym, interval, changed).catch(() => {});
         }
-        fs.writeFileSync(diskPath, JSON.stringify({ timestamp: nowMs, candles: sorted }), "utf8");
-      } catch {}
+      } else {
+        try {
+          if (!fs.existsSync(BacktestService.KLINE_CACHE_DIR)) {
+            fs.mkdirSync(BacktestService.KLINE_CACHE_DIR, { recursive: true });
+          }
+          fs.writeFileSync(diskPath, JSON.stringify({ timestamp: nowMs, candles: merged }), "utf8");
+        } catch {}
+      }
     }
 
-    return sorted.slice(-limit);
+    return merged.slice(-limit);
   }
 
   /**
@@ -979,9 +1026,66 @@ export class BacktestService {
       return cached.candles.slice(-limit);
     }
 
-    // 2. Persistent Disk Cache: check data/cache/klines/ for previously saved historical bars
+    const pg = this.getPgStore();
+    const ivSec = intervalToSeconds(interval);
+    const maxCandles = Math.min(60000, Math.max(50, limit));
+    let dbCandles: Candle[] = [];
+
+    // 2. PostgreSQL shared `market_candles` incremental cache
+    if (pg) {
+      try {
+        dbCandles = (await pg.loadMarketCandles("binance", cleanSym, interval, maxCandles)).filter(
+          (c) => c.isClosed !== false,
+        );
+        if (dbCandles.length >= limit) {
+          const lastCandleTime = dbCandles[dbCandles.length - 1]?.time || 0;
+          const ageSec = Math.floor(nowMs / 1000) - lastCandleTime;
+          if (ageSec < ivSec) {
+            console.log(`[CandleFeed] 🐘 PG Cache HIT for ${cleanSym} (${interval}) -> ${dbCandles.length} candles`);
+            this.candleCache.set(cacheKey, { timestamp: nowMs, candles: dbCandles });
+            return dbCandles.slice(-limit);
+          }
+          if (ageSec < ivSec * 900) {
+            const startTimeMs = Math.max(1, (lastCandleTime - ivSec * 2) * 1000);
+            const incUrl = `https://api.binance.com/api/v3/klines?symbol=${cleanSym}&interval=${interval}&limit=1000&startTime=${startTimeMs}`;
+            const incRes = await fetch(incUrl, { headers: { "User-Agent": "dynamic-grid-bn/backtest" } });
+            if (incRes.ok) {
+              const incRaw = (await incRes.json()) as any[];
+              const incoming: Candle[] = [];
+              if (Array.isArray(incRaw)) {
+                for (const k of incRaw) {
+                  const time = Math.floor(Number(k[0]) / 1000);
+                  const closeTimeMs = Number(k[6]);
+                  if (Number.isFinite(closeTimeMs) && closeTimeMs > nowMs) continue;
+                  const open = Number(k[1]);
+                  const high = Number(k[2]);
+                  const low = Number(k[3]);
+                  const close = Number(k[4]);
+                  const volume = Number(k[5]) || 0;
+                  if ([time, open, high, low, close].every(Number.isFinite) && close > 0) {
+                    incoming.push({ time, open, high, low, close, volume, isClosed: true });
+                  }
+                }
+              }
+              const merged = mergeCandles(dbCandles, incoming, maxCandles);
+              const changed = filterChangedCandles(dbCandles, incoming);
+              if (changed.length > 0) {
+                await pg.upsertMarketCandles("binance", cleanSym, interval, changed).catch(() => {});
+              }
+              this.candleCache.set(cacheKey, { timestamp: nowMs, candles: merged });
+              console.log(`[CandleFeed] 🐘 ${cleanSym} (${interval}): PG incremental +${changed.length} bars -> ${merged.length} candles`);
+              return merged.slice(-limit);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn(`[CandleFeed] ⚠️ PG read fallback for ${cleanSym}: ${(err as Error).message}`);
+      }
+    }
+
+    // 3. Persistent Disk Cache (fallback when PostgreSQL is not active)
     const diskPath = path.join(BacktestService.KLINE_CACHE_DIR, `${cleanSym}_${interval}.json`);
-    if (!cached && fs.existsSync(diskPath)) {
+    if (!pg && !cached && fs.existsSync(diskPath)) {
       try {
         const raw = fs.readFileSync(diskPath, "utf8");
         const parsed = JSON.parse(raw);
@@ -1033,31 +1137,37 @@ export class BacktestService {
 
       const sorted = candles.sort((a, b) => a.time - b.time);
       this.candleCache.set(cacheKey, { timestamp: nowMs, candles: sorted });
-      try {
-        if (!fs.existsSync(BacktestService.KLINE_CACHE_DIR)) {
-          fs.mkdirSync(BacktestService.KLINE_CACHE_DIR, { recursive: true });
+      if (pg) {
+        const changed = filterChangedCandles(dbCandles, sorted);
+        if (changed.length > 0) {
+          await pg.upsertMarketCandles("binance", cleanSym, interval, changed).catch(() => {});
         }
-        let shouldWrite = true;
-        if (fs.existsSync(diskPath)) {
-          try {
-            const existing = JSON.parse(fs.readFileSync(diskPath, "utf8"));
-            if (Array.isArray(existing?.candles) && existing.candles.length > sorted.length) {
-              shouldWrite = false;
-            }
-          } catch {}
-        }
-        if (shouldWrite) {
-          fs.writeFileSync(diskPath, JSON.stringify({ timestamp: nowMs, candles: sorted }), "utf8");
-        }
-      } catch {}
-      console.log(`[CandleFeed] ✅ ${cleanSym} (${interval}): Loaded ${sorted.length} candles (saved to disk cache).`);
+      } else {
+        try {
+          if (!fs.existsSync(BacktestService.KLINE_CACHE_DIR)) {
+            fs.mkdirSync(BacktestService.KLINE_CACHE_DIR, { recursive: true });
+          }
+          let shouldWrite = true;
+          if (fs.existsSync(diskPath)) {
+            try {
+              const existing = JSON.parse(fs.readFileSync(diskPath, "utf8"));
+              if (Array.isArray(existing?.candles) && existing.candles.length > sorted.length) {
+                shouldWrite = false;
+              }
+            } catch {}
+          }
+          if (shouldWrite) {
+            fs.writeFileSync(diskPath, JSON.stringify({ timestamp: nowMs, candles: sorted }), "utf8");
+          }
+        } catch {}
+      }
+      console.log(`[CandleFeed] ✅ ${cleanSym} (${interval}): Loaded ${sorted.length} candles${pg ? " (saved to PG cache)" : " (saved to disk cache)"}.`);
       return sorted;
     }
 
     // Extended Multi-page fetch for up to 120+ days (up to 60,000 candles)
     const candlesMap = new Map<number, Candle>();
     let currentEndTime: number | undefined = undefined;
-    const maxCandles = Math.min(60000, Math.max(50, limit));
     const maxBatches = Math.ceil(maxCandles / 1000) + 3;
 
     console.log(`[CandleFeed] 📥 ${cleanSym} (${interval}): Fetching ${maxCandles} candles from Binance (${maxBatches} batches max)...`);
@@ -1122,17 +1232,24 @@ export class BacktestService {
       throw new Error(`No historical candles returned for ${cleanSym} on ${interval}`);
     }
 
-    const sorted = Array.from(candlesMap.values()).sort((a, b) => a.time - b.time);
-    const resultCandles = sorted.slice(-maxCandles);
+    const fetched = Array.from(candlesMap.values()).sort((a, b) => a.time - b.time);
+    const resultCandles = mergeCandles(dbCandles, fetched, maxCandles);
     this.candleCache.set(cacheKey, { timestamp: Date.now(), candles: resultCandles });
-    try {
-      if (!fs.existsSync(BacktestService.KLINE_CACHE_DIR)) {
-        fs.mkdirSync(BacktestService.KLINE_CACHE_DIR, { recursive: true });
+    if (pg) {
+      const changed = filterChangedCandles(dbCandles, fetched);
+      if (changed.length > 0) {
+        await pg.upsertMarketCandles("binance", cleanSym, interval, changed).catch(() => {});
       }
-      fs.writeFileSync(diskPath, JSON.stringify({ timestamp: Date.now(), candles: resultCandles }), "utf8");
-    } catch {}
-    console.log(`[CandleFeed] ✅ ${cleanSym} (${interval}): Successfully loaded ${resultCandles.length} candles (saved to disk cache).`);
-    return resultCandles;
+    } else {
+      try {
+        if (!fs.existsSync(BacktestService.KLINE_CACHE_DIR)) {
+          fs.mkdirSync(BacktestService.KLINE_CACHE_DIR, { recursive: true });
+        }
+        fs.writeFileSync(diskPath, JSON.stringify({ timestamp: Date.now(), candles: resultCandles }), "utf8");
+      } catch {}
+    }
+    console.log(`[CandleFeed] ✅ ${cleanSym} (${interval}): Successfully loaded ${resultCandles.length} candles${pg ? " (saved to PG cache)" : " (saved to disk cache)"}.`);
+    return resultCandles.slice(-limit);
   }
 
   /**

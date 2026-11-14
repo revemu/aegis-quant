@@ -11,6 +11,57 @@
 
 import postgres, { type Sql } from "postgres";
 import type { BotDatabaseSchema, StrategyStateRecord, UnifiedOrderRecord } from "./db.js";
+import type { Candle } from "./market-structure.js";
+
+/**
+ * Merge historical & freshly fetched candles by timestamp (ascending), keeping at most `maxKeep` latest bars.
+ */
+export function mergeCandles(existing: Candle[], incoming: Candle[], maxKeep?: number): Candle[] {
+  const map = new Map<number, Candle>();
+  for (const c of existing) {
+    const t = Math.floor(Number(c?.time));
+    if (Number.isFinite(t) && Number.isFinite(c?.close) && c.close > 0) {
+      map.set(t, { ...c, time: t });
+    }
+  }
+  for (const c of incoming) {
+    const t = Math.floor(Number(c?.time));
+    if (Number.isFinite(t) && Number.isFinite(c?.close) && c.close > 0) {
+      map.set(t, { ...c, time: t });
+    }
+  }
+  const sorted = Array.from(map.values()).sort((a, b) => a.time - b.time);
+  return maxKeep && maxKeep > 0 && sorted.length > maxKeep ? sorted.slice(-maxKeep) : sorted;
+}
+
+/**
+ * Return only bars from `incoming` that are new or have updated OHLCV/closed status compared to `existing`.
+ */
+export function filterChangedCandles(existing: Candle[], incoming: Candle[]): Candle[] {
+  if (incoming.length === 0) return [];
+  const prevByTime = new Map<number, Candle>();
+  for (const c of existing) {
+    if (c && Number.isFinite(c.time)) prevByTime.set(Math.floor(c.time), c);
+  }
+  const changed: Candle[] = [];
+  for (const c of incoming) {
+    const t = Math.floor(Number(c?.time));
+    if (!Number.isFinite(t) || !Number.isFinite(c?.close) || c.close <= 0) continue;
+    const prev = prevByTime.get(t);
+    if (
+      !prev ||
+      prev.open !== c.open ||
+      prev.high !== c.high ||
+      prev.low !== c.low ||
+      prev.close !== c.close ||
+      (prev.volume ?? 0) !== (c.volume ?? 0) ||
+      (prev.isClosed !== false) !== (c.isClosed !== false)
+    ) {
+      changed.push({ ...c, time: t });
+    }
+  }
+  return changed;
+}
 
 function sanitizeJson<T>(val: T): T {
   return JSON.parse(JSON.stringify(val ?? null)) as T;
@@ -489,6 +540,201 @@ export class PgStore {
     for (const delUid of deletedOrderUids) {
       this.lastOrderHashes.delete(delUid);
     }
+  }
+
+  // ── Shared Market Candles Cache (`market_candles`) ─────────────────────────
+
+  public async loadMarketCandles(
+    exchange: string,
+    symbol: string,
+    timeframe: string,
+    limit: number,
+  ): Promise<Candle[]> {
+    const cleanSym = symbol.toUpperCase().trim();
+    if (!cleanSym) return [];
+    const batch = await this.loadMarketCandlesBatch(exchange, [cleanSym], timeframe, limit);
+    return batch.get(cleanSym) ?? [];
+  }
+
+  public async loadMarketCandlesBatch(
+    exchange: string,
+    symbols: string[],
+    timeframe: string,
+    limit: number,
+  ): Promise<Map<string, Candle[]>> {
+    const result = new Map<string, Candle[]>();
+    const cleanSyms = Array.from(new Set(symbols.map((s) => s.toUpperCase().trim()).filter(Boolean)));
+    if (cleanSyms.length === 0 || limit <= 0) return result;
+
+    const ex = exchange.toLowerCase().trim();
+    const tf = timeframe.toLowerCase().trim();
+    const safeLimit = Math.max(1, Math.min(Math.floor(limit), 100_000));
+
+    type CandleRow = {
+      symbol: string;
+      time_sec: string | number;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      volume: number;
+      is_closed: boolean;
+    };
+
+    const rows = await this.sql<CandleRow[]>`
+      WITH ranked AS (
+        SELECT
+          symbol,
+          time_sec,
+          open,
+          high,
+          low,
+          close,
+          volume,
+          is_closed,
+          ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY time_sec DESC) AS rn
+        FROM market_candles
+        WHERE exchange = ${ex}
+          AND timeframe = ${tf}
+          AND symbol IN ${this.sql(cleanSyms)}
+      )
+      SELECT symbol, time_sec, open, high, low, close, volume, is_closed
+      FROM ranked
+      WHERE rn <= ${safeLimit}
+      ORDER BY symbol ASC, time_sec ASC
+    `;
+
+    for (const r of rows) {
+      const sym = String(r.symbol).toUpperCase().trim();
+      const time = Number(r.time_sec);
+      if (!Number.isFinite(time) || !Number.isFinite(r.close) || r.close <= 0) continue;
+      let list = result.get(sym);
+      if (!list) {
+        list = [];
+        result.set(sym, list);
+      }
+      list.push({
+        time,
+        open: Number(r.open),
+        high: Number(r.high),
+        low: Number(r.low),
+        close: Number(r.close),
+        volume: Number(r.volume ?? 0),
+        isClosed: Boolean(r.is_closed),
+      });
+    }
+
+    return result;
+  }
+
+  public async upsertMarketCandles(
+    exchange: string,
+    symbol: string,
+    timeframe: string,
+    candles: Candle[],
+  ): Promise<number> {
+    return this.upsertMarketCandlesBatch([{ exchange, symbol, timeframe, candles }]);
+  }
+
+  public async upsertMarketCandlesBatch(
+    items: Array<{ exchange: string; symbol: string; timeframe: string; candles: Candle[] }>,
+  ): Promise<number> {
+    if (this.closed || items.length === 0) return 0;
+
+    const nowMs = Date.now();
+    const dedup = new Map<
+      string,
+      {
+        exchange: string;
+        symbol: string;
+        timeframe: string;
+        time_sec: number;
+        open: number;
+        high: number;
+        low: number;
+        close: number;
+        volume: number;
+        is_closed: boolean;
+        updated_at: number;
+      }
+    >();
+
+    for (const item of items) {
+      const ex = item.exchange.toLowerCase().trim();
+      const sym = item.symbol.toUpperCase().trim();
+      const tf = item.timeframe.toLowerCase().trim();
+      if (!ex || !sym || !tf || !Array.isArray(item.candles) || item.candles.length === 0) continue;
+
+      for (const c of item.candles) {
+        const timeSec = Math.floor(Number(c?.time));
+        const open = Number(c?.open);
+        const high = Number(c?.high);
+        const low = Number(c?.low);
+        const close = Number(c?.close);
+        const volume = Number.isFinite(Number(c?.volume)) ? Number(c?.volume) : 0;
+        if (
+          !Number.isFinite(timeSec) ||
+          !Number.isFinite(open) ||
+          !Number.isFinite(high) ||
+          !Number.isFinite(low) ||
+          !Number.isFinite(close) ||
+          close <= 0
+        ) {
+          continue;
+        }
+        const key = `${ex}|${sym}|${tf}|${timeSec}`;
+        dedup.set(key, {
+          exchange: ex,
+          symbol: sym,
+          timeframe: tf,
+          time_sec: timeSec,
+          open,
+          high,
+          low,
+          close,
+          volume,
+          is_closed: c.isClosed !== false,
+          updated_at: nowMs,
+        });
+      }
+    }
+
+    const rows = Array.from(dedup.values());
+    if (rows.length === 0) return 0;
+
+    await this.sql.begin(async (tx) => {
+      const q = tx as unknown as Sql;
+      // 11 columns/row * 500 rows = 5,500 params, safely under Postgres's 65,535 param cap
+      for (let i = 0; i < rows.length; i += 500) {
+        const chunk = rows.slice(i, i + 500);
+        await q`
+          INSERT INTO market_candles ${q(
+            chunk,
+            "exchange",
+            "symbol",
+            "timeframe",
+            "time_sec",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "is_closed",
+            "updated_at",
+          )}
+          ON CONFLICT (exchange, symbol, timeframe, time_sec) DO UPDATE SET
+            open = EXCLUDED.open,
+            high = EXCLUDED.high,
+            low = EXCLUDED.low,
+            close = EXCLUDED.close,
+            volume = EXCLUDED.volume,
+            is_closed = EXCLUDED.is_closed,
+            updated_at = EXCLUDED.updated_at
+        `;
+      }
+    });
+
+    return rows.length;
   }
 
   public async close(): Promise<void> {

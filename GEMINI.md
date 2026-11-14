@@ -9782,3 +9782,20 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - คงอ่านจาก RAM แบบ Synchronous เพื่อไม่ให้ Tick loop ช้าลง และซิงก์เฉพาะส่วนที่เปลี่ยนแปลง (diff-based batch transaction) ลง PostgreSQL พร้อม `await closeAsync()` เมื่อปิดบอท
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.80`** ใน `package.json` และ `src/version.ts` (แก้ไข typecheck field `executedQty` ใน `src/pg-store.ts`)
+
+---
+
+## 325. v0.3.0.81 — PostgreSQL Incremental Candle Cache (`market_candles`) [Step 3]
+
+- **Shared Candle Batch Store & Diff Helpers (`src/pg-store.ts`)**:
+  - เพิ่ม `mergeCandles` และ `filterChangedCandles` (กรองเขียนเฉพาะแท่งใหม่หรือแท่งที่ OHLCV/`is_closed` เปลี่ยนแปลง ช่วยให้ช่วงตลาดปิดเกิด 0 DB writes)
+  - เพิ่ม `loadMarketCandles`, `loadMarketCandlesBatch` (ดึงทั้ง Universe ใน 1 SQL query ด้วย `ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY time_sec DESC)`), `upsertMarketCandles`, `upsertMarketCandlesBatch` (`ON CONFLICT DO UPDATE` chunk ละ 500 แถว)
+- **Alpaca Feed Incremental Support (`src/exchange/alpaca/feed.ts`)**:
+  - เพิ่มออปชัน `startTimeSec?: number` ให้ `fetchAlpacaBars` และ `fetchAlpacaMultiBars` เพื่อดึงเฉพาะแท่งล่าสุดต่อจากแคช (เช่นตั้งแต่ `minRecentWarmTime - 4 * intervalSec`) โดยไม่ต้องสแกนย้อนหลัง 17 วันทุกรอบ
+- **Live Portfolio Scanner Incremental Fetch (`src/strategy/ma-fan-portfolio/universe.ts`, `src/strategy/ma-fan-portfolio/index.ts`)**:
+  - `MaFanPortfolioStrategy.refreshUniverseBars()` ส่งแคชใน RAM (`existingCandles`, `existingBenchmarkCandles`) และ `pgStore` เข้า `fetchPortfolioUniverseAndBenchmark()`
+  - ตอนบูตโหลดจาก PostgreSQL `market_candles` แล้วดึงเพิ่มเฉพาะส่วนที่ขาด; รอบ 60 วินาทีดึงเฉพาะแท่งล่าสุดไม่กี่แท่งมา merge และ upsert เฉพาะแท่งที่เปลี่ยนแปลง (รองรับทั้ง Alpaca และ Binance)
+- **Backtest Candle Cache (`src/backtest-service.ts`)**:
+  - ปรับ `fetchAlpacaCandles` และ `fetchBinanceCandles` ให้อ่านจาก PostgreSQL `market_candles` ก่อน ถ้าข้อมูลเก่ากว่ากรอบเวลาให้ดึงต่อเฉพาะหางที่ขาด (incremental tail-fill) แล้ว upsert ลงตารางเดียวกันกับ Live Bot (เก็บ JSON disk cache ไว้เป็น fallback เมื่อไม่ได้ตั้ง `DATABASE_URL`)
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.81`** ใน `package.json` และ `src/version.ts`

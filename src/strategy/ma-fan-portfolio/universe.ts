@@ -2,7 +2,8 @@ import type { Candle } from "../../market-structure.js";
 import type { Config } from "../../config.js";
 import { calcEMA } from "../ma-fan/ribbon.js";
 import { calcMACD, calcRSI } from "../ma-fan/exhaustion.js";
-import { fetchAlpacaBars, fetchAlpacaMultiBars, fetchAlpacaMultiSnapshots, normalizeStockSymbol } from "../../exchange/alpaca/feed.js";
+import { fetchAlpacaBars, fetchAlpacaMultiBars, fetchAlpacaMultiSnapshots, intervalToSeconds, normalizeStockSymbol } from "../../exchange/alpaca/feed.js";
+import { filterChangedCandles, mergeCandles, type PgStore } from "../../pg-store.js";
 import type { SymbolIndicatorSnapshot } from "./types.js";
 
 export const US_STOCK_TOP49_UNIVERSE = [
@@ -56,8 +57,17 @@ export function resolvePortfolioUniverseSymbols(
   return [];
 }
 
-async function fetchBinanceKlinesSimple(symbol: string, interval: string, limit: number, baseUrl: string): Promise<Candle[]> {
-  const url = `${baseUrl.replace(/\/+$/, "")}/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${Math.min(1000, limit)}`;
+async function fetchBinanceKlinesSimple(
+  symbol: string,
+  interval: string,
+  limit: number,
+  baseUrl: string,
+  startTimeMs?: number,
+): Promise<Candle[]> {
+  let url = `${baseUrl.replace(/\/+$/, "")}/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${Math.min(1000, limit)}`;
+  if (startTimeMs && startTimeMs > 0) {
+    url += `&startTime=${Math.floor(startTimeMs)}`;
+  }
   const res = await fetch(url);
   if (!res.ok) return [];
   const raw = (await res.json()) as any[];
@@ -145,34 +155,154 @@ export async function fetchPortfolioUniverseAndBenchmark(opts: {
   cfg: Config;
   alpacaCreds: { apiKey: string; apiSecret: string; dataUrl: string };
   existingLivePrices?: Map<string, number>;
+  existingCandles?: Map<string, { c15: Candle[]; c1h: Candle[] }>;
+  existingBenchmarkCandles?: { c4h?: Candle[]; c1d?: Candle[]; c15?: Candle[] };
+  pgStore?: PgStore | null;
+  log?: (msg: string) => void;
 }): Promise<UniverseFetchResult> {
   const ex = (opts.exchangeName || "binance").toLowerCase();
   const isAlpaca = ex === "alpaca";
+  const pg = opts.pgStore ?? null;
+  const upsertItems: Array<{ exchange: string; symbol: string; timeframe: string; candles: Candle[] }> = [];
+
+  const queueCandleChanges = (exchange: string, symbol: string, timeframe: string, prev: Candle[], incoming: Candle[]) => {
+    if (!pg || incoming.length === 0) return;
+    const changed = filterChangedCandles(prev, incoming);
+    if (changed.length > 0) {
+      upsertItems.push({ exchange, symbol, timeframe, candles: changed });
+    }
+  };
 
   if (isAlpaca) {
     const symbols = resolvePortfolioUniverseSymbols("alpaca", opts.cfg);
     const allSyms = Array.from(new Set(["SPY", ...symbols]));
 
+    const fetchAlpacaBatchCached = async (
+      interval: "15m" | "1h",
+      targetLimit: number,
+    ): Promise<Map<string, Candle[]>> => {
+      const ivSec = intervalToSeconds(interval);
+      const cachedMap = new Map<string, Candle[]>();
+      const missingInRam: string[] = [];
+
+      for (const sym of allSyms) {
+        const mem = opts.existingCandles?.get(sym);
+        const memArr = interval === "15m" ? mem?.c15 : mem?.c1h;
+        if (memArr && memArr.length >= targetLimit) {
+          cachedMap.set(sym, memArr);
+        } else if (sym === "SPY" && interval === "15m" && opts.existingBenchmarkCandles?.c15 && opts.existingBenchmarkCandles.c15.length >= targetLimit) {
+          cachedMap.set(sym, opts.existingBenchmarkCandles.c15);
+        } else {
+          missingInRam.push(sym);
+        }
+      }
+
+      if (pg && missingInRam.length > 0) {
+        try {
+          const dbBatch = await pg.loadMarketCandlesBatch("alpaca", missingInRam, interval, targetLimit);
+          for (const [sym, bars] of dbBatch.entries()) {
+            if (bars.length > 0) cachedMap.set(sym, bars);
+          }
+        } catch (err) {
+          opts.log?.(`⚠️ PG candle batch read (${interval}) failed: ${(err as Error).message}`);
+        }
+      }
+
+      let maxWarmTime = 0;
+      for (const bars of cachedMap.values()) {
+        if (bars.length >= targetLimit) {
+          const lastT = bars[bars.length - 1]?.time || 0;
+          if (lastT > maxWarmTime) maxWarmTime = lastT;
+        }
+      }
+
+      const warmSyms: string[] = [];
+      const coldSyms: string[] = [];
+      let minRecentWarmTime = Infinity;
+
+      for (const sym of allSyms) {
+        const bars = cachedMap.get(sym);
+        const lastT = bars?.[bars.length - 1]?.time || 0;
+        if (bars && bars.length >= targetLimit && maxWarmTime > 0 && maxWarmTime - lastT <= 5 * 86_400) {
+          warmSyms.push(sym);
+          if (lastT < minRecentWarmTime) minRecentWarmTime = lastT;
+        } else {
+          coldSyms.push(sym);
+        }
+      }
+
+      const [warmFetched, coldFetched] = await Promise.all([
+        warmSyms.length > 0 && Number.isFinite(minRecentWarmTime)
+          ? fetchAlpacaMultiBars({
+              symbols: warmSyms,
+              interval,
+              limit: targetLimit,
+              startTimeSec: Math.max(1, minRecentWarmTime - ivSec * 4),
+              ...opts.alpacaCreds,
+            })
+          : Promise.resolve(new Map<string, Candle[]>()),
+        coldSyms.length > 0
+          ? fetchAlpacaMultiBars({
+              symbols: coldSyms,
+              interval,
+              limit: targetLimit,
+              ...opts.alpacaCreds,
+            })
+          : Promise.resolve(new Map<string, Candle[]>()),
+      ]);
+
+      const mergedOut = new Map<string, Candle[]>();
+      for (const sym of allSyms) {
+        const prev = cachedMap.get(sym) || [];
+        const incoming = warmFetched.get(sym) || coldFetched.get(sym) || [];
+        const merged = mergeCandles(prev, incoming, targetLimit);
+        mergedOut.set(sym, merged);
+        queueCandleChanges("alpaca", sym, interval, prev, incoming);
+      }
+      return mergedOut;
+    };
+
+    const fetchAlpacaSingleCached = async (
+      symbol: string,
+      interval: "4h" | "1d",
+      targetLimit: number,
+      memBars?: Candle[],
+    ): Promise<Candle[]> => {
+      const ivSec = intervalToSeconds(interval);
+      let prev = memBars && memBars.length >= targetLimit ? memBars : [];
+      if (prev.length < targetLimit && pg) {
+        try {
+          prev = await pg.loadMarketCandles("alpaca", symbol, interval, targetLimit);
+        } catch {}
+      }
+      const lastT = prev.length >= targetLimit ? prev[prev.length - 1]?.time || 0 : 0;
+      const incoming = await fetchAlpacaBars({
+        symbol,
+        interval,
+        limit: targetLimit,
+        startTimeSec: lastT > 0 ? Math.max(1, lastT - ivSec * 3) : undefined,
+        ...opts.alpacaCreds,
+      }).catch(() => [] as Candle[]);
+      queueCandleChanges("alpaca", symbol, interval, prev, incoming);
+      return mergeCandles(prev, incoming, targetLimit);
+    };
+
     const [bars15Map, bars1hMap, snapMap, spy4h, spy1d] = await Promise.all([
-      fetchAlpacaMultiBars({
-        symbols: allSyms,
-        interval: "15m",
-        limit: 260,
-        ...opts.alpacaCreds,
-      }),
-      fetchAlpacaMultiBars({
-        symbols: allSyms,
-        interval: "1h",
-        limit: 120,
-        ...opts.alpacaCreds,
-      }),
+      fetchAlpacaBatchCached("15m", 260),
+      fetchAlpacaBatchCached("1h", 120),
       fetchAlpacaMultiSnapshots({
         symbols: allSyms,
         ...opts.alpacaCreds,
       }),
-      fetchAlpacaBars({ symbol: "SPY", interval: "4h", limit: 120, ...opts.alpacaCreds }).catch(() => [] as Candle[]),
-      fetchAlpacaBars({ symbol: "SPY", interval: "1d", limit: 60, ...opts.alpacaCreds }).catch(() => [] as Candle[]),
+      fetchAlpacaSingleCached("SPY", "4h", 120, opts.existingBenchmarkCandles?.c4h),
+      fetchAlpacaSingleCached("SPY", "1d", 60, opts.existingBenchmarkCandles?.c1d),
     ]);
+
+    if (pg && upsertItems.length > 0) {
+      await pg.upsertMarketCandlesBatch(upsertItems).catch((err) => {
+        opts.log?.(`⚠️ PG candle batch upsert failed: ${(err as Error).message}`);
+      });
+    }
 
     const snapshots = new Map<string, SymbolIndicatorSnapshot>();
     for (const sym of symbols) {
@@ -208,10 +338,52 @@ export async function fetchPortfolioUniverseAndBenchmark(opts: {
   const benchSym = quoteAsset === "FDUSD" ? "BTCFDUSD" : "BTCUSDT";
   const baseUrl = opts.cfg.binanceBaseUrl || "https://api.binance.com";
 
+  // Preload Binance candles from RAM or PostgreSQL batch in 1 query per timeframe
+  const preloadBinanceBatch = async (syms: string[], tf: "15m" | "1h", limit: number): Promise<Map<string, Candle[]>> => {
+    const map = new Map<string, Candle[]>();
+    const needDb: string[] = [];
+    for (const s of syms) {
+      const mem = opts.existingCandles?.get(s);
+      const arr = tf === "15m" ? mem?.c15 : mem?.c1h;
+      if (arr && arr.length >= limit) map.set(s, arr);
+      else needDb.push(s);
+    }
+    if (pg && needDb.length > 0) {
+      const dbMap = await pg.loadMarketCandlesBatch("binance", needDb, tf, limit).catch(() => new Map<string, Candle[]>());
+      for (const [s, bars] of dbMap.entries()) map.set(s, bars);
+    }
+    return map;
+  };
+
+  const fetchBinanceIncremental = async (sym: string, tf: string, targetLimit: number, prev: Candle[]): Promise<Candle[]> => {
+    const ivSec = intervalToSeconds(tf);
+    const nowSec = Math.floor(Date.now() / 1000);
+    const lastT = prev.length >= targetLimit ? prev[prev.length - 1]?.time || 0 : 0;
+    const canIncremental = lastT > 0 && nowSec - lastT < ivSec * 800;
+    const startTimeMs = canIncremental ? Math.max(1, (lastT - ivSec * 3) * 1000) : undefined;
+    const fetchLimit = canIncremental ? Math.min(1000, Math.max(5, Math.ceil((nowSec - lastT) / ivSec) + 5)) : targetLimit;
+    const incoming = await fetchBinanceKlinesSimple(sym, tf, fetchLimit, baseUrl, startTimeMs);
+    queueCandleChanges("binance", sym, tf, prev, incoming);
+    return mergeCandles(prev, incoming, targetLimit);
+  };
+
+  const [db15Map, db1hMap] = await Promise.all([
+    preloadBinanceBatch(symbols, "15m", 260),
+    preloadBinanceBatch(symbols, "1h", 120),
+  ]);
+
+  const loadBench = async (tf: "15m" | "4h" | "1d", limit: number, mem?: Candle[]): Promise<Candle[]> => {
+    let prev = mem && mem.length >= limit ? mem : [];
+    if (prev.length < limit && pg) {
+      prev = await pg.loadMarketCandles("binance", benchSym, tf, limit).catch(() => [] as Candle[]);
+    }
+    return fetchBinanceIncremental(benchSym, tf, limit, prev);
+  };
+
   const [bench15, bench4h, bench1d] = await Promise.all([
-    fetchBinanceKlinesSimple(benchSym, "15m", 260, baseUrl),
-    fetchBinanceKlinesSimple(benchSym, "4h", 120, baseUrl),
-    fetchBinanceKlinesSimple(benchSym, "1d", 60, baseUrl),
+    loadBench("15m", 260, opts.existingBenchmarkCandles?.c15),
+    loadBench("4h", 120, opts.existingBenchmarkCandles?.c4h),
+    loadBench("1d", 60, opts.existingBenchmarkCandles?.c1d),
   ]);
 
   const snapshots = new Map<string, SymbolIndicatorSnapshot>();
@@ -221,14 +393,20 @@ export async function fetchPortfolioUniverseAndBenchmark(opts: {
     await Promise.all(
       chunk.map(async (sym) => {
         const [c15, c1h] = await Promise.all([
-          fetchBinanceKlinesSimple(sym, "15m", 260, baseUrl),
-          fetchBinanceKlinesSimple(sym, "1h", 120, baseUrl),
+          fetchBinanceIncremental(sym, "15m", 260, db15Map.get(sym) || []),
+          fetchBinanceIncremental(sym, "1h", 120, db1hMap.get(sym) || []),
         ]);
         const lp = opts.existingLivePrices?.get(sym);
         const ind = buildSymbolIndicators(sym, c15, c1h, lp);
         if (ind) snapshots.set(sym, ind);
       }),
     );
+  }
+
+  if (pg && upsertItems.length > 0) {
+    await pg.upsertMarketCandlesBatch(upsertItems).catch((err) => {
+      opts.log?.(`⚠️ PG candle batch upsert failed: ${(err as Error).message}`);
+    });
   }
 
   return {

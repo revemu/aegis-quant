@@ -22,6 +22,7 @@ export interface FetchAlpacaBarsParams {
   symbol: string;
   interval: string;
   limit?: number;
+  startTimeSec?: number;
   apiKey: string;
   apiSecret: string;
   dataUrl?: string;
@@ -183,12 +184,17 @@ export async function fetchAlpacaBars(params: FetchAlpacaBarsParams): Promise<Ca
   if (!cleanSym) return [];
 
   const { timeframe, aggregateHours } = mapIntervalToAlpacaTimeframe(params.interval);
-  const requestedLimit = Math.max(10, Math.min(params.limit ?? 300, 10_000));
+  const requestedLimit = Math.max(1, Math.min(params.limit ?? 300, 10_000));
   const rawLimit = Math.min(10_000, requestedLimit * aggregateHours);
   const dataUrl = (params.dataUrl || "https://data.alpaca.markets").replace(/\/+$/, "");
 
-  const daysBack = estimateDaysBack(params.interval, rawLimit);
-  const startIso = new Date(Date.now() - daysBack * 86_400_000).toISOString().split(".")[0] + "Z";
+  const intervalSec = intervalToSeconds(params.interval);
+  const startIso =
+    params.startTimeSec && params.startTimeSec > 0
+      ? new Date(Math.floor(params.startTimeSec / (aggregateHours > 1 ? 14_400 : intervalSec)) * (aggregateHours > 1 ? 14_400 : intervalSec) * 1000)
+          .toISOString()
+          .split(".")[0] + "Z"
+      : new Date(Date.now() - estimateDaysBack(params.interval, rawLimit) * 86_400_000).toISOString().split(".")[0] + "Z";
 
   const headers: Record<string, string> = {};
   if (params.apiKey && params.apiSecret) {
@@ -223,7 +229,6 @@ export async function fetchAlpacaBars(params: FetchAlpacaBarsParams): Promise<Ca
 
   if (rawBars.length === 0) return [];
 
-  const intervalSec = intervalToSeconds(params.interval);
   const nowSec = Math.floor(Date.now() / 1000);
 
   let candles: Candle[] = rawBars
@@ -544,6 +549,7 @@ export async function fetchAlpacaMultiBars(params: {
   symbols: string[];
   interval: string;
   limit?: number;
+  startTimeSec?: number;
   apiKey: string;
   apiSecret: string;
   dataUrl?: string;
@@ -553,11 +559,16 @@ export async function fetchAlpacaMultiBars(params: {
   if (cleanSyms.length === 0) return out;
 
   const { timeframe, aggregateHours } = mapIntervalToAlpacaTimeframe(params.interval);
-  const perSymLimit = Math.max(10, Math.min(params.limit ?? 280, 1000));
+  const perSymLimit = Math.max(1, Math.min(params.limit ?? 280, 1000));
   const intervalSec = intervalToSeconds(params.interval);
   const nowSec = Math.floor(Date.now() / 1000);
-  const daysBack = estimateDaysBack(params.interval, perSymLimit * aggregateHours);
-  const startIso = new Date(Date.now() - daysBack * 86_400_000).toISOString().split(".")[0] + "Z";
+  const alignSec = aggregateHours > 1 ? 14_400 : intervalSec;
+  const startIso =
+    params.startTimeSec && params.startTimeSec > 0
+      ? new Date(Math.floor(params.startTimeSec / alignSec) * alignSec * 1000).toISOString().split(".")[0] + "Z"
+      : new Date(Date.now() - estimateDaysBack(params.interval, Math.max(perSymLimit, 10) * aggregateHours) * 86_400_000)
+          .toISOString()
+          .split(".")[0] + "Z";
 
   const dataUrl = (params.dataUrl || "https://data.alpaca.markets").replace(/\/+$/, "");
   const headers: Record<string, string> = {};
