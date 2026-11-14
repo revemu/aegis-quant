@@ -9753,3 +9753,14 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - หากเกิด `error 405` ให้ล้าง `subscribedSymbols` เพื่อให้ REST Snapshot fallback ทำงานต่อทันที พร้อมคูลดาวน์และลดเพดานชั่วคราวป้องกัน loop error
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.77`** ใน `package.json` และ `src/version.ts`
+
+---
+
+## 323. v0.3.0.78 — Prevent Phantom Flat Candles During Closed/Weekend Alpaca Market Hours (`src/strategy/ma-fan-portfolio/index.ts`)
+
+- **สาเหตุที่พบจากกราฟบน `:3334`**: ในวันเสาร์ที่ตลาด US ปิดทำการ `refreshLiveQuotes()` เคยส่ง `Date.now()` เข้า `updateCandleBarWithLivePrice()` ทำให้เกิดแท่งเทียนแบน (`O=H=L=C, Volume=0`) เพิ่มขึ้นมาทุก 15 นาทีต่อท้ายแท่งปิดตลาดวันศุกร์
+- **การแก้ไขใน `src/strategy/ma-fan-portfolio/index.ts`**:
+  - ใน `refreshLiveQuotes()` (ฝั่ง Alpaca) เปลี่ยนมาใช้เวลาจริงของราคาจาก snapshot (`book.time * 1000`) แทน `Date.now()`
+  - เพิ่มเงื่อนไขงดสร้าง/แก้ไขแท่งเทียนเมื่อ `this.isMarketClosed` หรือ `this.marketClock?.isOpen === false` (ทั้งใน `refreshLiveQuotes()` และ `handleWsPriceUpdate()`) โดยยังคงอัปเดต `ind.livePrice` และส่ง Telemetry ตามปกติ
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.78`** ใน `package.json` และ `src/version.ts`

@@ -283,19 +283,22 @@ export class MaFanPortfolioStrategy implements IStrategy {
   }
 
   private handleWsPriceUpdate(sym: string, price: number, tsMs: number): void {
+    const allowCandleMutation = this.exchange.exchangeName !== "alpaca" || !this.isMarketClosed;
     const ind = this.snapshots.get(sym);
     if (ind) {
       ind.livePrice = price;
-      this.updateCandleBarWithLivePrice(ind.c15, 900, price, tsMs);
-      this.updateCandleBarWithLivePrice(ind.c1h, 3600, price, tsMs);
+      if (allowCandleMutation) {
+        this.updateCandleBarWithLivePrice(ind.c15, 900, price, tsMs);
+        this.updateCandleBarWithLivePrice(ind.c1h, 3600, price, tsMs);
+      }
     }
-    if (sym === this.benchmarkSymbol && this.benchmark15m.length > 0) {
+    if (allowCandleMutation && sym === this.benchmarkSymbol && this.benchmark15m.length > 0) {
       this.updateCandleBarWithLivePrice(this.benchmark15m, 900, price, tsMs);
     }
 
     const isInspected = sym === this.inspectedSymbol;
     const isHeldSlot = this.slots.some((s) => s.symbol === sym);
-    if (isInspected) {
+    if (isInspected && allowCandleMutation) {
       this.emitInspectedChartCandles({ force: false });
     }
     if ((isInspected || isHeldSlot) && Date.now() - this.lastTelemetryEmitTs >= 400) {
@@ -883,13 +886,18 @@ export class MaFanPortfolioStrategy implements IStrategy {
 
       const snaps = await fetchAlpacaMultiSnapshots({ symbols: targetsToPoll, ...creds }).catch(() => new Map());
       let inspectedUpdated = false;
+      const allowCandleMutation = !this.isMarketClosed && this.marketClock?.isOpen !== false;
       for (const [sym, book] of snaps.entries()) {
         const ind = this.snapshots.get(sym);
         if (ind && book.mid > 0) {
           ind.livePrice = book.mid;
-          this.updateCandleBarWithLivePrice(ind.c15, 900, book.mid, nowMs);
-          this.updateCandleBarWithLivePrice(ind.c1h, 3600, book.mid, nowMs);
-          if (sym === this.inspectedSymbol) inspectedUpdated = true;
+          // Use the snapshot's actual quote/trade timestamp and never synthesize flat weekend/off-hours candles
+          const snapTsMs = book.time > 0 ? book.time * 1000 : 0;
+          if (allowCandleMutation && snapTsMs > 0) {
+            const changed15 = this.updateCandleBarWithLivePrice(ind.c15, 900, book.mid, snapTsMs);
+            const changed1h = this.updateCandleBarWithLivePrice(ind.c1h, 3600, book.mid, snapTsMs);
+            if (sym === this.inspectedSymbol && (changed15 || changed1h)) inspectedUpdated = true;
+          }
         }
       }
       if (inspectedUpdated) {
