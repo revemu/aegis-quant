@@ -3,7 +3,8 @@
  * Dow Theory market structure and real-time visual web dashboard.
  */
 
-import { config } from "./config.js";
+import { config, loadConfigFromDatabase } from "./config.js";
+import { getDatabase } from "./db.js";
 import { createExchangeClient, type IExchangeClient } from "./exchange/index.js";
 import { DynamicGrid, createStrategy, normalizeStrategyType, type IStrategy } from "./strategy.js";
 import { VolatilityEngine } from "./volatility.js";
@@ -97,6 +98,10 @@ function buildExchangeAdapter(exchangeName: string, src: Record<string, any>): I
 }
 
 async function main(): Promise<void> {
+  const bootDb = getDatabase({ dbPath: config.dbPath, log });
+  await bootDb.initPostgres();
+  Object.assign(config, loadConfigFromDatabase());
+
   const pairRotator = new AutonomousPairRotator((msg) => log(msg));
   const startupExchange = (config.exchange || "binance").toLowerCase();
   let exchange = buildExchangeAdapter(startupExchange, config);
@@ -1107,6 +1112,7 @@ async function main(): Promise<void> {
   }
 
   grid.stop?.();
+  await grid.getDatabase().closeAsync();
   dashboard.stop();
   macroFeed?.stop();
   tradingFeed?.stop();

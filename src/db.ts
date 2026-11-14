@@ -9,6 +9,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { calculateTradeRounds, type TradeRoundsResult, type TradeRound, type TradeRoundSummary } from "./trade-rounds.js";
+import { PgStore } from "./pg-store.js";
 
 export function formatExplorerUrl(txHash?: string): string | undefined {
   if (!txHash) return undefined;
@@ -257,6 +258,7 @@ export class BotDatabase {
   private flushTimer: NodeJS.Timeout | null = null;
   private maxHistoryRecords = 5000;
   private pendingTxGas = new Map<string, { gasUsed: number; effectiveGasPriceGwei?: number; gasSomi: number; gasUsdso: number }>();
+  private pgStore: PgStore | null = null;
 
   constructor(opts: DatabaseOptions = {}) {
     this.dbPath = opts.dbPath ? path.resolve(opts.dbPath) : path.resolve(process.cwd(), "grid-state.db.json");
@@ -325,6 +327,7 @@ export class BotDatabase {
       fs.writeFileSync(tempPath, JSON.stringify(this.data.settings, null, 2), "utf8");
       fs.renameSync(tempPath, this.settingsPath);
       this.isSettingsDirty = false;
+      this.pgStore?.scheduleSettingsSync(this.data.settings);
     } catch (err) {
       this.log(`❌ critical: failed to flush settings to disk: ${(err as Error).message}`);
     }
@@ -487,6 +490,7 @@ export class BotDatabase {
       // Atomic rename
       fs.renameSync(tempPath, this.dbPath);
       this.isDirty = false;
+      this.pgStore?.scheduleDataSync(this.data);
     } catch (err) {
       this.log(`❌ critical: failed to flush database to disk: ${(err as Error).message}`);
     }
@@ -3125,6 +3129,43 @@ export class BotDatabase {
     this.flushSync();
   }
 
+  // ── PostgreSQL Backing & Lifecycle ────────────────────────────────────────
+
+  public isPostgresActive(): boolean {
+    return Boolean(this.pgStore);
+  }
+
+  public getPgStore(): PgStore | null {
+    return this.pgStore;
+  }
+
+  public async initPostgres(databaseUrl?: string, instanceKey?: string): Promise<boolean> {
+    const url = (databaseUrl ?? process.env.DATABASE_URL ?? "").trim();
+    if (!url) {
+      return false;
+    }
+    if (this.pgStore) return true;
+
+    const store = new PgStore(url, instanceKey, this.log);
+    await store.initSchema();
+    const hasExisting = await store.hasInstanceData();
+
+    if (hasExisting) {
+      this.data = await store.loadInstanceData(this.getDefaultState());
+      this.pgStore = store;
+      this.log(
+        `🟢 PostgreSQL connected (instance: ${store.instanceKey}) — loaded ${this.data.orders.length} orders & ${Object.keys(this.data.settings).length} settings`,
+      );
+    } else {
+      this.pgStore = store;
+      await store.flushImmediate(this.data.settings, this.data);
+      this.log(
+        `🚀 Migrated local JSON state -> PostgreSQL (instance: ${store.instanceKey}, ${this.data.orders.length} orders, ${Object.keys(this.data.settings).length} settings)`,
+      );
+    }
+    return true;
+  }
+
   // ── DB Maintenance ────────────────────────────────────────────────────────
 
   public close(): void {
@@ -3134,6 +3175,14 @@ export class BotDatabase {
     }
     this.flushSettingsSync();
     this.flushSync();
+  }
+
+  public async closeAsync(): Promise<void> {
+    this.close();
+    if (this.pgStore) {
+      await this.pgStore.close();
+      this.pgStore = null;
+    }
   }
 }
 

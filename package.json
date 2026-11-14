@@ -1,6 +1,6 @@
 {
   "name": "dynamic-grid",
-  "version": "0.3.0.78",
+  "version": "0.3.0.79",
   "private": true,
   "type": "module",
   "scripts": {
@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "dotenv": "^16.4.5",
+    "postgres": "^4.1.1",
     "viem": "^2.57.4",
     "ws": "^8.18.0"
   },

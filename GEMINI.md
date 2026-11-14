@@ -9764,3 +9764,21 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - เพิ่มเงื่อนไขงดสร้าง/แก้ไขแท่งเทียนเมื่อ `this.isMarketClosed` หรือ `this.marketClock?.isOpen === false` (ทั้งใน `refreshLiveQuotes()` และ `handleWsPriceUpdate()`) โดยยังคงอัปเดต `ind.livePrice` และส่ง Telemetry ตามปกติ
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.78`** ใน `package.json` และ `src/version.ts`
+
+---
+
+## 324. v0.3.0.79 — PostgreSQL Persistence Layer (`src/pg-store.ts`, `src/db.ts`, `src/index.ts`) [Step 2]
+
+- **Driver & Schema (`src/pg-store.ts`, `package.json`)**:
+  - เพิ่ม `postgres` (Pure-JS/ESM PostgreSQL driver ไม่ต้อง build C++) เปิดใช้งานอัตโนมัติเมื่อตั้ง `DATABASE_URL` ใน `.env` (ถ้าไม่ตั้งยังคงทำงานผ่าน JSON เดิมได้)
+  - สร้างตารางอัตโนมัติ saat boot (`initSchema`):
+    - `bot_settings` (`instance_key`, `key`, `value_json`, `updated_at`)
+    - `bot_strategy_states` (`instance_key`, `state_key`, `state_json`, `updated_at`)
+    - `bot_orders` (`instance_key`, `order_uid`, ..., `raw_json`, index `(instance_key, timestamp_ms DESC)`)
+    - `market_candles` (เตรียมโครงสร้างสำหรับ Step 3 แคชแท่งเทียน)
+  - แยก Instance อัตโนมัติด้วย `BOT_INSTANCE` หรือ `port_${PORT}` เพื่อใช้ Postgres ก้อนเดียวสำหรับหลายบอทได้อย่างปลอดภัย
+- **Auto-Migration & Write-Behind (`src/db.ts`, `src/index.ts`)**:
+  - `BotDatabase.initPostgres()` ใน `src/index.ts` เชื่อมต่อก่อนสร้าง Strategy พร้อมนำเข้าข้อมูลจาก `settings.db.json` / `grid-bot.db.json` อัตโนมัติในครั้งแรกที่ตารางใน Postgres ยังว่าง
+  - คงอ่านจาก RAM แบบ Synchronous เพื่อไม่ให้ Tick loop ช้าลง และซิงก์เฉพาะส่วนที่เปลี่ยนแปลง (diff-based batch transaction) ลง PostgreSQL พร้อม `await closeAsync()` เมื่อปิดบอท
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.79`** ใน `package.json` และ `src/version.ts`
