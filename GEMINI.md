@@ -9767,7 +9767,7 @@ When investigating live production behavior, debugging issues, or analyzing trad
 
 ---
 
-## 324. v0.3.0.79 — PostgreSQL Persistence Layer (`src/pg-store.ts`, `src/db.ts`, `src/index.ts`) [Step 2]
+## 324. v0.3.0.80 — PostgreSQL Persistence Layer (`src/pg-store.ts`, `src/db.ts`, `src/index.ts`) [Step 2]
 
 - **Driver & Schema (`src/pg-store.ts`, `package.json`)**:
   - เพิ่ม `postgres` (Pure-JS/ESM PostgreSQL driver ไม่ต้อง build C++) เปิดใช้งานอัตโนมัติเมื่อตั้ง `DATABASE_URL` ใน `.env` (ถ้าไม่ตั้งยังคงทำงานผ่าน JSON เดิมได้)
@@ -9781,4 +9781,4 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - `BotDatabase.initPostgres()` ใน `src/index.ts` เชื่อมต่อก่อนสร้าง Strategy พร้อมนำเข้าข้อมูลจาก `settings.db.json` / `grid-bot.db.json` อัตโนมัติในครั้งแรกที่ตารางใน Postgres ยังว่าง
   - คงอ่านจาก RAM แบบ Synchronous เพื่อไม่ให้ Tick loop ช้าลง และซิงก์เฉพาะส่วนที่เปลี่ยนแปลง (diff-based batch transaction) ลง PostgreSQL พร้อม `await closeAsync()` เมื่อปิดบอท
 - **Version Bump**:
-  - อัปเดตเวอร์ชันเป็น **`0.3.0.79`** ใน `package.json` และ `src/version.ts`
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.80`** ใน `package.json` และ `src/version.ts` (แก้ไข typecheck field `executedQty` ใน `src/pg-store.ts`)
