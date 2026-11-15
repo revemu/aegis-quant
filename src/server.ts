@@ -38,6 +38,7 @@ export interface DashboardServerOptions {
   onClosePortfolioSlot?: (slotIndex: number) => Promise<any>;
   getPortfolioRadar?: () => any;
   onGetLearningReport?: () => Promise<any>;
+  onClearLearningCooldown?: (symbol: string) => Promise<{ success: boolean; symbol: string }>;
   maxCandles?: number;
 }
 
@@ -810,6 +811,29 @@ export class DashboardServer {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ supported: false, error: (err as Error).message }));
         });
+      return;
+    }
+
+    if (pathname === "/api/learning/clear-cooldown" && req.method === "POST") {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", async () => {
+        try {
+          const parsed = body ? JSON.parse(body) : {};
+          const sym = String(parsed.symbol || "").trim();
+          if (!this.opts.onClearLearningCooldown || !sym) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ success: false, error: "Invalid symbol or handler missing" }));
+            return;
+          }
+          const result = await this.opts.onClearLearningCooldown(sym);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(result));
+        } catch (e: any) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, error: (e as Error).message }));
+        }
+      });
       return;
     }
 

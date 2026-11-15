@@ -622,6 +622,12 @@ export class MaFanPortfolioStrategy implements IStrategy {
     return this.learning.buildReport(this.cfg);
   }
 
+  public async clearLearningCooldown(symbol: string) {
+    const res = await this.learning.clearSymbolCooldown(symbol);
+    this.emitTelemetryTick();
+    return res;
+  }
+
   // ── Wallet & Position Sync ─────────────────────────────────────────────────
 
   public async refreshWalletBalances(): Promise<any> {

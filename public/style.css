@@ -4893,3 +4893,97 @@ input:checked + .slider:before { transform: translateX(20px); }
   text-align: right;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
+
+/* ── Learning Engine Insights Modal ─────────────────────────────────────── */
+.lr-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 10px;
+}
+.lr-kpi-card {
+  background: rgba(15, 23, 42, 0.72);
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.lr-kpi-label {
+  font-size: 11px;
+  color: #94a3b8;
+  margin-bottom: 4px;
+}
+.lr-kpi-val {
+  font-size: 17px;
+  font-weight: 800;
+  color: #f8fafc;
+  font-family: "JetBrains Mono", monospace;
+}
+.lr-kpi-sub {
+  font-size: 11px;
+  color: #64748b;
+  margin-top: 3px;
+}
+.lr-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.lr-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.lr-section-head h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  color: #e2e8f0;
+}
+.lr-meta-pill {
+  font-size: 11px;
+  color: #c084fc;
+  background: rgba(168, 85, 247, 0.12);
+  border: 1px solid rgba(168, 85, 247, 0.3);
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.lr-two-col {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+}
+.lr-list-box {
+  background: rgba(15, 23, 42, 0.55);
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 70px;
+  font-size: 12px;
+  color: #94a3b8;
+}
+.lr-list-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 8px;
+  background: rgba(30, 41, 59, 0.6);
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+}
+.lr-clear-cd-btn {
+  background: rgba(56, 189, 248, 0.15);
+  color: #38bdf8;
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  border-radius: 6px;
+  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.lr-clear-cd-btn:hover {
+  background: rgba(56, 189, 248, 0.28);
+}

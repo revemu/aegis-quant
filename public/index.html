@@ -69,6 +69,10 @@
           <span class="btn-icon">📊</span>
           <span>ประวัติ / ล็อต</span>
         </button>
+        <button class="top-menu-btn" id="btnOpenLearningModal" title="ดูรายงานระบบการเรียนรู้ (Counterfactual Filters, Macro Breadth, MAE/MFE &amp; Cooldowns)" style="background: rgba(168, 85, 247, 0.14); border: 1px solid rgba(168, 85, 247, 0.38); color: #d8b4fe;">
+          <span class="btn-icon">🧠</span>
+          <span>การเรียนรู้</span>
+        </button>
         <button class="top-menu-btn menu-btn-rounds" id="btnOpenRoundsModal" style="display: none;">
           <span class="btn-icon">📊</span>
           <span>สรุปรอบเทรด</span>
@@ -2979,7 +2983,112 @@
     </div>
   </div>
 
-  <script src="app.js?v=0.3.0.43"></script>
+  <!-- ═══════════════════ Learning Engine Insights Modal ═══════════════════ -->
+  <div class="modal-overlay" id="learningModal" style="display: none;">
+    <div class="modal-card tm-modal-card">
+      <div class="modal-header tm-modal-header">
+        <div class="modal-title-group">
+          <span class="modal-icon">🧠</span>
+          <div>
+            <h2>ระบบการเรียนรู้ &amp; Counterfactual Analytics (Learning Engine)</h2>
+            <p class="modal-sub" id="lrModalSubtitle">กำลังโหลดข้อมูลการเรียนรู้จาก PostgreSQL...</p>
+          </div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <button class="btn btn-secondary" id="lrBtnRefresh" style="padding: 6px 12px; font-size: 12px;">🔄 รีเฟรช</button>
+          <button class="modal-close-btn" id="closeLearningModalBtn" title="Close modal">&times;</button>
+        </div>
+      </div>
+
+      <div class="modal-body tm-modal-body" id="lrModalBody">
+        <div class="lr-kpi-grid" id="lrKpiGrid"></div>
+
+        <div class="lr-section">
+          <div class="lr-section-head">
+            <h3>🛡️ ประสิทธิภาพตัวกรอง (Counterfactual Blocked Signals — จำลอง TP1 EMA200 + Lock BE)</h3>
+            <span class="lr-meta-pill" id="lrBlockedPendingBadge">Pending: 0</span>
+          </div>
+          <div class="tm-table-wrap">
+            <table class="tm-table">
+              <thead>
+                <tr>
+                  <th>เหตุผลที่บล็อก</th>
+                  <th>ตรวจแล้ว</th>
+                  <th>ถ้าเข้าจะชนะ</th>
+                  <th>ถ้าเข้าจะแพ้</th>
+                  <th>ช่วยกันขาดทุน (Saved)</th>
+                  <th>พลาดโอกาส (Missed)</th>
+                  <th>Sim PnL เฉลี่ย</th>
+                </tr>
+              </thead>
+              <tbody id="lrBlockedTbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="lr-section">
+          <div class="lr-section-head">
+            <h3>🌐 Macro Sit-Out แยกตาม Market Breadth (% เหนือ EMA25)</h3>
+            <span class="lr-meta-pill">ดูว่าช่วงตลาดกว้างแค่ไหน Sit-Out ช่วยหรือขวาง</span>
+          </div>
+          <div class="tm-table-wrap">
+            <table class="tm-table">
+              <thead>
+                <tr>
+                  <th>ระดับ Breadth</th>
+                  <th>ตรวจแล้ว</th>
+                  <th>ถ้าเข้าจะชนะ</th>
+                  <th>ถ้าเข้าจะแพ้</th>
+                  <th>ช่วยกันขาดทุน (Saved)</th>
+                  <th>พลาดโอกาส (Missed)</th>
+                  <th>Sim PnL เฉลี่ย</th>
+                </tr>
+              </thead>
+              <tbody id="lrBreadthTbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="lr-two-col">
+          <div class="lr-section">
+            <div class="lr-section-head">
+              <h3>❄️ หุ้น/เหรียญที่ติด Cooldown (48 ชม.)</h3>
+            </div>
+            <div id="lrCooldownsBox" class="lr-list-box"></div>
+          </div>
+
+          <div class="lr-section">
+            <div class="lr-section-head">
+              <h3>🎚️ ประวัติการจูนค่าอัตโนมัติ (Adjustments)</h3>
+            </div>
+            <div id="lrAdjustmentsBox" class="lr-list-box"></div>
+          </div>
+        </div>
+
+        <div class="lr-section">
+          <div class="lr-section-head">
+            <h3>🏆 ผลงานรายตัวที่บันทึกไว้ (Symbol Memory)</h3>
+          </div>
+          <div class="tm-table-wrap">
+            <table class="tm-table">
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>ชนะ / แพ้</th>
+                  <th>SL ติดกัน</th>
+                  <th>PnL สะสม</th>
+                  <th>เหตุผลล่าสุด</th>
+                </tr>
+              </thead>
+              <tbody id="lrSymbolPerfTbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js?v=0.3.0.86"></script>
 </body>
 
 </html>

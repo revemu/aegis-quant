@@ -49,6 +49,92 @@ function normalizeBlockReasonKey(rawReason: string | null | undefined): string {
   return first;
 }
 
+function getBreadthBucketLabel(breadthRaw: unknown): string {
+  const val = Number(breadthRaw);
+  if (!Number.isFinite(val)) return "UNKNOWN";
+  if (val < 40) return "LOW (<40%)";
+  if (val < 70) return "MID (40-70%)";
+  return "HIGH (>=70%)";
+}
+
+function aggregateBlockedStats(
+  records: LearningJournalRecord[],
+  keyFn: (rec: LearningJournalRecord) => string,
+) {
+  const map = new Map<string, { total: number; wouldWin: number; wouldLose: number; avgRetPct: number }>();
+  for (const b of records) {
+    const key = keyFn(b);
+    const cur = map.get(key) || { total: 0, wouldWin: 0, wouldLose: 0, avgRetPct: 0 };
+    cur.total++;
+    if (b.counterfactualVerdict === "WOULD_WIN") cur.wouldWin++;
+    if (b.counterfactualVerdict === "WOULD_LOSE") cur.wouldLose++;
+    cur.avgRetPct += Number(b.counterfactualPnlPct ?? 0);
+    map.set(key, cur);
+  }
+  return Array.from(map.entries()).map(([key, st]) => ({
+    key,
+    evaluated: st.total,
+    wouldWin: st.wouldWin,
+    wouldLose: st.wouldLose,
+    savedPct: st.total > 0 ? Number(((st.wouldLose / st.total) * 100).toFixed(1)) : 0,
+    missedWinPct: st.total > 0 ? Number(((st.wouldWin / st.total) * 100).toFixed(1)) : 0,
+    avgCounterfactualPnlPct: st.total > 0 ? Number((st.avgRetPct / st.total).toFixed(2)) : 0,
+  }));
+}
+
+/**
+ * Simulate MA-Fan TP1 (50% exit at EMA200 with +0.8% floor, lock BE +0.25% on remaining 50%)
+ * vs hard Disaster SL over the forward 15m horizon bars.
+ */
+function simulateMaFanCounterfactual(
+  entryPrice: number,
+  distEma200Pct: number,
+  slTriggerPct: number,
+  futureBars: Array<{ high: number; low: number; close: number }>,
+): { finalRet: number; maePct: number; mfePct: number; verdict: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL" } {
+  const tp1Pct = Number.isFinite(distEma200Pct) && distEma200Pct > 0
+    ? Math.max(0.8, Math.min(distEma200Pct, 8.0))
+    : 2.0;
+  const beLockPct = 0.25;
+
+  let minLow = entryPrice;
+  let maxHigh = entryPrice;
+  let tp1Hit = false;
+  let finalRet: number | null = null;
+
+  for (const b of futureBars) {
+    if (b.low < minLow) minLow = b.low;
+    if (b.high > maxHigh) maxHigh = b.high;
+    const lowPct = ((b.low - entryPrice) / entryPrice) * 100;
+    const highPct = ((b.high - entryPrice) / entryPrice) * 100;
+
+    if (!tp1Hit) {
+      if (lowPct <= slTriggerPct) {
+        finalRet = slTriggerPct;
+        break;
+      }
+      if (highPct >= tp1Pct) {
+        tp1Hit = true;
+      }
+    } else if (lowPct <= beLockPct) {
+      finalRet = 0.5 * tp1Pct + 0.5 * beLockPct;
+      break;
+    }
+  }
+
+  if (finalRet === null) {
+    const lastClose = futureBars[futureBars.length - 1]!.close;
+    const closeRetPct = ((lastClose - entryPrice) / entryPrice) * 100;
+    finalRet = tp1Hit ? 0.5 * tp1Pct + 0.5 * closeRetPct : closeRetPct;
+  }
+
+  const maePct = ((minLow - entryPrice) / entryPrice) * 100;
+  const mfePct = ((maxHigh - entryPrice) / entryPrice) * 100;
+  const verdict: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL" =
+    finalRet >= 0.35 ? "WOULD_WIN" : finalRet <= -0.35 ? "WOULD_LOSE" : "NEUTRAL";
+  return { finalRet, maePct, mfePct, verdict };
+}
+
 export type LearningAutoTuneConfig = Pick<Config, "learningAutoTuneMode" | "dryRun" | "exchange" | "alpacaBaseUrl">;
 
 export class LearningEngine {
@@ -106,6 +192,41 @@ export class LearningEngine {
     return 0;
   }
 
+  public async clearSymbolCooldown(symbol: string): Promise<{ success: boolean; symbol: string }> {
+    const sym = String(symbol || "").toUpperCase().trim();
+    if (!sym) return { success: false, symbol: "" };
+    await this.ensureSymbolStatesLoaded();
+    const prev = this.symbolStates.get(sym);
+    if (prev) {
+      const cleared: SymbolLearningStateRecord = {
+        ...prev,
+        consecutiveSl: 0,
+        scorePenalty: 0,
+        cooldownUntilMs: 0,
+        lastReason: "MANUAL_COOLDOWN_CLEAR",
+        updatedAt: Date.now(),
+      };
+      this.symbolStates.set(sym, cleared);
+      const pg = this.getPg();
+      if (pg) {
+        await pg.upsertSymbolLearningState(cleared).catch(() => {});
+        await pg
+          .recordLearningAdjustment({
+            paramName: `symbol_cooldown:${sym}`,
+            oldValue: 48,
+            newValue: 0,
+            sampleSize: prev.wins + prev.losses,
+            rationale: "Manual cooldown reset from Learning Dashboard",
+            applied: true,
+            createdAt: Date.now(),
+          })
+          .catch(() => {});
+      }
+      this.log(`🧠 [Learning] Manual cooldown cleared for ${sym}`);
+    }
+    return { success: true, symbol: sym };
+  }
+
   // ── Level 1: Entry, Outcome (MFE/MAE), and Blocked Signal Recording ──────
 
   public async onPortfolioEntry(params: {
@@ -147,6 +268,7 @@ export class LearningEngine {
         distEma200Pct: snap ? Number(snap.distanceToEma200Pct.toFixed(3)) : null,
         macroPass4h: params.macro?.pass4h ?? true,
         macroPass1d: params.macro?.pass1d ?? true,
+        breadthAboveEma25Pct: params.macro ? Number(params.macro.breadthAboveEma25Pct.toFixed(1)) : null,
       },
       updatedAt: Date.now(),
     };
@@ -298,6 +420,7 @@ export class LearningEngine {
           macroPass4h: params.macro.pass4h,
           macroPass1d: params.macro.pass1d,
           isSitOut: params.macro.isSitOut,
+          breadthAboveEma25Pct: Number(params.macro.breadthAboveEma25Pct.toFixed(1)),
         },
         updatedAt: nowMs,
       });
@@ -334,7 +457,6 @@ export class LearningEngine {
       mfePct: number;
     }> = [];
 
-    const tpTargetPct = 2.0;
     const slTriggerPct = -Math.max(1.5, slPct || 3.5);
 
     for (const p of pending) {
@@ -343,38 +465,15 @@ export class LearningEngine {
       const futureBars = bars.filter((b: any) => b.time > barStartSec).slice(0, 16);
       if (futureBars.length < 8 || p.entryPrice <= 0) continue;
 
-      let minLow = p.entryPrice;
-      let maxHigh = p.entryPrice;
-      let barrierRet: number | null = null;
-
-      for (const b of futureBars) {
-        if (b.low < minLow) minLow = b.low;
-        if (b.high > maxHigh) maxHigh = b.high;
-        const lowPct = ((b.low - p.entryPrice) / p.entryPrice) * 100;
-        const highPct = ((b.high - p.entryPrice) / p.entryPrice) * 100;
-        if (lowPct <= slTriggerPct) {
-          barrierRet = slTriggerPct;
-          break;
-        }
-        if (highPct >= tpTargetPct) {
-          barrierRet = tpTargetPct;
-          break;
-        }
-      }
-
-      const lastClose = futureBars[futureBars.length - 1]!.close;
-      const finalRet = barrierRet ?? ((lastClose - p.entryPrice) / p.entryPrice) * 100;
-      const maePct = ((minLow - p.entryPrice) / p.entryPrice) * 100;
-      const mfePct = ((maxHigh - p.entryPrice) / p.entryPrice) * 100;
-      const verdict: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL" =
-        finalRet >= 0.35 ? "WOULD_WIN" : finalRet <= -0.35 ? "WOULD_LOSE" : "NEUTRAL";
+      const distEma200Pct = Number(p.features?.distEma200Pct);
+      const sim = simulateMaFanCounterfactual(p.entryPrice, distEma200Pct, slTriggerPct, futureBars);
 
       updates.push({
         journalUid: p.journalUid,
-        counterfactualPnlPct: Number(finalRet.toFixed(3)),
-        counterfactualVerdict: verdict,
-        maePct: Number(maePct.toFixed(3)),
-        mfePct: Number(mfePct.toFixed(3)),
+        counterfactualPnlPct: Number(sim.finalRet.toFixed(3)),
+        counterfactualVerdict: sim.verdict,
+        maePct: Number(sim.maePct.toFixed(3)),
+        mfePct: Number(sim.mfePct.toFixed(3)),
       });
     }
 
@@ -489,26 +588,13 @@ export class LearningEngine {
       byReasonMap.set(key, cur);
     }
 
-    const blockedStatsMap = new Map<string, { total: number; wouldWin: number; wouldLose: number; avgRetPct: number }>();
-    for (const b of evaluatedBlocked) {
-      const key = normalizeBlockReasonKey(b.blockReason);
-      const cur = blockedStatsMap.get(key) || { total: 0, wouldWin: 0, wouldLose: 0, avgRetPct: 0 };
-      cur.total++;
-      if (b.counterfactualVerdict === "WOULD_WIN") cur.wouldWin++;
-      if (b.counterfactualVerdict === "WOULD_LOSE") cur.wouldLose++;
-      cur.avgRetPct += Number(b.counterfactualPnlPct ?? 0);
-      blockedStatsMap.set(key, cur);
-    }
-
-    const blockedSummary = Array.from(blockedStatsMap.entries()).map(([reason, st]) => ({
-      reason,
-      evaluated: st.total,
-      wouldWin: st.wouldWin,
-      wouldLose: st.wouldLose,
-      savedPct: st.total > 0 ? Number(((st.wouldLose / st.total) * 100).toFixed(1)) : 0,
-      missedWinPct: st.total > 0 ? Number(((st.wouldWin / st.total) * 100).toFixed(1)) : 0,
-      avgCounterfactualPnlPct: st.total > 0 ? Number((st.avgRetPct / st.total).toFixed(2)) : 0,
-    }));
+    const blockedSummary = aggregateBlockedStats(evaluatedBlocked, (b) => normalizeBlockReasonKey(b.blockReason)).map(
+      ({ key, ...rest }) => ({ reason: key, ...rest }),
+    );
+    const macroSitOutRecords = evaluatedBlocked.filter((b) => b.blockReason === "MACRO_SIT_OUT");
+    const macroSitOutByBreadth = aggregateBlockedStats(macroSitOutRecords, (b) =>
+      getBreadthBucketLabel(b.features?.breadthAboveEma25Pct),
+    ).map(({ key, ...rest }) => ({ bucket: key, ...rest }));
 
     const nowMs = Date.now();
     const activeCooldowns = symbolStates
@@ -550,6 +636,7 @@ export class LearningEngine {
         pendingEvaluation: pendingBlocked.length,
         evaluatedTotal: evaluatedBlocked.length,
         breakdown: blockedSummary,
+        macroSitOutByBreadth,
       },
       activeCooldowns,
       symbolPerformance: symbolStates

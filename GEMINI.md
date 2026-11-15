@@ -9853,3 +9853,17 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - เพิ่มตัวเลือก Dropdown `🧠 Learning Engine Auto-Tune (Level 3)` (`dry_run_only` / `all` / `off`) ในแท็บ Portfolio Settings พร้อมเชื่อมต่อการโหลดและบันทึกค่าผ่าน `/api/db/settings`
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.85`** ใน `package.json` และ `src/version.ts`
+
+---
+
+## 330. v0.3.0.86 — Learning Insights Dashboard, MA-Fan Counterfactual Sim & Macro Breadth Calibration (`src/learning-engine.ts`, `src/server.ts`, `public/index.html`, `public/app.js`, `public/style.css`)
+
+- **Realistic MA-Fan Counterfactual Simulation (`src/learning-engine.ts`)**:
+  - เพิ่ม `simulateMaFanCounterfactual()` เพื่อจำลองผลลัพธ์ของสัญญาณที่ถูกบล็อกตามกฎจริงของกลยุทธ์: แบ่งขาย 50% ที่ TP1 (`distEma200Pct` หรือขั้นต่ำ +0.8%, สูงสุด +8.0%) แล้วล็อก Breakeven +0.25% สำหรับอีก 50% ที่เหลือ เทียบกับ Disaster SL
+- **Macro Sit-Out Breadth Recording & Breakdown (`src/learning-engine.ts`)**:
+  - บันทึก `breadthAboveEma25Pct` ลงใน `features` ของทั้ง `TRADE` และ `BLOCKED_SIGNAL`
+  - เพิ่ม `macroSitOutByBreadth` ใน `/api/learning/report` แยกสถิติ `MACRO_SIT_OUT` ตามช่วง Breadth (`LOW (<40%)`, `MID (40-70%)`, `HIGH (>=70%)`)
+- **Learning Insights Dashboard & Cooldown Reset (`public/index.html`, `public/app.js`, `public/style.css`, `src/server.ts`, `src/index.ts`)**:
+  - เพิ่มปุ่ม `🧠 การเรียนรู้` บนแถบเมนูด้านบนและ `#learningModal` แสดง KPI, WinMAE P80, ตาราง Counterfactual Breakdown, Macro Sit-Out by Breadth, Active Cooldowns (พร้อมปุ่ม `ปลด Cooldown` ผ่าน `POST /api/learning/clear-cooldown`), Adjustments และ Symbol Memory
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.86`** ใน `package.json` และ `src/version.ts`

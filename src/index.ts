@@ -859,6 +859,10 @@ async function main(): Promise<void> {
       grid.getLearningReport
         ? grid.getLearningReport()
         : Promise.resolve({ supported: false, message: "Switch strategy to Portfolio mode to enable Learning Report." }),
+    onClearLearningCooldown: (sym) =>
+      grid.clearLearningCooldown
+        ? grid.clearLearningCooldown(sym)
+        : Promise.resolve({ success: false, symbol: sym }),
     onPauseBot: (paused) => grid.setPaused(paused),
     getIsPaused: () => grid.getIsPaused(),
     onCancelAll: () => grid.cancelAllOrdersUser(),

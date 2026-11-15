@@ -8876,6 +8876,188 @@
     });
   }
 
+  // ═══════════════════ LEARNING ENGINE MODAL CONTROLLER ═══════════════════
+  const elBtnOpenLearning = document.getElementById("btnOpenLearningModal");
+  const elLearningModal = document.getElementById("learningModal");
+  const elCloseLearningBtn = document.getElementById("closeLearningModalBtn");
+  const elLrBtnRefresh = document.getElementById("lrBtnRefresh");
+
+  function renderCounterfactualRows(rows, labelField, emptyText) {
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return `<tr><td colspan="7" style="text-align:center; color:#64748b;">${emptyText}</td></tr>`;
+    }
+    return rows.map((r) => {
+      const avgPnl = Number(r.avgCounterfactualPnlPct || 0);
+      const pnlCol = avgPnl >= 0 ? "#4ade80" : "#f87171";
+      const savedCol = Number(r.savedPct || 0) >= 60 ? "#4ade80" : "#fbbf24";
+      return `
+        <tr>
+          <td style="font-weight:700; color:#e2e8f0;">${r[labelField] || "--"}</td>
+          <td>${r.evaluated || 0}</td>
+          <td style="color:#4ade80;">${r.wouldWin || 0}</td>
+          <td style="color:#f87171;">${r.wouldLose || 0}</td>
+          <td style="color:${savedCol}; font-weight:700;">${Number(r.savedPct || 0).toFixed(1)}%</td>
+          <td style="color:#fbbf24;">${Number(r.missedWinPct || 0).toFixed(1)}%</td>
+          <td style="color:${pnlCol}; font-weight:700;">${avgPnl >= 0 ? "+" : ""}${avgPnl.toFixed(2)}%</td>
+        </tr>
+      `;
+    }).join("");
+  }
+
+  async function loadLearningReportUI() {
+    const elSub = document.getElementById("lrModalSubtitle");
+    const elKpis = document.getElementById("lrKpiGrid");
+    const elBlockedBody = document.getElementById("lrBlockedTbody");
+    const elBreadthBody = document.getElementById("lrBreadthTbody");
+    const elPendingBadge = document.getElementById("lrBlockedPendingBadge");
+    const elCooldownsBox = document.getElementById("lrCooldownsBox");
+    const elAdjBox = document.getElementById("lrAdjustmentsBox");
+    const elSymBody = document.getElementById("lrSymbolPerfTbody");
+
+    if (elSub) elSub.textContent = "กำลังโหลดข้อมูลจาก /api/learning/report...";
+    try {
+      const res = await fetch(`${API_BASE}/api/learning/report`);
+      const rep = await res.json();
+      if (!rep.supported || !rep.postgresActive) {
+        if (elSub) elSub.textContent = rep.message || "ต้องเปิดใช้งานโหมด MA-Fan Portfolio + PostgreSQL เพื่อดูรายงานนี้";
+        if (elKpis) elKpis.innerHTML = "";
+        if (elBlockedBody) elBlockedBody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:#64748b;">ยังไม่รองรับในโหมดปัจจุบัน</td></tr>';
+        if (elBreadthBody) elBreadthBody.innerHTML = "";
+        return;
+      }
+
+      const tuneBadge = rep.autoTuneEffective ? "🟢 Auto-Tune: ON" : "🟡 Auto-Tune: OFF";
+      if (elSub) {
+        elSub.textContent = `Instance: ${rep.instanceKey || "--"} • Mode: ${rep.autoTuneMode || "dry_run_only"} • ${tuneBadge}`;
+      }
+
+      const s = rep.summary || {};
+      const winCol = Number(s.winRatePct || 0) >= 50 ? "#4ade80" : "#fbbf24";
+      const pnlVal = Number(s.totalPnlQuote || 0);
+      const recSlTxt = s.recommendedDisasterSlPct != null
+        ? `${s.recommendedDisasterSlPct}% (WinMAE P80: ${s.winMaeP80Pct ?? "--"}%)`
+        : `ต้องการอีก ${s.samplesNeededForSlTune ?? 20} ไม้`;
+      if (elKpis) {
+        elKpis.innerHTML = `
+          <div class="lr-kpi-card">
+            <div class="lr-kpi-label">🎯 ปิดไม้แล้ว / Win Rate</div>
+            <div class="lr-kpi-val" style="color:${winCol};">${Number(s.winRatePct || 0).toFixed(1)}%</div>
+            <div class="lr-kpi-sub">${s.wins || 0} ชนะ / ${s.losses || 0} แพ้ (เปิดอยู่ ${s.openTrades || 0})</div>
+          </div>
+          <div class="lr-kpi-card">
+            <div class="lr-kpi-label">💰 PnL สะสม (Journal)</div>
+            <div class="lr-kpi-val" style="color:${pnlVal >= 0 ? "#4ade80" : "#f87171"};">${pnlVal >= 0 ? "+" : ""}$${pnlVal.toFixed(2)}</div>
+            <div class="lr-kpi-sub">เฉลี่ยต่อไม้: ${Number(s.avgPnlPct || 0) >= 0 ? "+" : ""}${Number(s.avgPnlPct || 0).toFixed(2)}%</div>
+          </div>
+          <div class="lr-kpi-card">
+            <div class="lr-kpi-label">📉 Avg MAE / 📈 Avg MFE</div>
+            <div class="lr-kpi-val" style="font-size:15px;"><span style="color:#f87171;">${Number(s.avgMaePct || 0).toFixed(2)}%</span> / <span style="color:#4ade80;">+${Number(s.avgMfePct || 0).toFixed(2)}%</span></div>
+            <div class="lr-kpi-sub">WinMAE P80: ${s.winMaeP80Pct != null ? `${s.winMaeP80Pct}%` : "รอข้อมูลเพิ่ม"}</div>
+          </div>
+          <div class="lr-kpi-card">
+            <div class="lr-kpi-label">🛡️ Disaster SL ปัจจุบัน</div>
+            <div class="lr-kpi-val" style="color:#38bdf8;">${Number(s.currentDisasterSlPct || 3.5).toFixed(2)}%</div>
+            <div class="lr-kpi-sub">${recSlTxt}</div>
+          </div>
+        `;
+      }
+
+      const bs = rep.blockedSignals || {};
+      if (elPendingBadge) elPendingBadge.textContent = `Pending 4h: ${bs.pendingEvaluation || 0} • ตรวจแล้ว: ${bs.evaluatedTotal || 0}`;
+      if (elBlockedBody) {
+        elBlockedBody.innerHTML = renderCounterfactualRows(bs.breakdown, "reason", "ยังไม่มีสัญญาณที่ตรวจเฉลยครบ 4 ชม.");
+      }
+      if (elBreadthBody) {
+        elBreadthBody.innerHTML = renderCounterfactualRows(bs.macroSitOutByBreadth, "bucket", "ยังไม่มีข้อมูล Macro Sit-Out ที่ตรวจเฉลยแล้ว");
+      }
+
+      const cds = Array.isArray(rep.activeCooldowns) ? rep.activeCooldowns : [];
+      if (elCooldownsBox) {
+        elCooldownsBox.innerHTML = cds.length === 0
+          ? '<div style="color:#64748b;">ไม่มีหุ้น/เหรียญติด Cooldown ในขณะนี้</div>'
+          : cds.map((c) => `
+              <div class="lr-list-item">
+                <div>
+                  <strong style="color:#f8fafc;">${c.symbol}</strong>
+                  <span style="color:#f87171; margin-left:6px;">${c.consecutiveSl} SL ติด</span>
+                  <span style="color:#94a3b8; margin-left:6px;">เหลือ ${c.hoursRemaining} ชม. ($${Number(c.totalPnlQuote || 0).toFixed(2)})</span>
+                </div>
+                <button type="button" class="lr-clear-cd-btn" data-clear-cd="${c.symbol}">ปลด Cooldown</button>
+              </div>
+            `).join("");
+        elCooldownsBox.querySelectorAll("[data-clear-cd]").forEach((btn) => {
+          btn.addEventListener("click", async () => {
+            const sym = btn.getAttribute("data-clear-cd");
+            if (!sym) return;
+            await fetch(`${API_BASE}/api/learning/clear-cooldown`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ symbol: sym }),
+            }).catch(() => {});
+            loadLearningReportUI();
+          });
+        });
+      }
+
+      const adjs = Array.isArray(rep.recentAdjustments) ? rep.recentAdjustments : [];
+      if (elAdjBox) {
+        elAdjBox.innerHTML = adjs.length === 0
+          ? '<div style="color:#64748b;">ยังไม่มีประวัติการจูนค่าอัตโนมัติ</div>'
+          : adjs.slice(0, 10).map((a) => `
+              <div class="lr-list-item" style="flex-direction:column; align-items:flex-start; gap:3px;">
+                <div style="width:100%; display:flex; justify-content:space-between; color:#e2e8f0; font-weight:600;">
+                  <span>${a.paramName}: ${a.oldValue} ➔ ${a.newValue}</span>
+                  <span style="color:#64748b; font-size:10px;">${new Date(a.createdAt).toLocaleString()}</span>
+                </div>
+                <div style="font-size:11px; color:#94a3b8;">${a.rationale}</div>
+              </div>
+            `).join("");
+      }
+
+      const syms = Array.isArray(rep.symbolPerformance) ? rep.symbolPerformance : [];
+      if (elSymBody) {
+        elSymBody.innerHTML = syms.length === 0
+          ? '<tr><td colspan="5" style="text-align:center; color:#64748b;">ยังไม่มีสถิติปิดไม้รายตัว</td></tr>'
+          : syms.map((sp) => {
+              const pCol = Number(sp.totalPnlQuote || 0) >= 0 ? "#4ade80" : "#f87171";
+              return `
+                <tr>
+                  <td style="font-weight:700; color:#e2e8f0;">${sp.symbol}</td>
+                  <td><span style="color:#4ade80;">${sp.wins || 0}</span> / <span style="color:#f87171;">${sp.losses || 0}</span></td>
+                  <td>${sp.consecutiveSl || 0}</td>
+                  <td style="color:${pCol}; font-weight:700;">${Number(sp.totalPnlQuote || 0) >= 0 ? "+" : ""}$${Number(sp.totalPnlQuote || 0).toFixed(2)}</td>
+                  <td style="color:#94a3b8;">${sp.lastReason || "--"}</td>
+                </tr>
+              `;
+            }).join("");
+      }
+    } catch (err) {
+      if (elSub) elSub.textContent = `โหลดข้อมูลไม่สำเร็จ: ${err.message}`;
+    }
+  }
+
+  function openLearningModal() {
+    if (!elLearningModal) return;
+    elLearningModal.classList.add("active");
+    elLearningModal.style.display = "flex";
+    loadLearningReportUI();
+  }
+
+  function closeLearningModal() {
+    if (!elLearningModal) return;
+    elLearningModal.classList.remove("active");
+    elLearningModal.style.display = "none";
+  }
+
+  if (elBtnOpenLearning) elBtnOpenLearning.addEventListener("click", openLearningModal);
+  if (elCloseLearningBtn) elCloseLearningBtn.addEventListener("click", closeLearningModal);
+  if (elLrBtnRefresh) elLrBtnRefresh.addEventListener("click", loadLearningReportUI);
+  if (elLearningModal) {
+    elLearningModal.addEventListener("click", (e) => {
+      if (e.target === elLearningModal) closeLearningModal();
+    });
+  }
+
     function renderLiveBottomSection() {
     renderLiveTradesTable();
     renderLiveRoundsTable();
