@@ -5808,6 +5808,14 @@
     const grpStage2 = document.getElementById("group_stage2Multiplier");
     if (grpStage2) grpStage2.style.display = twoStageEnabled ? "" : "none";
 
+    const pfPreset = document.getElementById("cfg_portfolioUniversePreset")?.value || "us_top49";
+    const grpCustomWl = document.getElementById("group_portfolioCustomWhitelist");
+    if (grpCustomWl) grpCustomWl.style.display = pfPreset === "custom" ? "" : "none";
+
+    const stratType = document.getElementById("cfg_strategyType")?.value || "dynamic_grid";
+    const grpSinglePair = document.getElementById("group_singleTradingPair");
+    if (grpSinglePair) grpSinglePair.style.display = isPortfolioType(stratType) ? "none" : "";
+
     updateStrategyTabsVisibility(false);
   }
 
@@ -5936,12 +5944,16 @@
 
     const btnRotation = document.getElementById("tabBtnRotation");
     if (btnRotation) {
-      btnRotation.style.display = "inline-flex";
-      btnRotation.style.order = "5";
+      if (isPortfolioType(stratType)) {
+        btnRotation.style.display = "none";
+      } else {
+        btnRotation.style.display = "inline-flex";
+        btnRotation.style.order = "5";
+      }
     }
 
     const currentActiveTab = document.querySelector(".settings-tabs .tab-btn.active")?.getAttribute("data-tab");
-    if (currentActiveTab === "tab-rotation") {
+    if (currentActiveTab === "tab-rotation" && !isPortfolioType(stratType)) {
       activateSettingsTab("tab-rotation");
       return;
     }
@@ -5958,6 +5970,7 @@
 
   [
     "cfg_strategyType",
+    "cfg_portfolioUniversePreset",
     "cfg_orderExecutionMode",
     "cfg_useTrueWick",
     "cfg_enableNarrowChannelCollapse",
@@ -6173,9 +6186,16 @@
 
       // MA-Fan Multi-Slot Portfolio settings
       setVal("cfg_portfolioMaxSlots", data.portfolioMaxSlots ?? 3);
-      setVal("cfg_portfolioUniversePreset", data.portfolioUniversePreset || "us_top49");
+      const validPresets = ["us_top49", "us_top25", "custom"];
+      setVal(
+        "cfg_portfolioUniversePreset",
+        validPresets.includes(data.portfolioUniversePreset) ? data.portfolioUniversePreset : "us_top49",
+      );
       setVal("cfg_portfolioMaxBudgetUsd", data.portfolioMaxBudgetUsd ?? 0);
-      setVal("cfg_portfolioRankBy", data.portfolioRankBy || "COMPOSITE_QUALITY");
+      setVal(
+        "cfg_portfolioRankBy",
+        data.portfolioRankBy === "RSI15" ? "RSI15" : "COMPOSITE_QUALITY",
+      );
       setVal(
         "cfg_portfolioCustomWhitelist",
         Array.isArray(data.portfolioCustomWhitelist) ? data.portfolioCustomWhitelist.join(", ") : "",

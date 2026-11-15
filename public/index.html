@@ -1613,7 +1613,7 @@
                 </select>
               </div>
 
-              <div class="form-group">
+              <div class="form-group" id="group_singleTradingPair">
                 <label for="cfg_symbol" id="lbl_symbol">
                   คู่เหรียญเทรด (Trading Pair)
                   <span class="help-tip" title="เลือกคู่เหรียญจากรายการ หรือกดปุ่มพิมพ์เอง">ℹ️</span>
@@ -1757,59 +1757,62 @@
           </div>
 
           <!-- Section 4.3: ตั้งค่าระบบ & ประสิทธิภาพ -->
-          <div class="cfg-section-card">
-            <div class="cfg-section-header">
-              <span class="cfg-section-title">🖥️ ตั้งค่าระบบ &amp; ประสิทธิภาพการทำงาน (System &amp; Performance)</span>
+          <details class="cfg-advanced-details" id="apiSystemAdvancedDetails">
+            <summary class="cfg-advanced-summary">
+              <span>🖥️ ตั้งค่าระบบ &amp; ประสิทธิภาพการทำงานขั้นสูง (System &amp; Performance)</span>
+              <span class="cfg-advanced-summary-hint">Tick Interval • Timezone • Candles • Port ▾</span>
+            </summary>
+            <div class="cfg-advanced-body">
+              <div class="settings-grid">
+                <div class="form-group">
+                  <label for="cfg_intervalMs">
+                    ความเร็วรอบประมวลผลบอท (Bot Tick Interval)
+                    <span class="help-tip" title="ความถี่ในการตรวจเช็คราคาของบอท (เช่น 200ms = 5 ครั้งต่อวินาที)">ℹ️</span>
+                  </label>
+                  <div class="input-with-unit">
+                    <input type="number" id="cfg_intervalMs" step="100" min="100" max="30000" />
+                    <span class="unit">ms</span>
+                  </div>
+                </div>
+
+                <div class="form-group">
+                  <label for="cfg_timezone">ไทม์โซนแสดงผล (Bot Timezone)</label>
+                  <select id="cfg_timezone" class="form-select">
+                    <option value="Asia/Bangkok">Asia/Bangkok (UTC+7 ประเทศไทย)</option>
+                    <option value="UTC">UTC (UTC+0 เวลาสากล)</option>
+                    <option value="Asia/Singapore">Asia/Singapore (UTC+8 สิงคโปร์)</option>
+                    <option value="Asia/Tokyo">Asia/Tokyo (UTC+9 ญี่ปุ่น)</option>
+                    <option value="America/New_York">America/New_York (EST/EDT)</option>
+                    <option value="Europe/London">Europe/London (GMT/BST)</option>
+                  </select>
+                </div>
+
+                <div class="form-group">
+                  <label for="cfg_initialCandleCount">โหลดแท่งเทียนเริ่มต้น (Initial Candles)</label>
+                  <div class="input-with-unit">
+                    <input type="number" id="cfg_initialCandleCount" step="10" min="50" max="1000" />
+                    <span class="unit">แท่ง</span>
+                  </div>
+                </div>
+
+                <div class="form-group">
+                  <label for="cfg_maxCandleCount">จำนวนแท่งเทียนสูงสุดในหน่วยความจำ (Max Candles)</label>
+                  <div class="input-with-unit">
+                    <input type="number" id="cfg_maxCandleCount" step="50" min="100" max="2000" />
+                    <span class="unit">แท่ง</span>
+                  </div>
+                </div>
+
+                <div class="form-group">
+                  <label for="cfg_dashboardPort">พอร์ตหน้าเว็บแดชบอร์ด (Web Dashboard Port)</label>
+                  <div class="input-with-unit">
+                    <input type="number" id="cfg_dashboardPort" placeholder="3333" min="1024" max="65535" />
+                    <span class="unit">PORT</span>
+                  </div>
+                </div>
+              </div>
             </div>
-            <div class="settings-grid">
-              <div class="form-group">
-                <label for="cfg_intervalMs">
-                  ความเร็วรอบประมวลผลบอท (Bot Tick Interval)
-                  <span class="help-tip" title="ความถี่ในการตรวจเช็คราคาของบอท (เช่น 200ms = 5 ครั้งต่อวินาที)">ℹ️</span>
-                </label>
-                <div class="input-with-unit">
-                  <input type="number" id="cfg_intervalMs" step="100" min="100" max="30000" />
-                  <span class="unit">ms</span>
-                </div>
-              </div>
-
-              <div class="form-group">
-                <label for="cfg_timezone">ไทม์โซนแสดงผล (Bot Timezone)</label>
-                <select id="cfg_timezone" class="form-select">
-                  <option value="Asia/Bangkok">Asia/Bangkok (UTC+7 ประเทศไทย)</option>
-                  <option value="UTC">UTC (UTC+0 เวลาสากล)</option>
-                  <option value="Asia/Singapore">Asia/Singapore (UTC+8 สิงคโปร์)</option>
-                  <option value="Asia/Tokyo">Asia/Tokyo (UTC+9 ญี่ปุ่น)</option>
-                  <option value="America/New_York">America/New_York (EST/EDT)</option>
-                  <option value="Europe/London">Europe/London (GMT/BST)</option>
-                </select>
-              </div>
-
-              <div class="form-group">
-                <label for="cfg_initialCandleCount">โหลดแท่งเทียนเริ่มต้น (Initial Candles)</label>
-                <div class="input-with-unit">
-                  <input type="number" id="cfg_initialCandleCount" step="10" min="50" max="1000" />
-                  <span class="unit">แท่ง</span>
-                </div>
-              </div>
-
-              <div class="form-group">
-                <label for="cfg_maxCandleCount">จำนวนแท่งเทียนสูงสุดในหน่วยความจำ (Max Candles)</label>
-                <div class="input-with-unit">
-                  <input type="number" id="cfg_maxCandleCount" step="50" min="100" max="2000" />
-                  <span class="unit">แท่ง</span>
-                </div>
-              </div>
-
-              <div class="form-group">
-                <label for="cfg_dashboardPort">พอร์ตหน้าเว็บแดชบอร์ด (Web Dashboard Port)</label>
-                <div class="input-with-unit">
-                  <input type="number" id="cfg_dashboardPort" placeholder="3333" min="1024" max="65535" />
-                  <span class="unit">PORT</span>
-                </div>
-              </div>
-            </div>
-          </div>
+          </details>
         </div>
 
         <!-- ═══════════════════ TAB 5: กลยุทธ์สวิงเทรด (Swing Trade Strategy) ═══════════════════ -->
@@ -2383,26 +2386,12 @@
         <div class="tab-pane" id="tab-portfolio">
           <div class="cfg-section-card">
             <div class="cfg-section-header">
-              <span class="cfg-section-title">🚀 โครงสร้างพอร์ต &amp; กลุ่มหุ้น/เหรียญ (Portfolio Slots &amp; Universe)</span>
-              <span class="cfg-section-desc">ใช้ตรรกะเดียวกับ Backtest Multi-Slot (15m EMA4 Pullback + 1h RSI Filter)</span>
+              <span class="cfg-section-title">🚀 ตั้งค่าพอร์ตหลัก (Essential Portfolio Settings)</span>
+              <span class="cfg-section-desc">ปรับเฉพาะค่าหลักที่จำเป็น ค่าเทคนิคทั้งหมดถูกจูนตามผล Backtest ไว้ให้แล้ว</span>
             </div>
             <div class="settings-grid">
               <div class="form-group">
-                <label for="cfg_portfolioMaxSlots">จำนวนช่องถือพร้อมกัน (Max Concurrent Slots)</label>
-                <input type="number" id="cfg_portfolioMaxSlots" min="1" max="5" step="1" />
-              </div>
-
-              <div class="form-group">
-                <label for="cfg_portfolioUniversePreset">ชุดหุ้น / เหรียญที่สแกน (Universe Preset)</label>
-                <select id="cfg_portfolioUniversePreset" class="form-select">
-                  <option value="us_top49">🇺🇸 Top 49 US Mega-Caps &amp; ETFs (เหมือน Backtest 100%)</option>
-                  <option value="us_top25">💎 Top 25 Liquid Mega-Caps (คัดเฉพาะตัวสภาพคล่องสูงสุด)</option>
-                  <option value="custom">🎯 Custom Watchlist (กำหนดรายชื่อเอง)</option>
-                </select>
-              </div>
-
-              <div class="form-group">
-                <label for="cfg_portfolioMaxBudgetUsd">งบพอร์ตสูงสุด ($ USD | 0 = ใช้เงินในพอร์ตทั้งหมด)</label>
+                <label for="cfg_portfolioMaxBudgetUsd">💰 งบพอร์ตสูงสุด ($ USD | 0 = ใช้เงินทั้งหมดในพอร์ต)</label>
                 <div class="input-with-unit">
                   <input type="number" id="cfg_portfolioMaxBudgetUsd" min="0" max="10000000" step="100" />
                   <span class="unit">$</span>
@@ -2410,52 +2399,23 @@
               </div>
 
               <div class="form-group">
-                <label for="cfg_portfolioRankBy">การจัดอันดับคัดเข้า Slot (Candidate Ranker)</label>
-                <select id="cfg_portfolioRankBy" class="form-select">
-                  <option value="COMPOSITE_QUALITY">🏆 Composite Quality (เหมือน Backtest แนะนำ)</option>
-                  <option value="REL_STRENGTH">💪 Relative Strength 24h สูงสุด</option>
-                  <option value="RSI_LOWEST">🌊 RSI ต่ำสุด (Oversold Hook)</option>
-                </select>
+                <label for="cfg_portfolioMaxSlots">🎰 จำนวน Slot ถือพร้อมกัน (Max Concurrent Slots)</label>
+                <input type="number" id="cfg_portfolioMaxSlots" min="1" max="5" step="1" />
               </div>
 
-              <div class="form-group" style="grid-column: 1 / -1;">
-                <label for="cfg_portfolioCustomWhitelist">Custom Watchlist / หุ้นที่เจาะจง (คั่นด้วยจุลภาค เช่น AAPL, MSFT, NVDA, TSLA)</label>
-                <input type="text" id="cfg_portfolioCustomWhitelist" class="form-input" placeholder="AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA, SPY, QQQ" />
-              </div>
-
-              <div class="form-group" style="grid-column: 1 / -1;">
-                <label for="cfg_portfolioBlacklist">Blacklist (รายชื่อที่ห้ามเข้าเทรด คั่นด้วยจุลภาค)</label>
-                <input type="text" id="cfg_portfolioBlacklist" class="form-input" placeholder="เช่น T, PFE" />
-              </div>
-            </div>
-          </div>
-
-          <div class="cfg-section-card">
-            <div class="cfg-section-header">
-              <span class="cfg-section-title">🎯 จุดขาย Take Profit, Stop Loss &amp; Macro Guard</span>
-              <span class="cfg-section-desc">ตั้งค่าระยะขาย EMA200, Lock Breakeven, Disaster SL และตัวกรองตลาดใหญ่</span>
-            </div>
-            <div class="settings-grid">
               <div class="form-group">
-                <label for="cfg_portfolioTp1TargetMode">เป้าหมาย TP1 (Primary Profit Target)</label>
-                <select id="cfg_portfolioTp1TargetMode" class="form-select">
-                  <option value="EMA200">🎯 EMA 200 (ตามผลทดสอบ Backtest)</option>
-                  <option value="EMA75">⚡ EMA 75 (ขายไวขึ้น)</option>
+                <label for="cfg_portfolioUniversePreset">🌐 ชุดหุ้น / เหรียญที่สแกน (Universe Preset)</label>
+                <select id="cfg_portfolioUniversePreset" class="form-select">
+                  <option value="us_top49">🌐 Auto Top Liquid (US Top 49 / Binance Top Vol — แนะนำ)</option>
+                  <option value="us_top25">💎 Top 25 Liquid Mega-Caps (คัดเฉพาะสภาพคล่องสูงสุด)</option>
+                  <option value="custom">🎯 Custom Watchlist (กำหนดรายชื่อเอง)</option>
                 </select>
               </div>
 
               <div class="form-group">
-                <label for="cfg_portfolioDisasterSlPct">Disaster Stop Loss (%)</label>
-                <div class="input-with-unit">
-                  <input type="number" id="cfg_portfolioDisasterSlPct" min="0.5" max="15" step="0.25" />
-                  <span class="unit">%</span>
-                </div>
-              </div>
-
-              <div class="form-group">
-                <label for="cfg_portfolioSitOutMode">Macro Sit-Out Filter (SPY / BTC Benchmark)</label>
+                <label for="cfg_portfolioSitOutMode">🛡️ ตัวกรองตลาดใหญ่ (Macro Sit-Out Filter)</label>
                 <select id="cfg_portfolioSitOutMode" class="form-select">
-                  <option value="dual">🛡️ Dual Guard (4H ≥ EMA75 &amp; 1D ≥ EMA25)</option>
+                  <option value="dual">🛡️ Dual Guard (4H ≥ EMA75 &amp; 1D ≥ EMA25 — แนะนำ)</option>
                   <option value="btc4h">📊 4H Only (4H ≥ EMA75)</option>
                   <option value="btc1d">📅 Daily Only (1D ≥ EMA25)</option>
                   <option value="off">🔥 ปิด (Off — เข้าทุกจังหวะ ไม่สนตลาดใหญ่)</option>
@@ -2463,45 +2423,89 @@
               </div>
 
               <div class="form-group">
-                <label for="cfg_portfolioMaxHoldHours">Max Hold Hours (0 = ไม่จำกัดเวลา)</label>
+                <label for="cfg_portfolioDisasterSlPct">🚨 Stop Loss ฉุกเฉิน (Disaster SL %)</label>
                 <div class="input-with-unit">
-                  <input type="number" id="cfg_portfolioMaxHoldHours" min="0" max="720" step="4" />
-                  <span class="unit">ชม.</span>
+                  <input type="number" id="cfg_portfolioDisasterSlPct" min="0.5" max="15" step="0.25" />
+                  <span class="unit">%</span>
                 </div>
               </div>
 
-              <div class="form-group">
-                <label for="cfg_learningAutoTuneMode">🧠 Learning Engine Auto-Tune (Level 3)</label>
-                <select id="cfg_learningAutoTuneMode" class="form-select">
-                  <option value="dry_run_only">🧪 Dry Run &amp; Paper Only (จูนเฉพาะพอร์ตจำลอง / Alpaca Paper)</option>
-                  <option value="all">🚀 เปิดทั้งหมด (All — รวม Live Trading จริง)</option>
-                  <option value="off">📊 ปิด Auto-Tune (Off — เก็บสถิติและรายงานอย่างเดียว)</option>
-                </select>
-              </div>
-
-              <div class="form-group switch-group">
-                <div class="switch-label-group">
-                  <span class="switch-title">✂️ แบ่งขาย 50% ที่ TP1 (Partial TP @ EMA200)</span>
-                  <span class="switch-desc">ขายครึ่งไม้เมื่อแตะ EMA200 อีกครึ่งรันต่อจน Full Bullish Fan</span>
-                </div>
-                <label class="toggle-switch">
-                  <input type="checkbox" id="cfg_portfolioPartialTpAtEma200" />
-                  <span class="slider"></span>
-                </label>
-              </div>
-
-              <div class="form-group switch-group">
-                <div class="switch-label-group">
-                  <span class="switch-title">🔒 เลื่อน SL บังทุนเมื่อถึง TP1 (Lock Breakeven)</span>
-                  <span class="switch-desc">ยก Stop Loss มาที่ Entry + 0.25% อัตโนมัติหลังชน EMA200</span>
-                </div>
-                <label class="toggle-switch">
-                  <input type="checkbox" id="cfg_portfolioLockBreakevenAtEma200" />
-                  <span class="slider"></span>
-                </label>
+              <div class="form-group" id="group_portfolioCustomWhitelist" style="grid-column: 1 / -1; display: none;">
+                <label for="cfg_portfolioCustomWhitelist">🎯 Custom Watchlist / รายชื่อที่กำหนดเอง (คั่นด้วยจุลภาค เช่น AAPL, MSFT, NVDA, TSLA)</label>
+                <input type="text" id="cfg_portfolioCustomWhitelist" class="form-input" placeholder="AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA, SPY, QQQ" />
               </div>
             </div>
           </div>
+
+          <details class="cfg-advanced-details" id="portfolioAdvancedDetails">
+            <summary class="cfg-advanced-summary">
+              <span>🔧 ตั้งค่าขั้นสูง (Advanced — ใช้ค่ามาตรฐานที่จูนมาให้แล้ว)</span>
+              <span class="cfg-advanced-summary-hint">TP1 EMA200 • Lock Breakeven • Ranker • Auto-Tune ▾</span>
+            </summary>
+            <div class="cfg-advanced-body">
+              <div class="settings-grid">
+                <div class="form-group">
+                  <label for="cfg_portfolioTp1TargetMode">เป้าหมาย TP1 (Primary Profit Target)</label>
+                  <select id="cfg_portfolioTp1TargetMode" class="form-select">
+                    <option value="EMA200">🎯 EMA 200 (ตามผลทดสอบ Backtest)</option>
+                    <option value="EMA75">⚡ EMA 75 (ขายไวขึ้น)</option>
+                  </select>
+                </div>
+
+                <div class="form-group">
+                  <label for="cfg_portfolioMaxHoldHours">Max Hold Hours (0 = ไม่จำกัดเวลา)</label>
+                  <div class="input-with-unit">
+                    <input type="number" id="cfg_portfolioMaxHoldHours" min="0" max="720" step="4" />
+                    <span class="unit">ชม.</span>
+                  </div>
+                </div>
+
+                <div class="form-group">
+                  <label for="cfg_portfolioRankBy">การจัดอันดับคัดเข้า Slot (Candidate Ranker)</label>
+                  <select id="cfg_portfolioRankBy" class="form-select">
+                    <option value="COMPOSITE_QUALITY">🏆 Composite Quality (เหมือน Backtest แนะนำ)</option>
+                    <option value="RSI15">🌊 RSI 15m Momentum (คัดตัว RSI แข็งแรงสุด)</option>
+                  </select>
+                </div>
+
+                <div class="form-group">
+                  <label for="cfg_learningAutoTuneMode">🧠 Learning Engine Auto-Tune (Level 3)</label>
+                  <select id="cfg_learningAutoTuneMode" class="form-select">
+                    <option value="dry_run_only">🧪 Dry Run &amp; Paper Only (จูนเฉพาะพอร์ตจำลอง / Alpaca Paper)</option>
+                    <option value="all">🚀 เปิดทั้งหมด (All — รวม Live Trading จริง)</option>
+                    <option value="off">📊 ปิด Auto-Tune (Off — เก็บสถิติและรายงานอย่างเดียว)</option>
+                  </select>
+                </div>
+
+                <div class="form-group" style="grid-column: 1 / -1;">
+                  <label for="cfg_portfolioBlacklist">Blacklist (รายชื่อที่ห้ามเข้าเทรด คั่นด้วยจุลภาค)</label>
+                  <input type="text" id="cfg_portfolioBlacklist" class="form-input" placeholder="เช่น T, PFE" />
+                </div>
+
+                <div class="form-group switch-group">
+                  <div class="switch-label-group">
+                    <span class="switch-title">✂️ แบ่งขาย 50% ที่ TP1 (Partial TP @ EMA200)</span>
+                    <span class="switch-desc">ขายครึ่งไม้เมื่อแตะ EMA200 อีกครึ่งรันต่อจน Full Bullish Fan</span>
+                  </div>
+                  <label class="toggle-switch">
+                    <input type="checkbox" id="cfg_portfolioPartialTpAtEma200" />
+                    <span class="slider"></span>
+                  </label>
+                </div>
+
+                <div class="form-group switch-group">
+                  <div class="switch-label-group">
+                    <span class="switch-title">🔒 เลื่อน SL บังทุนเมื่อถึง TP1 (Lock Breakeven)</span>
+                    <span class="switch-desc">ยก Stop Loss มาที่ Entry + 0.25% อัตโนมัติหลังชน EMA200</span>
+                  </div>
+                  <label class="toggle-switch">
+                    <input type="checkbox" id="cfg_portfolioLockBreakevenAtEma200" />
+                    <span class="slider"></span>
+                  </label>
+                </div>
+              </div>
+            </div>
+          </details>
         </div>
 
       <div class="modal-footer">
@@ -3088,7 +3092,7 @@
     </div>
   </div>
 
-  <script src="app.js?v=0.3.0.86"></script>
+  <script src="app.js?v=0.3.0.87"></script>
 </body>
 
 </html>

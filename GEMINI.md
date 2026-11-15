@@ -9865,5 +9865,18 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - เพิ่ม `macroSitOutByBreadth` ใน `/api/learning/report` แยกสถิติ `MACRO_SIT_OUT` ตามช่วง Breadth (`LOW (<40%)`, `MID (40-70%)`, `HIGH (>=70%)`)
 - **Learning Insights Dashboard & Cooldown Reset (`public/index.html`, `public/app.js`, `public/style.css`, `src/server.ts`, `src/index.ts`)**:
   - เพิ่มปุ่ม `🧠 การเรียนรู้` บนแถบเมนูด้านบนและ `#learningModal` แสดง KPI, WinMAE P80, ตาราง Counterfactual Breakdown, Macro Sit-Out by Breadth, Active Cooldowns (พร้อมปุ่ม `ปลด Cooldown` ผ่าน `POST /api/learning/clear-cooldown`), Adjustments และ Symbol Memory
+
+---
+
+## 331. v0.3.0.87 — Streamlined Essential-Only Portfolio Settings UI (`public/index.html`, `public/app.js`, `public/style.css`)
+
+- **Essential-First Portfolio Settings (`public/index.html`, `public/app.js`)**:
+  - คัดกรองหน้าตั้งค่า `tab-portfolio` ให้แสดงเฉพาะ 5 ค่าหลักที่ผู้ใช้จำเป็นต้องปรับจริง ได้แก่: `portfolioMaxBudgetUsd` (งบพอร์ตสูงสุด), `portfolioMaxSlots` (จำนวน Slot), `portfolioUniversePreset` (ชุดหุ้น/เหรียญ), `portfolioSitOutMode` (Macro Guard) และ `portfolioDisasterSlPct` (Disaster SL %)
+  - ซ่อนช่อง `group_portfolioCustomWhitelist` อัตโนมัติเมื่อไม่ได้เลือก `portfolioUniversePreset === "custom"` พร้อม Normalize ค่า Preset เก่า (เช่น `auto_top`) เป็น `us_top49` ไม่ให้ Dropdown แสดงผลว่าง
+  - จัดตัวเลือกรองและพารามิเตอร์ที่จูนตาม Backtest แล้ว (`portfolioTp1TargetMode`, `portfolioMaxHoldHours`, `portfolioRankBy` ที่แก้ Value ให้ตรง Backend `RSI15`/`COMPOSITE_QUALITY`, `learningAutoTuneMode`, `portfolioBlacklist`, `portfolioPartialTpAtEma200`, `portfolioLockBreakevenAtEma200`) รวมถึงระบบขั้นสูงใน `tab-api` (`apiSystemAdvancedDetails`) ไว้ภายใต้ `<details class="cfg-advanced-details">` แบบพับเก็บได้
+- **Strategy-Clean Tab & Field Isolation (`public/app.js`)**:
+  - ซ่อน `tabBtnRotation` และช่อง `group_singleTradingPair` โดยอัตโนมัติเมื่อเลือกกลยุทธ์ `ma_fan_portfolio` เพื่อให้หน้าต่างตั้งค่าเหลือเฉพาะแท็บพอร์ตหลักและกระดานเทรดที่ใช้งานจริง
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.87`** ใน `package.json`, `src/version.ts` และ `public/index.html`
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.86`** ใน `package.json` และ `src/version.ts`

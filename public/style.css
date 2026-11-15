@@ -4987,3 +4987,45 @@ input:checked + .slider:before { transform: translateX(20px); }
 .lr-clear-cd-btn:hover {
   background: rgba(56, 189, 248, 0.28);
 }
+
+/* Collapsible Advanced Settings Section */
+.cfg-advanced-details {
+  margin-top: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.42);
+  overflow: hidden;
+}
+.cfg-advanced-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 16px;
+  cursor: pointer;
+  list-style: none;
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: #cbd5e1;
+  user-select: none;
+  transition: background 0.15s ease;
+}
+.cfg-advanced-summary::-webkit-details-marker {
+  display: none;
+}
+.cfg-advanced-summary:hover {
+  background: rgba(56, 189, 248, 0.06);
+  color: #f8fafc;
+}
+.cfg-advanced-summary-hint {
+  font-size: 0.72rem;
+  font-weight: 500;
+  color: #64748b;
+}
+.cfg-advanced-details[open] .cfg-advanced-summary {
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+  color: #38bdf8;
+}
+.cfg-advanced-body {
+  padding: 14px 16px;
+}
