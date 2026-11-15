@@ -3243,22 +3243,22 @@ input:checked + .slider:before { transform: translateX(20px); }
    DASHBOARD REDESIGN v2.2 — Top Bar Clusters, 4-Card KPI, Dock & Config Cards
    ═══════════════════════════════════════════════════════════════════════════ */
 
-/* 1. Top Bar Balanced Single-Line Navigation & Bot Status Strip Controls */
+/* 1. Top Bar Balanced Responsive Navigation & Bot Status Strip Controls */
 .top-nav {
-  padding: 4px 12px;
+  padding: 6px 12px;
   min-height: 38px;
-  gap: 8px;
-  overflow-x: auto;
-  overflow-y: hidden;
+  gap: 6px 12px;
+  flex-wrap: wrap;
 }
 
 .brand {
   display: flex;
   align-items: center;
-  gap: 8px;
-  flex-wrap: nowrap;
+  gap: 6px 8px;
+  flex-wrap: wrap;
   min-width: 0;
-  flex-shrink: 1;
+  max-width: 100%;
+  flex: 1 1 auto;
 }
 
 .logo-badge {
@@ -3338,12 +3338,15 @@ input:checked + .slider:before { transform: translateX(20px); }
   margin-left: 2px;
   padding-left: 8px;
   border-left: 1px solid rgba(255, 255, 255, 0.08);
-  flex-wrap: nowrap;
-  flex-shrink: 0;
+  flex-wrap: wrap;
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .nav-system-pills .status-pill,
 .nav-system-pills .dry-badge,
+.nav-system-pills .market-clock-pill,
 .nav-system-pills .version-pill {
   height: 26px;
   display: inline-flex;
@@ -3388,8 +3391,10 @@ input:checked + .slider:before { transform: translateX(20px); }
   display: flex;
   align-items: center;
   gap: 6px;
-  flex-wrap: nowrap;
-  flex-shrink: 0;
+  flex-wrap: wrap;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .top-menu-btn {

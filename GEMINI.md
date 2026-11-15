@@ -9910,5 +9910,15 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - ปรับ `.form-input` ใน Modal/Login เป็นธีมมืด, หยุดยิง `/api/rotation/status` ก่อน Login, และแสดงโหนดที่รัน/ปักหมุดโหนดในหน้า Admin
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.89`** ใน `package.json`, `src/version.ts` และ `public/index.html`
+
+---
+
+## 334. v0.3.0.90 — Responsive Top Navigation Wrap Fix (`public/style.css`, `public/index.html`)
+
+- **Top Header Overlap Fix (`public/style.css`, `public/index.html`)**:
+  - แก้ปัญหาแถบ `.nav-metrics` (`Backtest`, `ประวัติ / ล็อต`, `การเรียนรู้`, `Auto-Rotate`, `ตั้งค่า`) ซ้อนทับ `.nav-system-pills` (`.dry-badge`, `.market-clock-pill`, `.status-pill`, `.version-pill`) บนหน้าจอกว้างกลาง (~900–1350px)
+  - ปรับ `.top-nav`, `.brand`, `.nav-system-pills` และ `.nav-metrics` จาก `flex-wrap: nowrap` + `.brand { flex-shrink: 1 }` / `.nav-system-pills { flex-shrink: 0 }` ให้รองรับ `flex-wrap: wrap`, `max-width: 100%` และรวม `.market-clock-pill` เข้าชุดสไตล์ความสูง `26px` เดียวกัน
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.90`** ใน `package.json`, `src/version.ts` และ `public/index.html` (`style.css?v=0.3.0.90`, `app.js?v=0.3.0.90`)
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.86`** ใน `package.json` และ `src/version.ts`
