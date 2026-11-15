@@ -341,8 +341,8 @@ export const defaultStrategyConfig = {
   // ── State Persistence & Offline Database (Lots & PnL recovery on restart) ──
   /** Persist open lots, realized PnL, order history, and gas tracking to offline database. Default true. */
   persistState: true,
-  /** File path for offline ACID database. Default "data/grid-bot.db.json". */
-  dbPath: "data/grid-bot.db.json",
+  /** File path for offline ACID database. Isolated per BOT_INSTANCE when set. */
+  dbPath: process.env.BOT_DB_PATH || (process.env.BOT_INSTANCE ? `data/grid-bot.${process.env.BOT_INSTANCE}.db.json` : "data/grid-bot.db.json"),
   /** Legacy JSON state file path to auto-migrate from. Default ".grid-state.json". */
   stateFile: ".grid-state.json",
 
@@ -351,8 +351,10 @@ export const defaultStrategyConfig = {
   startPaused: true,
 
   // ── Web Dashboard ────────────────────────────────────────────────────────
-  /** Port to serve the live TradingView dashboard on (0 to disable). Default 3333 or process.env.PORT. */
-  dashboardPort: process.env.PORT ? parseInt(process.env.PORT, 10) : 3333,
+  /** Port to serve the live TradingView dashboard on (0 to disable). Default 3333 or FORCE_DASHBOARD_PORT/PORT. */
+  dashboardPort: process.env.FORCE_DASHBOARD_PORT
+    ? parseInt(process.env.FORCE_DASHBOARD_PORT, 10)
+    : (process.env.PORT ? parseInt(process.env.PORT, 10) : 3333),
 
   // ── Swing Trade Strategy Specific Parameters ───────────────────────────
   /** Minimum Risk:Reward ratio required to execute a swing entry (default 2.0). */
@@ -499,7 +501,11 @@ export function loadConfigFromDatabase(): typeof defaultStrategyConfig {
       if (saved.binanceWsBase !== undefined) merged.binanceWsBase = String(saved.binanceWsBase);
       if (saved.dryRun !== undefined) merged.dryRun = Boolean(saved.dryRun);
       if (saved.timezone !== undefined) merged.timezone = String(saved.timezone);
-      if (saved.dashboardPort !== undefined) merged.dashboardPort = Number(saved.dashboardPort);
+      if (process.env.FORCE_DASHBOARD_PORT) {
+        merged.dashboardPort = parseInt(process.env.FORCE_DASHBOARD_PORT, 10);
+      } else if (saved.dashboardPort !== undefined) {
+        merged.dashboardPort = Number(saved.dashboardPort);
+      }
       if (saved.maFanUseRatchetSl !== undefined) merged.maFanUseRatchetSl = Boolean(saved.maFanUseRatchetSl);
       if (saved.maFanBullCushion !== undefined) merged.maFanBullCushion = Boolean(saved.maFanBullCushion);
       if (saved.maFanWaterfallGuard !== undefined) merged.maFanWaterfallGuard = Boolean(saved.maFanWaterfallGuard);

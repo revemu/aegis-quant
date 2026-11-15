@@ -848,8 +848,13 @@ async function main(): Promise<void> {
       return grid.getRuntimeConfig();
   };
 
+  const forcedPort = process.env.FORCE_DASHBOARD_PORT ? parseInt(process.env.FORCE_DASHBOARD_PORT, 10) : NaN;
+  const effectivePort = Number.isFinite(forcedPort) && forcedPort > 0 ? forcedPort : config.dashboardPort;
+  const dashboardHost = process.env.DASHBOARD_HOST?.trim() || (Number.isFinite(forcedPort) ? "127.0.0.1" : undefined);
+
   dashboard = new DashboardServer({
-    port: config.dashboardPort,
+    port: effectivePort,
+    host: dashboardHost,
     log,
     db: grid.getDatabase(),
     maxCandles: config.strategyType === "ma_ribbon" ? 1200 : (config.maxCandleCount ?? 600),

@@ -264,7 +264,10 @@ export class BotDatabase {
   constructor(opts: DatabaseOptions = {}) {
     this.dbPath = opts.dbPath ? path.resolve(opts.dbPath) : path.resolve(process.cwd(), "grid-state.db.json");
     const dir = path.dirname(this.dbPath);
-    this.settingsPath = path.resolve(dir, "settings.db.json");
+    const botInst = process.env.BOT_INSTANCE?.trim();
+    this.settingsPath = process.env.SETTINGS_DB_PATH
+      ? path.resolve(process.env.SETTINGS_DB_PATH)
+      : path.resolve(dir, botInst ? `settings.${botInst}.db.json` : "settings.db.json");
     this.legacyStateFile = opts.legacyStateFile ? path.resolve(opts.legacyStateFile) : path.resolve(process.cwd(), ".grid-state.json");
     this.log = opts.log || ((msg) => console.log(`[database] ${msg}`));
     this.data = this.initializeDatabase();

@@ -20,6 +20,7 @@ const PUBLIC_DIR = path.resolve(__dirname, "../public");
 
 export interface DashboardServerOptions {
   port: number;
+  host?: string;
   log: (msg: string) => void;
   db?: BotDatabase;
   getSettings?: () => Record<string, any>;
@@ -96,9 +97,16 @@ export class DashboardServer {
       this.handleRequest(req, res);
     });
 
-    this.server.listen(this.opts.port, () => {
-      this.opts.log(`web dashboard live at http://localhost:${this.opts.port} (version: ${APP_VERSION_INFO.version}, commit: ${APP_VERSION_INFO.commit})`);
-    });
+    const listenHost = this.opts.host?.trim();
+    const onListen = () => {
+      const bindLabel = listenHost || "localhost";
+      this.opts.log(`web dashboard live at http://${bindLabel}:${this.opts.port} (version: ${APP_VERSION_INFO.version}, commit: ${APP_VERSION_INFO.commit})`);
+    };
+    if (listenHost) {
+      this.server.listen(this.opts.port, listenHost, onListen);
+    } else {
+      this.server.listen(this.opts.port, onListen);
+    }
 
     this.server.on("error", (err: any) => {
       this.opts.log(`dashboard server error: ${err.message}`);

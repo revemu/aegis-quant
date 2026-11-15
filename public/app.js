@@ -1178,7 +1178,7 @@
           btnTf4h.classList.add("active");
           if (btnTf15m) btnTf15m.classList.remove("active");
           if (!cachedHtfCandles || cachedHtfCandles.length === 0) {
-            fetch("/api/candles/htf")
+            fetch(`${API_BASE}/api/candles/htf`)
               .then((res) => res.json())
               .then((data) => {
                 if (data.candles && data.candles.length > 0) {
@@ -5337,9 +5337,12 @@
   }, 30000);
 
   // ── SSE Connection & Dynamic Host Resolution ──────────────────────────────
-  const API_BASE = (window.location.protocol === "file:" || window.location.port === "5500" || !window.location.port)
+  const DEFAULT_API_BASE = (window.location.protocol === "file:" || window.location.port === "5500" || !window.location.port)
     ? "http://210.246.253.13:3333"
     : "";
+  let API_BASE = DEFAULT_API_BASE;
+  let activeSse = null;
+  let isOrchestratorMode = false;
 
   function removeActivityItem(id) {
     if (!id) return;
@@ -5579,9 +5582,17 @@
         loadFallbackCandles();
       });
 
+    if (activeSse) {
+      try {
+        activeSse.close();
+      } catch {}
+      activeSse = null;
+    }
+
     let sse = null;
     try {
       sse = new EventSource(`${API_BASE}/api/events`);
+      activeSse = sse;
     } catch (e) {
       console.warn("Could not create EventSource:", e);
       loadFallbackCandles();
@@ -5591,6 +5602,13 @@
     sse.addEventListener("connected", () => {
       if (elConnectionStatus) elConnectionStatus.className = "status-pill connected";
       if (elConnectionText) elConnectionText.textContent = "ออนไลน์";
+      if (!initialLoaded) {
+        initialLoaded = true;
+        loadSettings().catch(() => {});
+        checkBotPauseStatus();
+        loadTradeManagerData();
+        if (typeof refreshFrontPageState === "function") refreshFrontPageState();
+      }
     });
 
     sse.addEventListener("candles_batch", (e) => {
@@ -7001,7 +7019,7 @@
 
   async function checkBotPauseStatus() {
     try {
-      const res = await fetch("/api/bot/pause");
+      const res = await fetch(`${API_BASE}/api/bot/pause`);
       if (res.ok) {
         const data = await res.json();
         updatePauseUI(data.isPaused);
@@ -7024,7 +7042,7 @@
       try {
         elBtnPauseBot.disabled = true;
         const targetState = !isBotPaused;
-        const res = await fetch("/api/bot/pause", {
+        const res = await fetch(`${API_BASE}/api/bot/pause`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ paused: targetState }),
@@ -7049,7 +7067,7 @@
       try {
         elBtnCancelAll.disabled = true;
         elBtnCancelAll.textContent = "Cancelling...";
-        const res = await fetch("/api/bot/cancel-all", { method: "POST" });
+        const res = await fetch(`${API_BASE}/api/bot/cancel-all`, { method: "POST" });
         const data = await res.json();
         if (data.success) {
           alert(`✅ All open orders cancelled successfully! (${data.cancelledCount || 0} orders cancelled)`);
@@ -7073,7 +7091,7 @@
       try {
         elBtnSellAll.disabled = true;
         elBtnSellAll.textContent = "Selling All...";
-        const res = await fetch("/api/bot/sell-all", { method: "POST" });
+        const res = await fetch(`${API_BASE}/api/bot/sell-all`, { method: "POST" });
         const data = await res.json();
         if (data.success) {
           alert(`✅ ขายเหรียญทั้งหมดสำเร็จ!\nจำนวน: ${data.soldQty} ${activeBaseAsset}\nราคา: $${data.price}\n\n(บอทได้ถูกสลับเป็นสถานะ Pause เรียบร้อยแล้ว)`);
@@ -7099,7 +7117,7 @@
       try {
         elBtnResetPosition.disabled = true;
         elBtnResetPosition.textContent = "Resetting Pos...";
-        const res = await fetch("/api/bot/reset-position", { method: "POST" });
+        const res = await fetch(`${API_BASE}/api/bot/reset-position`, { method: "POST" });
         const data = await res.json();
         if (data.success) {
           alert(`✅ Position successfully reset! (${data.clearedLots || 0} lots cleared)`);
@@ -7149,7 +7167,7 @@
           clearTrades: elChkClearHistory ? elChkClearHistory.checked : false,
         };
 
-        const res = await fetch("/api/bot/reset", {
+        const res = await fetch(`${API_BASE}/api/bot/reset`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
@@ -9085,21 +9103,559 @@
     renderLiveLotsTable();
   }
 
+  // ── Multi-Instance Orchestrator Hub & Auth Controller ─────────────────────
+  let orchUser = null;
+  let orchInstances = [];
+  let activeOrchKey = null;
+  let orchPollTimer = null;
+  let chartInitialized = false;
+
+  function escHtml(v) {
+    return String(v ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function showOrchError(el, msg) {
+    if (!el) return;
+    if (msg) {
+      el.textContent = msg;
+      el.style.display = "block";
+    } else {
+      el.textContent = "";
+      el.style.display = "none";
+    }
+  }
+
+  function getActiveOrchInstance() {
+    return orchInstances.find((i) => i.instanceKey === activeOrchKey) || null;
+  }
+
+  function renderOrchBar() {
+    const elBar = document.getElementById("orchBar");
+    const elTabs = document.getElementById("orchInstanceTabs");
+    const elUserPill = document.getElementById("orchUserPill");
+    const elBtnUsers = document.getElementById("btnOrchManageUsers");
+    const elBtnStart = document.getElementById("btnOrchStartInst");
+    const elBtnStop = document.getElementById("btnOrchStopInst");
+    if (!elBar) return;
+
+    elBar.style.display = "flex";
+    if (elUserPill && orchUser) {
+      elUserPill.textContent = `👤 ${orchUser.username} (${orchUser.role})`;
+    }
+    if (elBtnUsers) {
+      elBtnUsers.style.display = orchUser?.role === "admin" ? "inline-flex" : "none";
+    }
+
+    if (elTabs) {
+      if (orchInstances.length === 0) {
+        elTabs.innerHTML = '<span style="font-size:12px;color:#94a3b8;">ยังไม่มี Instance — กด ＋ เพิ่ม Instance</span>';
+      } else {
+        elTabs.innerHTML = orchInstances
+          .map((inst) => {
+            const isActive = inst.instanceKey === activeOrchKey;
+            const dotCls = inst.status || "stopped";
+            const exLabel = inst.telemetry?.exchange ? String(inst.telemetry.exchange).toUpperCase() : "";
+            const pausedTag = inst.status === "running" && inst.telemetry?.isPaused ? " ⏸" : "";
+            const ownerTag = orchUser?.role === "admin" ? ` · ${escHtml(inst.ownerUsername)}` : "";
+            return `
+              <button class="orch-inst-pill ${isActive ? "active" : ""}" data-orch-key="${escHtml(inst.instanceKey)}"
+                title="${escHtml(inst.displayName)} (${escHtml(inst.status)})${ownerTag}">
+                <span class="orch-dot ${escHtml(dotCls)}"></span>
+                <span>${escHtml(inst.displayName || inst.instanceKey)}${pausedTag}</span>
+                ${exLabel ? `<span class="orch-inst-ex">${escHtml(exLabel)}</span>` : ""}
+              </button>
+            `;
+          })
+          .join("");
+
+        elTabs.querySelectorAll("[data-orch-key]").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const k = btn.getAttribute("data-orch-key");
+            if (k && k !== activeOrchKey) switchOrchInstance(k);
+          });
+        });
+      }
+    }
+
+    const activeInst = getActiveOrchInstance();
+    if (elBtnStart && elBtnStop) {
+      if (!activeInst) {
+        elBtnStart.style.display = "none";
+        elBtnStop.style.display = "none";
+      } else if (activeInst.status === "running" || activeInst.status === "starting") {
+        elBtnStart.style.display = "none";
+        elBtnStop.style.display = "inline-flex";
+      } else {
+        elBtnStart.style.display = "inline-flex";
+        elBtnStop.style.display = "none";
+      }
+    }
+  }
+
+  async function refreshWorkerDashboard() {
+    if (!chartInitialized) {
+      initChart();
+      chartInitialized = true;
+    }
+    rawOrders = [];
+    tradesCount = 0;
+    onchainCount = 0;
+    allCount = 0;
+    if (elTradesFeed) elTradesFeed.innerHTML = '<div class="empty-feed">No trade fills recorded yet</div>';
+    if (elOnchainFeed) elOnchainFeed.innerHTML = '<div class="empty-feed">No on-chain activity yet</div>';
+    if (elAllFeed) elAllFeed.innerHTML = '<div class="empty-feed">No order activity yet</div>';
+
+    const activeInst = getActiveOrchInstance();
+    if (isOrchestratorMode && (!activeInst || activeInst.status !== "running")) {
+      if (activeSse) {
+        try { activeSse.close(); } catch {}
+        activeSse = null;
+      }
+      if (elConnectionStatus) elConnectionStatus.className = "status-pill disconnected";
+      if (elConnectionText) {
+        elConnectionText.textContent = activeInst ? `Stopped (${activeInst.instanceKey})` : "No Instance";
+      }
+      return;
+    }
+
+    await loadSettings();
+    connectSSE();
+    checkBotPauseStatus();
+    loadTradeManagerData();
+  }
+
+  async function switchOrchInstance(key) {
+    activeOrchKey = key;
+    localStorage.setItem("orch_active_instance", key);
+    const url = new URL(window.location.href);
+    url.searchParams.set("instance", key);
+    window.history.replaceState({}, "", url.toString());
+    API_BASE = `${DEFAULT_API_BASE}/i/${encodeURIComponent(key)}`;
+    renderOrchBar();
+    await refreshWorkerDashboard();
+  }
+
+  async function fetchOrchInstances(autoSelect = false) {
+    const res = await fetch(`${DEFAULT_API_BASE}/api/orch/instances`);
+    if (res.status === 401) {
+      window.location.reload();
+      return;
+    }
+    if (!res.ok) return;
+    const data = await res.json();
+    orchInstances = Array.isArray(data.instances) ? data.instances : [];
+
+    if (autoSelect || !activeOrchKey || !orchInstances.some((i) => i.instanceKey === activeOrchKey)) {
+      const urlParam = new URLSearchParams(window.location.search).get("instance");
+      const savedKey = localStorage.getItem("orch_active_instance");
+      const chosen =
+        orchInstances.find((i) => i.instanceKey === urlParam) ||
+        orchInstances.find((i) => i.instanceKey === savedKey) ||
+        orchInstances[0] ||
+        null;
+      activeOrchKey = chosen ? chosen.instanceKey : null;
+      API_BASE = activeOrchKey ? `${DEFAULT_API_BASE}/i/${encodeURIComponent(activeOrchKey)}` : DEFAULT_API_BASE;
+      if (activeOrchKey) localStorage.setItem("orch_active_instance", activeOrchKey);
+    }
+
+    renderOrchBar();
+  }
+
+  function wireOrchUiEvents() {
+    const elBtnStart = document.getElementById("btnOrchStartInst");
+    const elBtnStop = document.getElementById("btnOrchStopInst");
+    const elBtnRestart = document.getElementById("btnOrchRestartInst");
+    const elBtnLogout = document.getElementById("btnOrchLogout");
+
+    if (elBtnStart) {
+      elBtnStart.addEventListener("click", async () => {
+        if (!activeOrchKey) return;
+        await fetch(`${DEFAULT_API_BASE}/api/orch/instances/${encodeURIComponent(activeOrchKey)}/start`, { method: "POST" });
+        await fetchOrchInstances(false);
+        setTimeout(() => refreshWorkerDashboard(), 1500);
+      });
+    }
+
+    if (elBtnStop) {
+      elBtnStop.addEventListener("click", async () => {
+        if (!activeOrchKey) return;
+        if (!confirm(`หยุดการทำงานของ Instance "${activeOrchKey}" ชั่วคราว?`)) return;
+        await fetch(`${DEFAULT_API_BASE}/api/orch/instances/${encodeURIComponent(activeOrchKey)}/stop`, { method: "POST" });
+        await fetchOrchInstances(false);
+        await refreshWorkerDashboard();
+      });
+    }
+
+    if (elBtnRestart) {
+      elBtnRestart.addEventListener("click", async () => {
+        if (!activeOrchKey) return;
+        await fetch(`${DEFAULT_API_BASE}/api/orch/instances/${encodeURIComponent(activeOrchKey)}/restart`, { method: "POST" });
+        await fetchOrchInstances(false);
+        setTimeout(() => refreshWorkerDashboard(), 1800);
+      });
+    }
+
+    if (elBtnLogout) {
+      elBtnLogout.addEventListener("click", async () => {
+        await fetch(`${DEFAULT_API_BASE}/api/orch/auth/logout`, { method: "POST" }).catch(() => {});
+        window.location.reload();
+      });
+    }
+
+    // Create Instance Modal
+    const elCreateModal = document.getElementById("orchCreateModal");
+    const elBtnCreate = document.getElementById("btnOrchCreateInst");
+    const elCloseCreate = document.getElementById("closeOrchCreateBtn");
+    const elCancelCreate = document.getElementById("cancelOrchCreateBtn");
+    const elSubmitCreate = document.getElementById("submitOrchCreateBtn");
+    const elCreateErr = document.getElementById("orchCreateError");
+
+    if (elBtnCreate && elCreateModal) {
+      elBtnCreate.addEventListener("click", async () => {
+        showOrchError(elCreateErr, "");
+        const ownerGrp = document.getElementById("orchNewOwnerGroup");
+        const ownerSel = document.getElementById("orchNewOwner");
+        if (ownerGrp && ownerSel && orchUser?.role === "admin") {
+          ownerGrp.style.display = "";
+          const uRes = await fetch(`${DEFAULT_API_BASE}/api/orch/users`).catch(() => null);
+          if (uRes && uRes.ok) {
+            const uData = await uRes.json();
+            ownerSel.innerHTML = (uData.users || [])
+              .map((u) => `<option value="${escHtml(u.username)}">${escHtml(u.username)} (${escHtml(u.role)})</option>`)
+              .join("");
+            ownerSel.value = orchUser.username;
+          }
+        } else if (ownerGrp) {
+          ownerGrp.style.display = "none";
+        }
+        elCreateModal.style.display = "flex";
+        elCreateModal.classList.add("active");
+      });
+    }
+    const closeCreate = () => {
+      if (elCreateModal) {
+        elCreateModal.style.display = "none";
+        elCreateModal.classList.remove("active");
+      }
+    };
+    if (elCloseCreate) elCloseCreate.addEventListener("click", closeCreate);
+    if (elCancelCreate) elCancelCreate.addEventListener("click", closeCreate);
+
+    if (elSubmitCreate) {
+      elSubmitCreate.addEventListener("click", async () => {
+        showOrchError(elCreateErr, "");
+        const payload = {
+          instanceKey: document.getElementById("orchNewKey")?.value?.trim().toLowerCase() || "",
+          displayName: document.getElementById("orchNewName")?.value?.trim() || "",
+          exchange: document.getElementById("orchNewExchange")?.value || "binance",
+          strategyType: document.getElementById("orchNewStrategy")?.value || "ma_fan_portfolio",
+          portfolioMaxBudgetUsd: Number(document.getElementById("orchNewBudget")?.value || 0),
+          dryRun: Boolean(document.getElementById("orchNewDryRun")?.checked),
+          ownerUsername: orchUser?.role === "admin" ? document.getElementById("orchNewOwner")?.value : orchUser?.username,
+        };
+        const res = await fetch(`${DEFAULT_API_BASE}/api/orch/instances`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showOrchError(elCreateErr, data.error || "สร้าง Instance ไม่สำเร็จ");
+          return;
+        }
+        closeCreate();
+        await fetchOrchInstances(false);
+        setTimeout(() => switchOrchInstance(data.instance.instanceKey), 1500);
+      });
+    }
+
+    // Logs Modal
+    const elLogsModal = document.getElementById("orchLogsModal");
+    const elBtnLogs = document.getElementById("btnOrchLogsInst");
+    const elCloseLogs = document.getElementById("closeOrchLogsBtn");
+    const elRefreshLogs = document.getElementById("btnOrchRefreshLogs");
+    const loadWorkerLogs = async () => {
+      if (!activeOrchKey) return;
+      const elTitle = document.getElementById("orchLogsTitle");
+      const elPre = document.getElementById("orchLogsContent");
+      if (elTitle) elTitle.textContent = `📜 Console Logs: ${activeOrchKey}`;
+      const res = await fetch(`${DEFAULT_API_BASE}/api/orch/instances/${encodeURIComponent(activeOrchKey)}/logs`);
+      if (res.ok && elPre) {
+        const d = await res.json();
+        elPre.textContent = Array.isArray(d.logs) && d.logs.length > 0 ? d.logs.join("\n") : "(ยังไม่มี Log)";
+        elPre.scrollTop = elPre.scrollHeight;
+      }
+    };
+    if (elBtnLogs && elLogsModal) {
+      elBtnLogs.addEventListener("click", () => {
+        elLogsModal.style.display = "flex";
+        elLogsModal.classList.add("active");
+        loadWorkerLogs();
+      });
+    }
+    if (elRefreshLogs) elRefreshLogs.addEventListener("click", loadWorkerLogs);
+    if (elCloseLogs && elLogsModal) {
+      elCloseLogs.addEventListener("click", () => {
+        elLogsModal.style.display = "none";
+        elLogsModal.classList.remove("active");
+      });
+    }
+
+    // Change Password Modal
+    const elCpModal = document.getElementById("orchChangePassModal");
+    const elBtnCp = document.getElementById("btnOrchChangePass");
+    const elCloseCp = document.getElementById("closeOrchChangePassBtn");
+    const elSubmitCp = document.getElementById("submitOrchChangePassBtn");
+    const elCpMsg = document.getElementById("orchChangePassMsg");
+    if (elBtnCp && elCpModal) {
+      elBtnCp.addEventListener("click", () => {
+        showOrchError(elCpMsg, "");
+        elCpModal.style.display = "flex";
+        elCpModal.classList.add("active");
+      });
+    }
+    if (elCloseCp && elCpModal) {
+      elCloseCp.addEventListener("click", () => {
+        elCpModal.style.display = "none";
+        elCpModal.classList.remove("active");
+      });
+    }
+    if (elSubmitCp) {
+      elSubmitCp.addEventListener("click", async () => {
+        showOrchError(elCpMsg, "");
+        const res = await fetch(`${DEFAULT_API_BASE}/api/orch/auth/change-password`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            currentPassword: document.getElementById("orchCurPass")?.value || "",
+            newPassword: document.getElementById("orchNewPass")?.value || "",
+          }),
+        });
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showOrchError(elCpMsg, d.error || "เปลี่ยนรหัสผ่านไม่สำเร็จ");
+          return;
+        }
+        elCpModal.style.display = "none";
+        elCpModal.classList.remove("active");
+        alert("✅ เปลี่ยนรหัสผ่านเรียบร้อยแล้ว");
+      });
+    }
+
+    // Admin Users Management Modal
+    const elUsersModal = document.getElementById("orchUsersModal");
+    const elBtnUsers = document.getElementById("btnOrchManageUsers");
+    const elCloseUsers = document.getElementById("closeOrchUsersBtn");
+    const elAddUserBtn = document.getElementById("btnOrchAddUserSubmit");
+    const elUserMsg = document.getElementById("orchUserFormMsg");
+
+    const loadAdminUsersData = async () => {
+      const [uRes] = await Promise.all([
+        fetch(`${DEFAULT_API_BASE}/api/orch/users`),
+        fetchOrchInstances(false),
+      ]);
+      const uData = uRes.ok ? await uRes.json() : { users: [] };
+      const users = uData.users || [];
+
+      const elTbody = document.getElementById("orchUsersTbody");
+      if (elTbody) {
+        elTbody.innerHTML = users
+          .map((u) => `
+            <tr>
+              <td style="font-weight:700;color:#e2e8f0;">${escHtml(u.username)}</td>
+              <td>${escHtml(u.displayName)}</td>
+              <td><span class="orch-inst-ex">${escHtml(u.role)}</span></td>
+              <td style="display:flex;gap:6px;">
+                <button class="lr-clear-cd-btn" data-reset-user="${escHtml(u.username)}">รีเซ็ตรหัส</button>
+                ${u.username !== orchUser?.username ? `<button class="lr-clear-cd-btn" style="color:#fca5a5;border-color:rgba(248,113,113,0.4);" data-del-user="${escHtml(u.username)}">ลบ</button>` : ""}
+              </td>
+            </tr>
+          `)
+          .join("");
+
+        elTbody.querySelectorAll("[data-reset-user]").forEach((b) => {
+          b.addEventListener("click", async () => {
+            const target = b.getAttribute("data-reset-user");
+            const np = prompt(`ตั้งรหัสผ่านใหม่ให้ "${target}" (อย่างน้อย 4 ตัวอักษร):`);
+            if (!np) return;
+            const r = await fetch(`${DEFAULT_API_BASE}/api/orch/users/${encodeURIComponent(target)}/reset-password`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ newPassword: np }),
+            });
+            const d = await r.json().catch(() => ({}));
+            if (!r.ok) alert(d.error || "ไม่สำเร็จ");
+            else alert(`✅ ตั้งรหัสผ่านใหม่ให้ ${target} แล้ว`);
+          });
+        });
+
+        elTbody.querySelectorAll("[data-del-user]").forEach((b) => {
+          b.addEventListener("click", async () => {
+            const target = b.getAttribute("data-del-user");
+            if (!confirm(`ลบผู้ใช้ "${target}"?`)) return;
+            const r = await fetch(`${DEFAULT_API_BASE}/api/orch/users/${encodeURIComponent(target)}`, { method: "DELETE" });
+            if (r.ok) loadAdminUsersData();
+          });
+        });
+      }
+
+      const elAdminInsts = document.getElementById("orchAdminInstancesList");
+      if (elAdminInsts) {
+        const userOpts = users.map((u) => `<option value="${escHtml(u.username)}">${escHtml(u.username)}</option>`).join("");
+        elAdminInsts.innerHTML = orchInstances
+          .map((inst) => `
+            <div class="lr-list-item">
+              <div style="font-weight:700;color:#e2e8f0;">${escHtml(inst.instanceKey)} <span style="color:#64748b;font-weight:400;">(:${inst.internalPort})</span></div>
+              <div style="display:flex;align-items:center;gap:6px;">
+                <select class="form-select" style="width:auto;padding:3px 8px;font-size:12px;" data-owner-select="${escHtml(inst.instanceKey)}">
+                  ${userOpts}
+                </select>
+                <button class="lr-clear-cd-btn" data-save-owner="${escHtml(inst.instanceKey)}">บันทึกเจ้าของ</button>
+                <button class="lr-clear-cd-btn" style="color:#fca5a5;border-color:rgba(248,113,113,0.4);" data-del-inst="${escHtml(inst.instanceKey)}">ลบ Instance</button>
+              </div>
+            </div>
+          `)
+          .join("");
+
+        orchInstances.forEach((inst) => {
+          const sel = elAdminInsts.querySelector(`[data-owner-select="${inst.instanceKey}"]`);
+          if (sel) sel.value = inst.ownerUsername;
+        });
+
+        elAdminInsts.querySelectorAll("[data-save-owner]").forEach((b) => {
+          b.addEventListener("click", async () => {
+            const k = b.getAttribute("data-save-owner");
+            const sel = elAdminInsts.querySelector(`[data-owner-select="${k}"]`);
+            if (!sel) return;
+            await fetch(`${DEFAULT_API_BASE}/api/orch/instances/${encodeURIComponent(k)}`, {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ ownerUsername: sel.value }),
+            });
+            await fetchOrchInstances(false);
+            alert(`✅ อัปเดตเจ้าของ ${k} -> ${sel.value} แล้ว`);
+          });
+        });
+
+        elAdminInsts.querySelectorAll("[data-del-inst]").forEach((b) => {
+          b.addEventListener("click", async () => {
+            const k = b.getAttribute("data-del-inst");
+            if (!confirm(`ลบ Instance "${k}" ออกจาก Orchestrator? (ประวัติใน DB จะถูกเก็บไว้)`)) return;
+            await fetch(`${DEFAULT_API_BASE}/api/orch/instances/${encodeURIComponent(k)}`, { method: "DELETE" });
+            await fetchOrchInstances(true);
+            await refreshWorkerDashboard();
+            loadAdminUsersData();
+          });
+        });
+      }
+    };
+
+    if (elBtnUsers && elUsersModal) {
+      elBtnUsers.addEventListener("click", () => {
+        showOrchError(elUserMsg, "");
+        elUsersModal.style.display = "flex";
+        elUsersModal.classList.add("active");
+        loadAdminUsersData();
+      });
+    }
+    if (elCloseUsers && elUsersModal) {
+      elCloseUsers.addEventListener("click", () => {
+        elUsersModal.style.display = "none";
+        elUsersModal.classList.remove("active");
+      });
+    }
+    if (elAddUserBtn) {
+      elAddUserBtn.addEventListener("click", async () => {
+        showOrchError(elUserMsg, "");
+        const res = await fetch(`${DEFAULT_API_BASE}/api/orch/users`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            username: document.getElementById("orchAddUserUsername")?.value?.trim() || "",
+            displayName: document.getElementById("orchAddUserDisplay")?.value?.trim() || "",
+            password: document.getElementById("orchAddUserPass")?.value || "",
+            role: document.getElementById("orchAddUserRole")?.value || "owner",
+          }),
+        });
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showOrchError(elUserMsg, d.error || "เพิ่มผู้ใช้ไม่สำเร็จ");
+          return;
+        }
+        document.getElementById("orchAddUserUsername").value = "";
+        document.getElementById("orchAddUserDisplay").value = "";
+        document.getElementById("orchAddUserPass").value = "";
+        loadAdminUsersData();
+      });
+    }
+  }
+
+  async function initOrchestratorMode() {
+    try {
+      const res = await fetch(`${DEFAULT_API_BASE}/api/orch/me`);
+      if (!res.ok) return true; // Standalone single-instance mode
+      const me = await res.json();
+      if (!me || !me.orchestrator) return true;
+
+      isOrchestratorMode = true;
+      const elPortInput = document.getElementById("cfg_dashboardPort")?.closest(".form-group");
+      if (elPortInput) elPortInput.style.display = "none";
+
+      if (!me.authenticated) {
+        const elOverlay = document.getElementById("orchLoginOverlay");
+        const elHint = document.getElementById("orchSeededHint");
+        const elForm = document.getElementById("orchLoginForm");
+        const elErr = document.getElementById("orchLoginError");
+        if (elHint) elHint.style.display = me.seededDefaultAdmin ? "block" : "none";
+        if (elOverlay) elOverlay.style.display = "flex";
+
+        if (elForm) {
+          elForm.addEventListener("submit", async (ev) => {
+            ev.preventDefault();
+            showOrchError(elErr, "");
+            const username = document.getElementById("orchLoginUsername")?.value || "";
+            const password = document.getElementById("orchLoginPassword")?.value || "";
+            const loginRes = await fetch(`${DEFAULT_API_BASE}/api/orch/auth/login`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ username, password }),
+            });
+            const loginData = await loginRes.json().catch(() => ({}));
+            if (!loginRes.ok) {
+              showOrchError(elErr, loginData.error || "เข้าสู่ระบบไม่สำเร็จ");
+              return;
+            }
+            window.location.reload();
+          });
+        }
+        return false;
+      }
+
+      orchUser = me.user;
+      wireOrchUiEvents();
+      await fetchOrchInstances(true);
+      if (!orchPollTimer) {
+        orchPollTimer = setInterval(() => fetchOrchInstances(false).catch(() => {}), 8000);
+      }
+      return true;
+    } catch {
+      return true;
+    }
+  }
+
+  async function bootDashboard() {
+    const ready = await initOrchestratorMode();
+    if (!ready) return;
+    await refreshWorkerDashboard();
+  }
+
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", async () => {
-      await loadSettings();
-      initChart();
-      connectSSE();
-      checkBotPauseStatus();
-      loadTradeManagerData();
-    });
+    document.addEventListener("DOMContentLoaded", bootDashboard);
   } else {
-    (async () => {
-      await loadSettings();
-      initChart();
-      connectSSE();
-      checkBotPauseStatus();
-      loadTradeManagerData();
-    })();
+    bootDashboard();
   }
 })();

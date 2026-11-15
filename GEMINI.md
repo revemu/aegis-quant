@@ -9878,5 +9878,21 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - ซ่อน `tabBtnRotation` และช่อง `group_singleTradingPair` โดยอัตโนมัติเมื่อเลือกกลยุทธ์ `ma_fan_portfolio` เพื่อให้หน้าต่างตั้งค่าเหลือเฉพาะแท็บพอร์ตหลักและกระดานเทรดที่ใช้งานจริง
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.87`** ใน `package.json`, `src/version.ts` และ `public/index.html`
+
+---
+
+## 332. v0.3.0.88 — Multi-Instance Orchestrator & Multi-Owner Auth Hub (`src/orchestrator.ts`, `src/orchestrator-store.ts`, `public/index.html`, `public/app.js`)
+
+- **Single-Port Multi-Instance Orchestrator (`src/orchestrator.ts`, `package.json`)**:
+  - เพิ่ม `npm run orchestrator` (`tsx src/orchestrator.ts`) รันพอร์ตหลักพอร์ตเดียว (`ORCHESTRATOR_PORT` / `PORT` ค่าเริ่มต้น `3333`) ทำหน้าที่ Spawn, ตรวจสอบสุขภาพ, Auto-Restart (Exponential Backoff) และ Stop โปรเซสลูก (`src/index.ts`) แยกกันอย่างอิสระ (Fault Isolation)
+  - Reverse Proxy เส้นทาง `/i/:instanceKey/api/...` และ SSE (`/api/events`) ไปยัง Worker ที่รันแบบ `127.0.0.1` ภายในเท่านั้น
+- **Worker Isolation & Auto-Migration (`src/config.ts`, `src/db.ts`, `src/server.ts`, `src/index.ts`, `src/orchestrator-store.ts`)**:
+  - รองรับ Env `BOT_INSTANCE`, `FORCE_DASHBOARD_PORT`, `DASHBOARD_HOST`, `BOT_DB_PATH` และ `SETTINGS_DB_PATH` เพื่อแยกพอร์ตภายในและไฟล์ DB ของแต่ละ Worker ไม่ให้ชนกัน (ยังคง Backward Compatible กับการรันเดี่ยว `npm start` 100%)
+  - `OrchestratorStore` (PostgreSQL `bot_instances`, `bot_users`, `bot_sessions`) สแกนและ Migrate `instance_key` เดิมจาก `bot_settings` / `bot_strategy_states` (เช่น `binance_dry`, `alpaca_kyne`) เข้า `bot_instances` ให้อัตโนมัติโดยไม่เสียข้อมูลเดิม
+- **Multi-Owner Access Control & Unified Hub UI (`public/index.html`, `public/app.js`, `public/style.css`)**:
+  - รองรับระบบ Login (`scrypt` + `HttpOnly` Cookie Session) แยกสิทธิ์ `admin` (คุมและสร้าง/มอบหมายทุก Instance + จัดการผู้ใช้) และ `owner` (เห็นและสั่งการได้เฉพาะ Instance ของตัวเอง, นอกสิทธิ์ตอบ `403 Forbidden`)
+  - หน้าเว็บตรวจจับ `/api/orch/me` อัตโนมัติ: ในโหมด Orchestrator จะแสดง Login Gate และแถบสลับ Instance ด้านบน (`#orchBar`), ปุ่ม Start/Stop/Restart/Logs, สร้าง Instance ใหม่ และหน้าต่าง Admin จัดการผู้ใช้/เจ้าของ; ในโหมดเดี่ยวซ่อนไว้ทั้งหมด
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.88`** ใน `package.json`, `src/version.ts` และ `public/index.html`
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.86`** ใน `package.json` และ `src/version.ts`

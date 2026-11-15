@@ -19,7 +19,56 @@
 </head>
 
 <body>
+  <!-- ═══════════════════ Orchestrator Login Overlay (Hidden in Standalone Mode) ═══════════════════ -->
+  <div class="orch-login-overlay" id="orchLoginOverlay" style="display: none;">
+    <div class="orch-login-card">
+      <div class="orch-login-header">
+        <span class="orch-login-logo">🎛️</span>
+        <div>
+          <h2>Orchestrator Hub</h2>
+          <p>เข้าสู่ระบบเพื่อจัดการ Bot Instances ของคุณ</p>
+        </div>
+      </div>
+      <div class="orch-login-hint" id="orchSeededHint" style="display: none;">
+        ℹ️ บัญชี Admin เริ่มต้น: <code>admin</code> / <code>admin1234</code> — แนะนำให้เปลี่ยนรหัสผ่านหลังเข้าสู่ระบบ
+      </div>
+      <form id="orchLoginForm" class="orch-login-form">
+        <div class="form-group">
+          <label for="orchLoginUsername">ชื่อผู้ใช้ (Username)</label>
+          <input type="text" id="orchLoginUsername" class="form-input" autocomplete="username" required placeholder="admin" />
+        </div>
+        <div class="form-group">
+          <label for="orchLoginPassword">รหัสผ่าน (Password)</label>
+          <input type="password" id="orchLoginPassword" class="form-input" autocomplete="current-password" required placeholder="••••••••" />
+        </div>
+        <div class="orch-form-error" id="orchLoginError" style="display: none;"></div>
+        <button type="submit" class="btn btn-primary orch-login-submit" id="btnOrchLoginSubmit">🔐 เข้าสู่ระบบ</button>
+      </form>
+    </div>
+  </div>
+
   <div class="app-layout">
+    <!-- ═══════════════════ Orchestrator Instance Switcher Bar (Hidden in Standalone Mode) ═══════════════════ -->
+    <div class="orch-bar" id="orchBar" style="display: none;">
+      <div class="orch-bar-left">
+        <span class="orch-hub-badge" title="Multi-Instance Orchestrator">🎛️ ORCHESTRATOR</span>
+        <div class="orch-instance-tabs" id="orchInstanceTabs"></div>
+        <div class="orch-instance-actions" id="orchInstanceActions">
+          <button class="orch-mini-btn orch-btn-start" id="btnOrchStartInst" title="เปิดทำงาน Instance ที่เลือก" style="display: none;">▶ Start</button>
+          <button class="orch-mini-btn orch-btn-stop" id="btnOrchStopInst" title="หยุด Instance ที่เลือก" style="display: none;">⏹ Stop</button>
+          <button class="orch-mini-btn" id="btnOrchRestartInst" title="รีสตาร์ท Instance ที่เลือก">🔄 Restart</button>
+          <button class="orch-mini-btn" id="btnOrchLogsInst" title="ดู Console Logs ล่าสุด">📜 Logs</button>
+          <button class="orch-mini-btn orch-btn-add" id="btnOrchCreateInst" title="สร้าง Bot Instance ใหม่">＋ เพิ่ม Instance</button>
+        </div>
+      </div>
+      <div class="orch-bar-right">
+        <span class="orch-user-pill" id="orchUserPill">👤 --</span>
+        <button class="orch-mini-btn" id="btnOrchManageUsers" style="display: none;" title="จัดการผู้ใช้ / เจ้าของ Instance (Admin)">👥 ผู้ใช้</button>
+        <button class="orch-mini-btn" id="btnOrchChangePass" title="เปลี่ยนรหัสผ่าน">🔑 รหัสผ่าน</button>
+        <button class="orch-mini-btn orch-btn-logout" id="btnOrchLogout" title="ออกจากระบบ">🚪 ออก</button>
+      </div>
+    </div>
+
     <!-- ═══════════════════ Sleek Top Navigation Bar ═══════════════════ -->
     <header class="top-nav">
       <div class="brand">
@@ -3092,7 +3141,201 @@
     </div>
   </div>
 
-  <script src="app.js?v=0.3.0.87"></script>
+  <!-- ═══════════════════ Orchestrator Sub-Modals ═══════════════════ -->
+  <!-- Create Instance Modal -->
+  <div class="modal-overlay" id="orchCreateModal" style="display: none;">
+    <div class="modal-card" style="max-width: 520px;">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <span class="modal-icon">➕</span>
+          <div>
+            <h2>สร้าง Bot Instance ใหม่</h2>
+            <p class="modal-sub">แยกฐานข้อมูล พอร์ตภายใน และ API Key อัตโนมัติ (เริ่มทำงานในโหมด Pause เพื่อความปลอดภัย)</p>
+          </div>
+        </div>
+        <button class="modal-close-btn" id="closeOrchCreateBtn">&times;</button>
+      </div>
+      <div class="modal-body" style="padding: 16px 20px;">
+        <div class="settings-grid">
+          <div class="form-group">
+            <label for="orchNewKey">รหัส Instance (ID ภาษาอังกฤษ)</label>
+            <input type="text" id="orchNewKey" class="form-input" placeholder="เช่น binance_live หรือ user_a" />
+          </div>
+          <div class="form-group">
+            <label for="orchNewName">ชื่อแสดงผล (Display Name)</label>
+            <input type="text" id="orchNewName" class="form-input" placeholder="เช่น Binance Live Account" />
+          </div>
+          <div class="form-group">
+            <label for="orchNewExchange">กระดานเทรด (Exchange)</label>
+            <select id="orchNewExchange" class="form-select">
+              <option value="binance">🟡 Binance Spot (CEX)</option>
+              <option value="alpaca">🇺🇸 Alpaca US Stocks</option>
+              <option value="dreamdex">🟣 DreamDEX on Somnia (DEX)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="orchNewStrategy">กลยุทธ์หลัก (Strategy)</label>
+            <select id="orchNewStrategy" class="form-select">
+              <option value="ma_fan_portfolio">🚀 MA-Fan Portfolio (แนะนำ)</option>
+              <option value="dynamic_grid">⚙️ Dynamic Grid</option>
+              <option value="ma_ribbon">🎀 MA-Ribbon</option>
+              <option value="swing_trade">🎯 Swing Trade</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="orchNewBudget">งบสูงสุดเริ่มต้น ($ USD | 0 = ทั้งพอร์ต)</label>
+            <input type="number" id="orchNewBudget" class="form-input" value="0" min="0" step="100" />
+          </div>
+          <div class="form-group" id="orchNewOwnerGroup" style="display: none;">
+            <label for="orchNewOwner">เจ้าของ Instance (Owner)</label>
+            <select id="orchNewOwner" class="form-select"></select>
+          </div>
+          <div class="form-group switch-group" style="grid-column: 1 / -1;">
+            <div class="switch-label-group">
+              <span class="switch-title">🧪 เริ่มในโหมดจำลอง (Dry Run Simulation)</span>
+              <span class="switch-desc">แนะนำให้เปิดไว้ก่อนจนกว่าจะตั้งค่า API Key ครบ</span>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="orchNewDryRun" checked />
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+        <div class="orch-form-error" id="orchCreateError" style="display: none; margin-top: 10px;"></div>
+      </div>
+      <div class="modal-footer">
+        <div></div>
+        <div class="modal-footer-btns">
+          <button class="btn btn-secondary" id="cancelOrchCreateBtn">ยกเลิก</button>
+          <button class="btn btn-primary" id="submitOrchCreateBtn">🚀 สร้างและเปิดใช้งาน</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Admin Users Management Modal -->
+  <div class="modal-overlay" id="orchUsersModal" style="display: none;">
+    <div class="modal-card" style="max-width: 720px;">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <span class="modal-icon">👥</span>
+          <div>
+            <h2>จัดการผู้ใช้ &amp; สิทธิ์เจ้าของ Instance (Admin)</h2>
+            <p class="modal-sub">บัญชี Role = owner จะเห็นและควบคุมได้เฉพาะ Instance ที่ตัวเองเป็นเจ้าของ</p>
+          </div>
+        </div>
+        <button class="modal-close-btn" id="closeOrchUsersBtn">&times;</button>
+      </div>
+      <div class="modal-body" style="padding: 16px 20px;">
+        <div class="cfg-section-card">
+          <div class="cfg-section-header">
+            <span class="cfg-section-title">➕ เพิ่มผู้ใช้ใหม่</span>
+          </div>
+          <div class="settings-grid" style="grid-template-columns: repeat(4, minmax(0, 1fr));">
+            <div class="form-group">
+              <label for="orchAddUserUsername">Username</label>
+              <input type="text" id="orchAddUserUsername" class="form-input" placeholder="owner1" />
+            </div>
+            <div class="form-group">
+              <label for="orchAddUserDisplay">ชื่อแสดง</label>
+              <input type="text" id="orchAddUserDisplay" class="form-input" placeholder="คุณเอ" />
+            </div>
+            <div class="form-group">
+              <label for="orchAddUserPass">รหัสผ่าน</label>
+              <input type="password" id="orchAddUserPass" class="form-input" placeholder="ขั้นต่ำ 4 ตัว" />
+            </div>
+            <div class="form-group">
+              <label for="orchAddUserRole">สิทธิ์ (Role)</label>
+              <select id="orchAddUserRole" class="form-select">
+                <option value="owner">owner (เฉพาะบอทตัวเอง)</option>
+                <option value="admin">admin (คุมทั้งหมด)</option>
+              </select>
+            </div>
+          </div>
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px;">
+            <span class="orch-form-error" id="orchUserFormMsg" style="display:none;"></span>
+            <button class="btn btn-primary btn-sm" id="btnOrchAddUserSubmit" style="margin-left:auto;">➕ เพิ่มผู้ใช้</button>
+          </div>
+        </div>
+
+        <div class="lr-table-wrap" style="margin-top: 12px;">
+          <table class="lr-table">
+            <thead>
+              <tr>
+                <th>Username</th>
+                <th>ชื่อแสดง</th>
+                <th>สิทธิ์</th>
+                <th>จัดการ</th>
+              </tr>
+            </thead>
+            <tbody id="orchUsersTbody"></tbody>
+          </table>
+        </div>
+
+        <div class="cfg-section-card" style="margin-top: 14px;">
+          <div class="cfg-section-header">
+            <span class="cfg-section-title">🔗 เปลี่ยนเจ้าของ / ลบ Instance</span>
+          </div>
+          <div id="orchAdminInstancesList" style="display:flex; flex-direction:column; gap:8px;"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Change Own Password Modal -->
+  <div class="modal-overlay" id="orchChangePassModal" style="display: none;">
+    <div class="modal-card" style="max-width: 420px;">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <span class="modal-icon">🔑</span>
+          <div>
+            <h2>เปลี่ยนรหัสผ่านของคุณ</h2>
+          </div>
+        </div>
+        <button class="modal-close-btn" id="closeOrchChangePassBtn">&times;</button>
+      </div>
+      <div class="modal-body" style="padding: 16px 20px;">
+        <div class="form-group">
+          <label for="orchCurPass">รหัสผ่านเดิม</label>
+          <input type="password" id="orchCurPass" class="form-input" />
+        </div>
+        <div class="form-group" style="margin-top:10px;">
+          <label for="orchNewPass">รหัสผ่านใหม่ (อย่างน้อย 4 ตัวอักษร)</label>
+          <input type="password" id="orchNewPass" class="form-input" />
+        </div>
+        <div class="orch-form-error" id="orchChangePassMsg" style="display:none; margin-top:8px;"></div>
+      </div>
+      <div class="modal-footer">
+        <div></div>
+        <div class="modal-footer-btns">
+          <button class="btn btn-primary" id="submitOrchChangePassBtn">💾 บันทึกรหัสผ่านใหม่</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Worker Console Logs Modal -->
+  <div class="modal-overlay" id="orchLogsModal" style="display: none;">
+    <div class="modal-card" style="max-width: 820px;">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <span class="modal-icon">📜</span>
+          <div>
+            <h2 id="orchLogsTitle">Instance Logs</h2>
+          </div>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <button class="btn btn-secondary btn-sm" id="btnOrchRefreshLogs">🔄 รีเฟรช</button>
+          <button class="modal-close-btn" id="closeOrchLogsBtn">&times;</button>
+        </div>
+      </div>
+      <div class="modal-body" style="padding: 12px 16px;">
+        <pre id="orchLogsContent" class="orch-logs-pre">กำลังโหลด...</pre>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js?v=0.3.0.88"></script>
 </body>
 
 </html>

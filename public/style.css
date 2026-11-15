@@ -5029,3 +5029,208 @@ input:checked + .slider:before { transform: translateX(20px); }
 .cfg-advanced-body {
   padding: 14px 16px;
 }
+
+/* ── Multi-Instance Orchestrator Bar & Login Gate ── */
+.orch-login-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: radial-gradient(circle at top, rgba(15, 23, 42, 0.96), rgba(2, 6, 23, 0.98));
+  backdrop-filter: blur(10px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.orch-login-card {
+  width: 100%;
+  max-width: 400px;
+  background: rgba(15, 23, 42, 0.92);
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.65);
+}
+.orch-login-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.orch-login-logo {
+  font-size: 2rem;
+}
+.orch-login-header h2 {
+  margin: 0;
+  font-size: 1.2rem;
+  color: #f8fafc;
+}
+.orch-login-header p {
+  margin: 2px 0 0;
+  font-size: 0.78rem;
+  color: #94a3b8;
+}
+.orch-login-hint {
+  background: rgba(251, 191, 36, 0.1);
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  color: #fde68a;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 0.75rem;
+  margin-bottom: 14px;
+}
+.orch-login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.orch-login-submit {
+  width: 100%;
+  margin-top: 4px;
+  padding: 10px;
+  font-weight: 700;
+}
+.orch-form-error {
+  color: #fca5a5;
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 0.76rem;
+}
+
+.orch-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 14px;
+  background: rgba(10, 15, 28, 0.92);
+  border-bottom: 1px solid rgba(56, 189, 248, 0.18);
+  flex-wrap: wrap;
+}
+.orch-bar-left,
+.orch-bar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.orch-hub-badge {
+  font-size: 0.72rem;
+  font-weight: 800;
+  color: #38bdf8;
+  letter-spacing: 0.5px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: rgba(56, 189, 248, 0.12);
+  border: 1px solid rgba(56, 189, 248, 0.25);
+}
+.orch-instance-tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.orch-inst-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  font-size: 0.76rem;
+  font-weight: 600;
+  background: rgba(30, 41, 59, 0.7);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  color: #cbd5e1;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.orch-inst-pill:hover {
+  background: rgba(51, 65, 85, 0.85);
+  color: #f8fafc;
+}
+.orch-inst-pill.active {
+  background: rgba(14, 165, 233, 0.2);
+  border-color: #38bdf8;
+  color: #f0f9ff;
+}
+.orch-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+  background: #64748b;
+}
+.orch-dot.running {
+  background: #4ade80;
+  box-shadow: 0 0 6px #4ade80;
+}
+.orch-dot.crashed {
+  background: #f87171;
+  box-shadow: 0 0 6px #f87171;
+}
+.orch-dot.starting {
+  background: #fbbf24;
+}
+.orch-inst-ex {
+  font-size: 0.66rem;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #94a3b8;
+  text-transform: uppercase;
+}
+.orch-instance-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.orch-mini-btn {
+  padding: 4px 9px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  border-radius: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(30, 41, 59, 0.65);
+  color: #cbd5e1;
+  cursor: pointer;
+}
+.orch-mini-btn:hover {
+  background: rgba(51, 65, 85, 0.9);
+  color: #fff;
+}
+.orch-btn-add {
+  border-color: rgba(56, 189, 248, 0.4);
+  color: #7dd3fc;
+}
+.orch-btn-start {
+  border-color: rgba(74, 222, 128, 0.4);
+  color: #4ade80;
+}
+.orch-btn-stop {
+  border-color: rgba(248, 113, 113, 0.4);
+  color: #fca5a5;
+}
+.orch-user-pill {
+  font-size: 0.74rem;
+  font-weight: 600;
+  color: #e2e8f0;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: rgba(30, 41, 59, 0.6);
+}
+.orch-logs-pre {
+  background: #020617;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 10px;
+  padding: 12px;
+  max-height: 440px;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.74rem;
+  line-height: 1.45;
+  color: #cbd5e1;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
