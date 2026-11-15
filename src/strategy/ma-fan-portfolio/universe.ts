@@ -122,9 +122,14 @@ export function buildSymbolIndicators(symbol: string, c15: Candle[], c1h: Candle
   const closed15 = c15.filter((c) => c.isClosed !== false);
   if (closed15.length < 205) return null;
 
+  let lastClosedIdx = c15.length - 1;
+  while (lastClosedIdx >= 0 && c15[lastClosedIdx]!.isClosed === false) {
+    lastClosedIdx--;
+  }
+  if (lastClosedIdx < 204) return null;
+
   const closes15 = c15.map((c) => c.close);
   const closes1h = c1h.map((c) => c.close);
-  const lastClosedIdx = closed15.length - 1;
 
   return {
     symbol,
@@ -140,7 +145,7 @@ export function buildSymbolIndicators(symbol: string, c15: Candle[], c1h: Candle
     macdHist15: calcMACD(c15).hist,
     rsi1h: c1h.length >= 20 ? calcRSI(c1h, 14) : new Array(c1h.length).fill(50),
     lastClosedIdx,
-    lastClosedTime: closed15[lastClosedIdx]!.time,
+    lastClosedTime: c15[lastClosedIdx]!.time,
     livePrice: livePrice && livePrice > 0 ? livePrice : c15[c15.length - 1]!.close,
   };
 }

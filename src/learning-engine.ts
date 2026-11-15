@@ -36,6 +36,19 @@ function clamp(v: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, v));
 }
 
+function normalizeBlockReasonKey(rawReason: string | null | undefined): string {
+  const first = (rawReason || "OTHER").split(",")[0]?.trim() || "OTHER";
+  if (first === "MACRO_SIT_OUT" || first === "FILTER_FAIL") return first;
+  if (first.startsWith("FILTER:")) {
+    const detail = first.slice("FILTER:".length).trim();
+    if (detail.startsWith("1hRSI")) return "FILTER:1hRSI<40";
+    if (detail.startsWith("VolR")) return "FILTER:VolR<1.3";
+    if (detail.startsWith("RS")) return "FILTER:RS<-1%";
+    if (detail.includes("Cooldown")) return "FILTER:Cooldown";
+  }
+  return first;
+}
+
 export class LearningEngine {
   private readonly db: BotDatabase;
   private readonly log: (msg: string) => void;
@@ -473,7 +486,7 @@ export class LearningEngine {
 
     const blockedStatsMap = new Map<string, { total: number; wouldWin: number; wouldLose: number; avgRetPct: number }>();
     for (const b of evaluatedBlocked) {
-      const key = (b.blockReason || "OTHER").split(",")[0]!;
+      const key = normalizeBlockReasonKey(b.blockReason);
       const cur = blockedStatsMap.get(key) || { total: 0, wouldWin: 0, wouldLose: 0, avgRetPct: 0 };
       cur.total++;
       if (b.counterfactualVerdict === "WOULD_WIN") cur.wouldWin++;

@@ -9825,3 +9825,20 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - **Bounded SL Nudge**: ขยับ `portfolioDisasterSlPct` ในกรอบ `[2.5%, 5.0%]` ทีละไม่เกิน `±0.25%` จาก `WinMAE_P80 + 0.8%` เมื่อมี sample ปิดไม้ `>= 20` ไม้ และไม่ถี่กว่า 7 วัน/ครั้ง
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.83`** ใน `package.json` และ `src/version.ts`
+
+---
+
+## 328. v0.3.0.84 — Portfolio Live Reliability, Benchmark Quote Sync & Learning Breakdown Fixes (`src/strategy/ma-fan-portfolio/index.ts`, `universe.ts`, `src/learning-engine.ts`)
+
+- **Guard Learning Blocked Signals During Closed/Paused States (`src/strategy/ma-fan-portfolio/index.ts`)**:
+  - เรียก `this.learning.recordBlockedSignals(...)` เฉพาะเมื่อ `canExecute` (`!this.isPaused && !this.isMarketClosed`) ป้องกันการบันทึก `BLOCKED_SIGNAL` นอกเวลาตลาด (เช่น วันหยุด US Equities บน Alpaca)
+- **Normalize Filter Breakdown Keys in Learning Report (`src/learning-engine.ts`)**:
+  - เพิ่ม `normalizeBlockReasonKey()` ใน `buildReport()` เพื่อรวมสถิติ `FILTER:1hRSI<40`, `FILTER:VolR<1.3`, `FILTER:RS<-1%`, `FILTER:Cooldown`, `MACRO_SIT_OUT` แทนการแยกบรรทัดตามค่าตัวเลขดิบ
+- **Binance Benchmark 15m Live Price Sync & Feed Telemetry (`src/strategy/ma-fan-portfolio/index.ts`)**:
+  - ใน `refreshLiveQuotes()` ของ Binance ให้อัปเดตราคา `this.benchmarkSymbol` เข้า `this.benchmark15m` ทุก 5 วินาทีเพื่อให้ `macro.benchmarkPrice` และ `benchmarkRet24h` สดต่อเนื่อง
+  - รายงาน `wsConnected` / `wsSubscribedCount` ของ Binance Portfolio ตามสถานะ live quote polling (`snapshots.size > 0 && now - lastSnapshotPollTs < 30s`) และไม่ส่ง `alpacaBaseUrl` ติดไปใน tick ของกระดานอื่น
+- **Exact Closed Candle Index & Safe TP1 Flag (`src/strategy/ma-fan-portfolio/universe.ts`, `index.ts`)**:
+  - ใน `buildSymbolIndicators()` หา `lastClosedIdx` โดยไล่ย้อนจากท้ายอาร์เรย์ `c15` แทนการใช้ `closed15.length - 1`
+  - ให้ `executeExitSlot()` คืนค่า `Promise<boolean>` และเซ็ต `slot.tp1Done = true` เฉพาะเมื่อคำสั่งขาย TP1 สำเร็จ (พร้อมสะท้อน error ใน `closeSlot()`)
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.84`** ใน `package.json` และ `src/version.ts`

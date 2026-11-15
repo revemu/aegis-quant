@@ -746,8 +746,9 @@ export class MaFanPortfolioStrategy implements IStrategy {
     if (idx < 0) return { success: false, error: `Slot ${slotIndex + 1} is empty` };
     const slot = this.slots[idx]!;
     const exitPrice = this.snapshots.get(slot.symbol)?.livePrice || slot.lastKnownPrice || slot.entryPrice;
-    await this.executeExitSlot(slot, slot.qty, exitPrice, reason, true);
+    const ok = await this.executeExitSlot(slot, slot.qty, exitPrice, reason, true);
     this.emitTelemetryTick();
+    if (!ok) return { success: false, symbol: slot.symbol, error: `Failed to execute exit order for ${slot.symbol}` };
     return { success: true, symbol: slot.symbol };
   }
 
@@ -941,6 +942,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
           if (sym === this.inspectedSymbol) inspectedUpdated = true;
         }
       }
+      const benchPx = this.benchmarkSymbol ? priceMap.get(this.benchmarkSymbol) : undefined;
+      if (benchPx && benchPx > 0 && this.benchmark15m.length > 0) {
+        this.updateCandleBarWithLivePrice(this.benchmark15m, 900, benchPx, nowMs);
+      }
       if (inspectedUpdated) {
         this.emitInspectedChartCandles({ force: true });
       }
@@ -1039,10 +1044,12 @@ export class MaFanPortfolioStrategy implements IStrategy {
           this.log(`🛡️ [Slot ${slot.slotIndex + 1} ${slot.symbol}] Reached ${tp1Mode} ($${tp1TargetPrice.toFixed(2)}) -> Locked Breakeven!`);
         }
         if (this.cfg.portfolioPartialTpAtEma200 !== false && !slot.tp1Done) {
-          slot.tp1Done = true;
           const halfQty = slot.qty * 0.5;
-          await this.executeExitSlot(slot, halfQty, px, `TP1_${tp1Mode}`, false);
-          changed = true;
+          const sold = await this.executeExitSlot(slot, halfQty, px, `TP1_${tp1Mode}`, false);
+          if (sold) {
+            slot.tp1Done = true;
+            changed = true;
+          }
         }
         if (changed) this.saveState(true);
       }
@@ -1213,9 +1220,9 @@ export class MaFanPortfolioStrategy implements IStrategy {
     this.radarList = newRadar;
     this.syncAlpacaWsSubscriptions();
 
-    // Learning Level 1 & 3: Record near-miss blocked signals & run periodic bounded learning cycle
+    // Learning Level 1 & 3: Record near-miss blocked signals only when active & market open, and run periodic bounded learning cycle
     const latestClosedBarSec = this.snapshots.get(this.inspectedSymbol)?.lastClosedTime || 0;
-    if (latestClosedBarSec > 0) {
+    if (canExecute && latestClosedBarSec > 0) {
       void this.learning.recordBlockedSignals({
         exchange: this.exchange.exchangeName,
         barTimeSec: latestClosedBarSec,
@@ -1412,7 +1419,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
     refPrice: number,
     reason: string,
     closeFullSlot: boolean,
-  ): Promise<void> {
+  ): Promise<boolean> {
     let sellQty = Math.min(slot.qty, rawSellQty);
     let execPrice = refPrice;
     let orderId = `sim_sell_${Date.now()}_${slot.slotIndex}`;
@@ -1421,7 +1428,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       const symInfo = await this.exchange.getExchangeInfo(slot.symbol).catch(() => this.symbolInfo);
       const stepSize = symInfo.stepSize || 0.0001;
       sellQty = closeFullSlot ? slot.qty : Math.floor(sellQty / stepSize) * stepSize;
-      if (sellQty <= 0) return;
+      if (sellQty <= 0) return false;
 
       if (!this.cfg.dryRun && this.exchange.hasCredentials()) {
         const orderRes = await this.exchange.placeOrder({
@@ -1441,7 +1448,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       }
     } catch (err) {
       this.log(`❌ [Slot ${slot.slotIndex + 1} ${slot.symbol}] Exit (${reason}) failed: ${(err as Error).message}`);
-      return;
+      return false;
     }
 
     const proceeds = sellQty * execPrice;
@@ -1519,6 +1526,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
 
     this.saveState(true);
     this.log(`💰 [Slot ${slot.slotIndex + 1} EXIT ${reason}] Sold ${sellQty} ${slot.symbol} @ $${execPrice.toFixed(2)} | PnL: ${legPnl >= 0 ? "+" : ""}$${legPnl.toFixed(2)}`);
+    return true;
   }
 
   // ── Telemetry Construction ─────────────────────────────────────────────────
@@ -1681,7 +1689,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       supervisorTimeframe: "1h",
       exchange: this.exchange.exchangeName,
       dryRun: this.cfg.dryRun,
-      alpacaBaseUrl: this.cfg.alpacaBaseUrl,
+      ...(isAlpaca ? { alpacaBaseUrl: this.cfg.alpacaBaseUrl } : {}),
       symbol: inspectedSym,
       baseAsset: isAlpaca ? inspectedSym : inspectedSym.replace(/(FDUSD|USDT|USDC)$/i, ""),
       quoteAsset,
@@ -1734,8 +1742,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
         inspectedEmas: inspectedSlot?.emas || this.radarList.find((r) => r.symbol === inspectedSym) || null,
         tp1Mode: this.cfg.portfolioTp1TargetMode || "EMA200",
         disasterSlPct: Number(this.cfg.portfolioDisasterSlPct ?? 3.5),
-        wsConnected: this.wsConnected,
-        wsSubscribedCount: this.alpacaWs?.getSubscribedSymbols().length || 0,
+        wsConnected: isAlpaca
+          ? this.wsConnected
+          : (this.snapshots.size > 0 && Date.now() - this.lastSnapshotPollTs < 30_000),
+        wsSubscribedCount: isAlpaca ? (this.alpacaWs?.getSubscribedSymbols().length || 0) : this.snapshots.size,
       },
     };
 
