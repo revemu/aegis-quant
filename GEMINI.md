@@ -9842,3 +9842,14 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - ให้ `executeExitSlot()` คืนค่า `Promise<boolean>` และเซ็ต `slot.tp1Done = true` เฉพาะเมื่อคำสั่งขาย TP1 สำเร็จ (พร้อมสะท้อน error ใน `closeSlot()`)
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.84`** ใน `package.json` และ `src/version.ts`
+
+---
+
+## 329. v0.3.0.85 — Alpaca Paper Auto-Tune Support & Settings UI Control (`src/learning-engine.ts`, `public/index.html`, `public/app.js`)
+
+- **Auto-Detect Alpaca Paper in `dry_run_only` Mode (`src/learning-engine.ts`)**:
+  - ปรับ `isAutoTuneAllowed()` ให้รองรับ `exchange === "alpaca"` ที่ใช้ `alpacaBaseUrl` ฝั่ง `paper-api` (`paper-api.alpaca.markets`) ถือเป็นพอร์ต Paper/Dry-Run ภายใต้นโยบาย `dry_run_only` อัตโนมัติ (โดยที่ Live API จริงยังปลอดภัย)
+- **Settings UI Control for `learningAutoTuneMode` (`public/index.html`, `public/app.js`)**:
+  - เพิ่มตัวเลือก Dropdown `🧠 Learning Engine Auto-Tune (Level 3)` (`dry_run_only` / `all` / `off`) ในแท็บ Portfolio Settings พร้อมเชื่อมต่อการโหลดและบันทึกค่าผ่าน `/api/db/settings`
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.85`** ใน `package.json` และ `src/version.ts`

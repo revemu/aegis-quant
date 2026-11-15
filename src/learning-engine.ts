@@ -49,6 +49,8 @@ function normalizeBlockReasonKey(rawReason: string | null | undefined): string {
   return first;
 }
 
+export type LearningAutoTuneConfig = Pick<Config, "learningAutoTuneMode" | "dryRun" | "exchange" | "alpacaBaseUrl">;
+
 export class LearningEngine {
   private readonly db: BotDatabase;
   private readonly log: (msg: string) => void;
@@ -67,11 +69,14 @@ export class LearningEngine {
     return this.db.getPgStore();
   }
 
-  public isAutoTuneAllowed(cfg: Pick<Config, "learningAutoTuneMode" | "dryRun">): boolean {
+  public isAutoTuneAllowed(cfg: LearningAutoTuneConfig): boolean {
     const mode = cfg.learningAutoTuneMode || "dry_run_only";
     if (mode === "off") return false;
     if (mode === "all") return true;
-    return Boolean(cfg.dryRun);
+    const isAlpacaPaper =
+      String(cfg.exchange || "").toLowerCase() === "alpaca" &&
+      String(cfg.alpacaBaseUrl || "").toLowerCase().includes("paper-api");
+    return Boolean(cfg.dryRun || isAlpacaPaper);
   }
 
   public async ensureSymbolStatesLoaded(): Promise<void> {
@@ -87,13 +92,13 @@ export class LearningEngine {
     } catch {}
   }
 
-  public isSymbolOnCooldown(symbol: string, cfg: Pick<Config, "learningAutoTuneMode" | "dryRun">): boolean {
+  public isSymbolOnCooldown(symbol: string, cfg: LearningAutoTuneConfig): boolean {
     if (!this.isAutoTuneAllowed(cfg)) return false;
     const st = this.symbolStates.get(symbol.toUpperCase());
     return Boolean(st && st.cooldownUntilMs > Date.now());
   }
 
-  public getSymbolScorePenalty(symbol: string, cfg: Pick<Config, "learningAutoTuneMode" | "dryRun">): number {
+  public getSymbolScorePenalty(symbol: string, cfg: LearningAutoTuneConfig): number {
     if (!this.isAutoTuneAllowed(cfg)) return 0;
     const st = this.symbolStates.get(symbol.toUpperCase());
     if (!st) return 0;
@@ -165,7 +170,7 @@ export class LearningEngine {
     totalPnlQuote: number;
     allocatedQuote: number;
     exitReason: string;
-    cfg: Pick<Config, "learningAutoTuneMode" | "dryRun">;
+    cfg: LearningAutoTuneConfig;
   }): Promise<void> {
     const pg = this.getPg();
     if (!pg) return;

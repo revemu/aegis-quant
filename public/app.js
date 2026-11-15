@@ -6188,6 +6188,7 @@
       setVal("cfg_portfolioDisasterSlPct", data.portfolioDisasterSlPct ?? 3.5);
       setVal("cfg_portfolioSitOutMode", data.portfolioSitOutMode || "dual");
       setVal("cfg_portfolioMaxHoldHours", data.portfolioMaxHoldHours ?? 0);
+      setVal("cfg_learningAutoTuneMode", data.learningAutoTuneMode || "dry_run_only");
       setCheck("cfg_portfolioPartialTpAtEma200", data.portfolioPartialTpAtEma200 !== false);
       setCheck("cfg_portfolioLockBreakevenAtEma200", data.portfolioLockBreakevenAtEma200 !== false);
 
@@ -6509,6 +6510,7 @@
       portfolioDisasterSlPct: parseFloat(document.getElementById("cfg_portfolioDisasterSlPct")?.value || "3.5") || 3.5,
       portfolioSitOutMode: document.getElementById("cfg_portfolioSitOutMode")?.value || "dual",
       portfolioMaxHoldHours: parseFloat(document.getElementById("cfg_portfolioMaxHoldHours")?.value || "0") || 0,
+      learningAutoTuneMode: document.getElementById("cfg_learningAutoTuneMode")?.value || "dry_run_only",
       portfolioPartialTpAtEma200: document.getElementById("cfg_portfolioPartialTpAtEma200")
         ? Boolean(document.getElementById("cfg_portfolioPartialTpAtEma200").checked)
         : true,
