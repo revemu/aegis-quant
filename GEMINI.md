@@ -9894,5 +9894,21 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - หน้าเว็บตรวจจับ `/api/orch/me` อัตโนมัติ: ในโหมด Orchestrator จะแสดง Login Gate และแถบสลับ Instance ด้านบน (`#orchBar`), ปุ่ม Start/Stop/Restart/Logs, สร้าง Instance ใหม่ และหน้าต่าง Admin จัดการผู้ใช้/เจ้าของ; ในโหมดเดี่ยวซ่อนไว้ทั้งหมด
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.88`** ใน `package.json`, `src/version.ts` และ `public/index.html`
+
+---
+
+## 333. v0.3.0.89 — Multi-Node Distributed Lease Lock, Cluster Proxy & Env Admin Sync (`src/orchestrator.ts`, `src/orchestrator-store.ts`, `src/orch-set-admin.ts`, `public/*`)
+
+- **PostgreSQL Admin Credential Sync & CLI Tool (`src/orchestrator.ts`, `src/orchestrator-store.ts`, `src/orch-set-admin.ts`)**:
+  - ใช้ `dotenv.config({ override: true })` เพื่อให้การแก้ไข `.env` มีผลทันทีเมื่อ Restart แม้รันผ่าน PM2
+  - `seedOrSyncEnvAdmin()` ทำ `UPSERT` บัญชี `ORCH_ADMIN_USER` เมื่อมีการตั้ง `ORCH_ADMIN_PASSWORD` ใน `.env` ทุกครั้งที่บูต (โดยไม่แตะต้องบัญชี `owner` อื่น) พร้อมเพิ่มคำสั่ง `npm run orch:set-admin -- <user> <pass>`
+- **Multi-Node Cluster & Atomic Distributed Lease Lock (`src/orchestrator-store.ts`, `src/orchestrator.ts`)**:
+  - เพิ่มตาราง `bot_nodes` และคอลัมน์ `preferred_node_id`, `lease_node_id`, `lease_expires_ms` ใน `bot_instances`
+  - Lease Reconciler (ทุก 4 วิ, TTL 20 วิ) ใช้ Atomic `UPDATE ... RETURNING` กระจาย Instance ไปยัง Node ที่โหลดน้อยสุด (`running_count ASC`), กันการเปิดซ้ำข้ามเครื่อง 100%, รองรับ Pin โหนด และ Auto-Failover เมื่ออีกโหนดดับ
+  - Reverse Proxy ข้ามโหนดผ่าน `/internal/i/:key/...` (ยืนยันด้วย `x-orch-cluster-key`) รองรับทั้ง REST, SSE, Logs และ Start/Stop/Restart ข้ามเครื่องเมื่อวางหลัง Load Balancer
+- **Login UI & Console Polish (`public/style.css`, `public/app.js`, `public/index.html`)**:
+  - ปรับ `.form-input` ใน Modal/Login เป็นธีมมืด, หยุดยิง `/api/rotation/status` ก่อน Login, และแสดงโหนดที่รัน/ปักหมุดโหนดในหน้า Admin
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.89`** ใน `package.json`, `src/version.ts` และ `public/index.html`
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.86`** ใน `package.json` และ `src/version.ts`

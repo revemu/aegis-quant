@@ -1,6 +1,6 @@
 /**
- * PostgreSQL-backed Registry, Multi-Owner User Auth & Session Store
- * for the Multi-Instance Bot Orchestrator.
+ * PostgreSQL-backed Cluster Node Registry, Distributed Instance Lease Lock,
+ * Multi-Owner User Auth & Session Store for the Multi-Instance Bot Orchestrator.
  */
 
 import crypto from "node:crypto";
@@ -22,20 +22,32 @@ export interface OrchInstance {
   ownerUsername: string;
   enabled: boolean;
   internalPort: number;
+  preferredNodeId: string | null;
+  leaseNodeId: string | null;
+  leaseExpiresMs: number;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface OrchNode {
+  nodeId: string;
+  advertiseUrl: string;
+  runningCount: number;
+  maxWorkers: number;
+  lastHeartbeatMs: number;
+  startedAt: number;
 }
 
 const SESSION_TTL_MS = 30 * 24 * 3_600_000;
 const BASE_INTERNAL_PORT = 13333;
 
-function hashPassword(password: string): string {
+export function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16).toString("hex");
   const hash = crypto.scryptSync(password, salt, 64).toString("hex");
   return `${salt}:${hash}`;
 }
 
-function verifyPassword(password: string, stored: string): boolean {
+export function verifyPassword(password: string, stored: string): boolean {
   const parts = String(stored || "").split(":");
   if (parts.length !== 2) return false;
   const [salt, hex] = parts;
@@ -67,7 +79,7 @@ export class OrchestratorStore {
   constructor(databaseUrl: string, log?: (msg: string) => void) {
     this.log = log ?? ((m) => console.log(`[orch-store] ${m}`));
     this.sql = postgres(databaseUrl, {
-      max: 6,
+      max: 8,
       idle_timeout: 20,
       connect_timeout: 10,
       onnotice: () => {},
@@ -101,44 +113,79 @@ export class OrchestratorStore {
     `;
 
     await this.sql`
+      CREATE TABLE IF NOT EXISTS bot_nodes (
+        node_id TEXT PRIMARY KEY,
+        advertise_url TEXT NOT NULL,
+        running_count INT NOT NULL DEFAULT 0,
+        max_workers INT NOT NULL DEFAULT 20,
+        last_heartbeat_ms BIGINT NOT NULL,
+        started_at BIGINT NOT NULL
+      )
+    `;
+
+    await this.sql`
       CREATE TABLE IF NOT EXISTS bot_instances (
         instance_key TEXT PRIMARY KEY,
         display_name TEXT NOT NULL,
         owner_username TEXT NOT NULL,
         enabled BOOLEAN NOT NULL DEFAULT TRUE,
         internal_port INT NOT NULL,
+        preferred_node_id TEXT DEFAULT NULL,
+        lease_node_id TEXT DEFAULT NULL,
+        lease_expires_ms BIGINT NOT NULL DEFAULT 0,
         created_at BIGINT NOT NULL,
         updated_at BIGINT NOT NULL
       )
     `;
 
+    // Idempotent column upgrades for existing v0.3.0.88 databases
+    await this.sql`ALTER TABLE bot_instances ADD COLUMN IF NOT EXISTS preferred_node_id TEXT DEFAULT NULL`;
+    await this.sql`ALTER TABLE bot_instances ADD COLUMN IF NOT EXISTS lease_node_id TEXT DEFAULT NULL`;
+    await this.sql`ALTER TABLE bot_instances ADD COLUMN IF NOT EXISTS lease_expires_ms BIGINT NOT NULL DEFAULT 0`;
+
     // Cleanup expired sessions on boot
     await this.sql`DELETE FROM bot_sessions WHERE expires_at < ${Date.now()}`;
 
-    await this.seedDefaultAdminIfNeeded();
+    await this.seedOrSyncEnvAdmin();
     await this.syncDiscoveredInstances();
   }
 
-  private async seedDefaultAdminIfNeeded(): Promise<void> {
+  /**
+   * Syncs ORCH_ADMIN_USER / ORCH_ADMIN_PASSWORD into PostgreSQL `bot_users`:
+   *  - Whenever ORCH_ADMIN_PASSWORD is set in `.env`, ensures that admin user exists
+   *    and matches the `.env` password (leaves all other users/owners untouched).
+   *  - If ORCH_ADMIN_PASSWORD is NOT set and `bot_users` is empty, seeds admin/admin1234.
+   */
+  private async seedOrSyncEnvAdmin(): Promise<void> {
     const [{ cnt }] = await this.sql<{ cnt: string }[]>`SELECT COUNT(*)::text AS cnt FROM bot_users`;
     const envAdminUser = (process.env.ORCH_ADMIN_USER || "admin").trim().toLowerCase();
     const envAdminPass = process.env.ORCH_ADMIN_PASSWORD?.trim();
+    const now = Date.now();
 
-    if (Number(cnt) === 0) {
-      const initialPass = envAdminPass || "admin1234";
-      const now = Date.now();
+    if (envAdminPass) {
       await this.sql`
         INSERT INTO bot_users (username, display_name, password_hash, role, created_at, updated_at)
-        VALUES (${envAdminUser}, ${"Administrator"}, ${hashPassword(initialPass)}, 'admin', ${now}, ${now})
+        VALUES (${envAdminUser}, ${envAdminUser}, ${hashPassword(envAdminPass)}, 'admin', ${now}, ${now})
+        ON CONFLICT (username) DO UPDATE SET
+          password_hash = EXCLUDED.password_hash,
+          role = 'admin',
+          updated_at = EXCLUDED.updated_at
+      `;
+      this.adminUsername = envAdminUser;
+      this.seededDefaultAdmin = false;
+      this.log(`🔑 Synced admin account "${envAdminUser}" credentials from .env`);
+      return;
+    }
+
+    if (Number(cnt) === 0) {
+      await this.sql`
+        INSERT INTO bot_users (username, display_name, password_hash, role, created_at, updated_at)
+        VALUES (${envAdminUser}, ${"Administrator"}, ${hashPassword("admin1234")}, 'admin', ${now}, ${now})
         ON CONFLICT (username) DO NOTHING
       `;
       this.adminUsername = envAdminUser;
-      if (!envAdminPass) {
-        this.seededDefaultAdmin = true;
-        this.log(`⚠️ Seeded initial admin user "${envAdminUser}" with default password "admin1234" — please change it in UI or set ORCH_ADMIN_PASSWORD!`);
-      } else {
-        this.log(`✅ Seeded initial admin user "${envAdminUser}" from ORCH_ADMIN_PASSWORD.`);
-      }
+      this.seededDefaultAdmin = true;
+      this.log(`⚠️ Seeded initial admin user "${envAdminUser}" with default password "admin1234" — set ORCH_ADMIN_PASSWORD in .env or change in UI.`);
       return;
     }
 
@@ -204,6 +251,123 @@ export class OrchestratorStore {
     let port = BASE_INTERNAL_PORT;
     while (usedPorts.has(port)) port++;
     return port;
+  }
+
+  private mapInstanceRow(r: any): OrchInstance {
+    return {
+      instanceKey: String(r.instance_key),
+      displayName: String(r.display_name || r.instance_key),
+      ownerUsername: String(r.owner_username),
+      enabled: Boolean(r.enabled),
+      internalPort: Number(r.internal_port),
+      preferredNodeId: r.preferred_node_id ? String(r.preferred_node_id) : null,
+      leaseNodeId: r.lease_node_id ? String(r.lease_node_id) : null,
+      leaseExpiresMs: Number(r.lease_expires_ms || 0),
+      createdAt: Number(r.created_at),
+      updatedAt: Number(r.updated_at),
+    };
+  }
+
+  // ── Cluster Nodes & Distributed Lease Lock ──────────────────────────────
+
+  public async upsertNodeHeartbeat(node: OrchNode): Promise<void> {
+    await this.sql`
+      INSERT INTO bot_nodes (node_id, advertise_url, running_count, max_workers, last_heartbeat_ms, started_at)
+      VALUES (${node.nodeId}, ${node.advertiseUrl}, ${node.runningCount}, ${node.maxWorkers}, ${node.lastHeartbeatMs}, ${node.startedAt})
+      ON CONFLICT (node_id) DO UPDATE SET
+        advertise_url = EXCLUDED.advertise_url,
+        running_count = EXCLUDED.running_count,
+        max_workers = EXCLUDED.max_workers,
+        last_heartbeat_ms = EXCLUDED.last_heartbeat_ms
+    `;
+  }
+
+  public async listActiveNodes(staleMs = 20_000): Promise<OrchNode[]> {
+    const cutoff = Date.now() - staleMs;
+    const rows = await this.sql<any[]>`
+      SELECT * FROM bot_nodes
+      WHERE last_heartbeat_ms >= ${cutoff}
+      ORDER BY running_count ASC, node_id ASC
+    `;
+    return rows.map((r) => ({
+      nodeId: String(r.node_id),
+      advertiseUrl: String(r.advertise_url),
+      runningCount: Number(r.running_count || 0),
+      maxWorkers: Number(r.max_workers || 20),
+      lastHeartbeatMs: Number(r.last_heartbeat_ms || 0),
+      startedAt: Number(r.started_at || 0),
+    }));
+  }
+
+  public async getNodeById(nodeId: string): Promise<OrchNode | null> {
+    const rows = await this.sql<any[]>`
+      SELECT * FROM bot_nodes WHERE node_id = ${nodeId} LIMIT 1
+    `;
+    const r = rows[0];
+    if (!r) return null;
+    return {
+      nodeId: String(r.node_id),
+      advertiseUrl: String(r.advertise_url),
+      runningCount: Number(r.running_count || 0),
+      maxWorkers: Number(r.max_workers || 20),
+      lastHeartbeatMs: Number(r.last_heartbeat_ms || 0),
+      startedAt: Number(r.started_at || 0),
+    };
+  }
+
+  /**
+   * Atomically acquires or renews the distributed lease for `instanceKey` on `nodeId`.
+   * Guarantees only 1 Orchestrator node runs a given instance at any moment.
+   */
+  public async tryAcquireOrRenewLease(
+    instanceKey: string,
+    nodeId: string,
+    leaseTtlMs = 20_000,
+    ignorePreferred = false,
+  ): Promise<OrchInstance | null> {
+    const now = Date.now();
+    const expires = now + leaseTtlMs;
+    const rows = ignorePreferred
+      ? await this.sql<any[]>`
+          UPDATE bot_instances
+          SET lease_node_id = ${nodeId},
+              lease_expires_ms = ${expires}
+          WHERE instance_key = ${instanceKey}
+            AND enabled = TRUE
+            AND (lease_node_id = ${nodeId} OR lease_node_id IS NULL OR lease_expires_ms < ${now})
+          RETURNING *
+        `
+      : await this.sql<any[]>`
+          UPDATE bot_instances
+          SET lease_node_id = ${nodeId},
+              lease_expires_ms = ${expires}
+          WHERE instance_key = ${instanceKey}
+            AND enabled = TRUE
+            AND (preferred_node_id IS NULL OR preferred_node_id = '' OR preferred_node_id = ${nodeId})
+            AND (lease_node_id = ${nodeId} OR lease_node_id IS NULL OR lease_expires_ms < ${now})
+          RETURNING *
+        `;
+    return rows[0] ? this.mapInstanceRow(rows[0]) : null;
+  }
+
+  public async releaseLease(instanceKey: string, nodeId: string): Promise<void> {
+    await this.sql`
+      UPDATE bot_instances
+      SET lease_node_id = NULL,
+          lease_expires_ms = 0
+      WHERE instance_key = ${instanceKey}
+        AND lease_node_id = ${nodeId}
+    `;
+  }
+
+  public async releaseAllLeasesForNode(nodeId: string): Promise<void> {
+    await this.sql`
+      UPDATE bot_instances
+      SET lease_node_id = NULL,
+          lease_expires_ms = 0
+      WHERE lease_node_id = ${nodeId}
+    `;
+    await this.sql`DELETE FROM bot_nodes WHERE node_id = ${nodeId}`.catch(() => {});
   }
 
   // ── Users & Sessions ────────────────────────────────────────────────────
@@ -303,6 +467,21 @@ export class OrchestratorStore {
     return { username, displayName, role, createdAt: now, updatedAt: now };
   }
 
+  public async upsertAdminUser(username: string, password: string, displayName?: string): Promise<void> {
+    const clean = String(username || "").trim().toLowerCase();
+    if (!isValidUsername(clean)) throw new Error("Invalid username");
+    if (!password || password.length < 4) throw new Error("Password must be at least 4 characters");
+    const now = Date.now();
+    await this.sql`
+      INSERT INTO bot_users (username, display_name, password_hash, role, created_at, updated_at)
+      VALUES (${clean}, ${displayName || clean}, ${hashPassword(password)}, 'admin', ${now}, ${now})
+      ON CONFLICT (username) DO UPDATE SET
+        password_hash = EXCLUDED.password_hash,
+        role = 'admin',
+        updated_at = EXCLUDED.updated_at
+    `;
+  }
+
   public async updatePassword(username: string, newPassword: string): Promise<void> {
     const clean = String(username || "").trim().toLowerCase();
     if (!newPassword || newPassword.length < 4) {
@@ -354,32 +533,14 @@ export class OrchestratorStore {
             ORDER BY created_at ASC, instance_key ASC
           `;
 
-    return rows.map((r) => ({
-      instanceKey: String(r.instance_key),
-      displayName: String(r.display_name || r.instance_key),
-      ownerUsername: String(r.owner_username),
-      enabled: Boolean(r.enabled),
-      internalPort: Number(r.internal_port),
-      createdAt: Number(r.created_at),
-      updatedAt: Number(r.updated_at),
-    }));
+    return rows.map((r) => this.mapInstanceRow(r));
   }
 
   public async getInstance(instanceKey: string): Promise<OrchInstance | null> {
     const rows = await this.sql<any[]>`
       SELECT * FROM bot_instances WHERE instance_key = ${instanceKey} LIMIT 1
     `;
-    const r = rows[0];
-    if (!r) return null;
-    return {
-      instanceKey: String(r.instance_key),
-      displayName: String(r.display_name || r.instance_key),
-      ownerUsername: String(r.owner_username),
-      enabled: Boolean(r.enabled),
-      internalPort: Number(r.internal_port),
-      createdAt: Number(r.created_at),
-      updatedAt: Number(r.updated_at),
-    };
+    return rows[0] ? this.mapInstanceRow(rows[0]) : null;
   }
 
   public async createInstance(params: {
@@ -387,6 +548,7 @@ export class OrchestratorStore {
     displayName?: string;
     ownerUsername: string;
     enabled?: boolean;
+    preferredNodeId?: string | null;
     initialSettings?: Record<string, any>;
   }): Promise<OrchInstance> {
     const key = String(params.instanceKey || "").trim().toLowerCase();
@@ -405,13 +567,14 @@ export class OrchestratorStore {
     const displayName = (params.displayName || key).trim();
     const ownerUsername = String(params.ownerUsername || this.adminUsername).trim().toLowerCase();
     const enabled = params.enabled !== false;
+    const preferredNodeId = params.preferredNodeId ? String(params.preferredNodeId).trim() : null;
     const now = Date.now();
 
     await this.sql.begin(async (tx) => {
       const q = tx as unknown as Sql;
       await q`
-        INSERT INTO bot_instances (instance_key, display_name, owner_username, enabled, internal_port, created_at, updated_at)
-        VALUES (${key}, ${displayName}, ${ownerUsername}, ${enabled}, ${internalPort}, ${now}, ${now})
+        INSERT INTO bot_instances (instance_key, display_name, owner_username, enabled, internal_port, preferred_node_id, created_at, updated_at)
+        VALUES (${key}, ${displayName}, ${ownerUsername}, ${enabled}, ${internalPort}, ${preferredNodeId}, ${now}, ${now})
       `;
 
       if (params.initialSettings && Object.keys(params.initialSettings).length > 0) {
@@ -444,6 +607,9 @@ export class OrchestratorStore {
       ownerUsername,
       enabled,
       internalPort,
+      preferredNodeId,
+      leaseNodeId: null,
+      leaseExpiresMs: 0,
       createdAt: now,
       updatedAt: now,
     };
@@ -451,7 +617,7 @@ export class OrchestratorStore {
 
   public async updateInstance(
     instanceKey: string,
-    patch: { displayName?: string; ownerUsername?: string; enabled?: boolean },
+    patch: { displayName?: string; ownerUsername?: string; enabled?: boolean; preferredNodeId?: string | null },
   ): Promise<OrchInstance | null> {
     const existing = await this.getInstance(instanceKey);
     if (!existing) return null;
@@ -459,6 +625,9 @@ export class OrchestratorStore {
     const nextDisplay = patch.displayName !== undefined ? String(patch.displayName).trim() || existing.displayName : existing.displayName;
     const nextOwner = patch.ownerUsername !== undefined ? String(patch.ownerUsername).trim().toLowerCase() : existing.ownerUsername;
     const nextEnabled = patch.enabled !== undefined ? Boolean(patch.enabled) : existing.enabled;
+    const nextPreferred = patch.preferredNodeId !== undefined
+      ? (patch.preferredNodeId ? String(patch.preferredNodeId).trim() : null)
+      : existing.preferredNodeId;
     const now = Date.now();
 
     await this.sql`
@@ -466,6 +635,7 @@ export class OrchestratorStore {
       SET display_name = ${nextDisplay},
           owner_username = ${nextOwner},
           enabled = ${nextEnabled},
+          preferred_node_id = ${nextPreferred},
           updated_at = ${now}
       WHERE instance_key = ${instanceKey}
     `;
@@ -475,6 +645,7 @@ export class OrchestratorStore {
       displayName: nextDisplay,
       ownerUsername: nextOwner,
       enabled: nextEnabled,
+      preferredNodeId: nextPreferred,
       updatedAt: now,
     };
   }

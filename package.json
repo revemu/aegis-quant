@@ -1,12 +1,13 @@
 {
   "name": "dynamic-grid",
-  "version": "0.3.0.88",
+  "version": "0.3.0.89",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "orchestrator": "tsx src/orchestrator.ts",
+    "orch:set-admin": "tsx src/orch-set-admin.ts",
     "backtest": "tsx src/backtest.ts",
     "claim": "tsx src/claim.ts",
     "cancel-all": "tsx src/cancel-all.ts",

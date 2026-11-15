@@ -8876,6 +8876,7 @@
   });
 
   async function updateHeaderRotationPill() {
+    if (isOrchestratorMode && (!orchUser || !activeOrchKey)) return;
     const pill = document.getElementById("headerRotationPill");
     if (!pill) return;
     try {
@@ -9106,6 +9107,8 @@
   // ── Multi-Instance Orchestrator Hub & Auth Controller ─────────────────────
   let orchUser = null;
   let orchInstances = [];
+  let orchNodes = [];
+  let orchCurrentNodeId = null;
   let activeOrchKey = null;
   let orchPollTimer = null;
   let chartInitialized = false;
@@ -9160,13 +9163,15 @@
             const dotCls = inst.status || "stopped";
             const exLabel = inst.telemetry?.exchange ? String(inst.telemetry.exchange).toUpperCase() : "";
             const pausedTag = inst.status === "running" && inst.telemetry?.isPaused ? " ⏸" : "";
+            const nodeTag = orchNodes.length > 1 && inst.runningOnNode ? ` [${escHtml(inst.runningOnNode)}]` : "";
             const ownerTag = orchUser?.role === "admin" ? ` · ${escHtml(inst.ownerUsername)}` : "";
             return `
               <button class="orch-inst-pill ${isActive ? "active" : ""}" data-orch-key="${escHtml(inst.instanceKey)}"
-                title="${escHtml(inst.displayName)} (${escHtml(inst.status)})${ownerTag}">
+                title="${escHtml(inst.displayName)} (${escHtml(inst.status)})${nodeTag}${ownerTag}">
                 <span class="orch-dot ${escHtml(dotCls)}"></span>
                 <span>${escHtml(inst.displayName || inst.instanceKey)}${pausedTag}</span>
                 ${exLabel ? `<span class="orch-inst-ex">${escHtml(exLabel)}</span>` : ""}
+                ${nodeTag ? `<span class="orch-inst-ex">${escHtml(inst.runningOnNode)}</span>` : ""}
               </button>
             `;
           })
@@ -9226,6 +9231,7 @@
     connectSSE();
     checkBotPauseStatus();
     loadTradeManagerData();
+    updateHeaderRotationPill();
   }
 
   async function switchOrchInstance(key) {
@@ -9248,6 +9254,8 @@
     if (!res.ok) return;
     const data = await res.json();
     orchInstances = Array.isArray(data.instances) ? data.instances : [];
+    orchNodes = Array.isArray(data.nodes) ? data.nodes : [];
+    orchCurrentNodeId = data.currentNodeId || null;
 
     if (autoSelect || !activeOrchKey || !orchInstances.some((i) => i.instanceKey === activeOrchKey)) {
       const urlParam = new URLSearchParams(window.location.search).get("instance");
@@ -9503,18 +9511,40 @@
         });
       }
 
+      const elNodesList = document.getElementById("orchClusterNodesList");
+      if (elNodesList) {
+        elNodesList.innerHTML = orchNodes.length === 0
+          ? '<div style="color:#64748b;font-size:12px;">ไม่พบโหนดที่ออนไลน์</div>'
+          : orchNodes.map((n) => `
+              <div class="lr-list-item">
+                <div style="font-weight:700;color:#e2e8f0;">
+                  <span class="orch-dot running"></span> ${escHtml(n.nodeId)}
+                  ${n.nodeId === orchCurrentNodeId ? '<span class="orch-inst-ex" style="color:#38bdf8;">THIS NODE</span>' : ""}
+                </div>
+                <div style="font-size:11px;color:#94a3b8;">Workers: ${n.runningCount}/${n.maxWorkers} • ${escHtml(n.advertiseUrl)}</div>
+              </div>
+            `).join("");
+      }
+
       const elAdminInsts = document.getElementById("orchAdminInstancesList");
       if (elAdminInsts) {
         const userOpts = users.map((u) => `<option value="${escHtml(u.username)}">${escHtml(u.username)}</option>`).join("");
+        const nodeOpts = `<option value="">⚖️ Auto Load Balance</option>` + orchNodes.map((n) => `<option value="${escHtml(n.nodeId)}">📌 ${escHtml(n.nodeId)}</option>`).join("");
         elAdminInsts.innerHTML = orchInstances
           .map((inst) => `
             <div class="lr-list-item">
-              <div style="font-weight:700;color:#e2e8f0;">${escHtml(inst.instanceKey)} <span style="color:#64748b;font-weight:400;">(:${inst.internalPort})</span></div>
-              <div style="display:flex;align-items:center;gap:6px;">
+              <div style="font-weight:700;color:#e2e8f0;">
+                ${escHtml(inst.instanceKey)}
+                <span style="color:#64748b;font-weight:400;">(:${inst.internalPort} • running: ${escHtml(inst.runningOnNode || "none")})</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
                 <select class="form-select" style="width:auto;padding:3px 8px;font-size:12px;" data-owner-select="${escHtml(inst.instanceKey)}">
                   ${userOpts}
                 </select>
-                <button class="lr-clear-cd-btn" data-save-owner="${escHtml(inst.instanceKey)}">บันทึกเจ้าของ</button>
+                <select class="form-select" style="width:auto;padding:3px 8px;font-size:12px;" data-node-select="${escHtml(inst.instanceKey)}">
+                  ${nodeOpts}
+                </select>
+                <button class="lr-clear-cd-btn" data-save-owner="${escHtml(inst.instanceKey)}">บันทึก</button>
                 <button class="lr-clear-cd-btn" style="color:#fca5a5;border-color:rgba(248,113,113,0.4);" data-del-inst="${escHtml(inst.instanceKey)}">ลบ Instance</button>
               </div>
             </div>
@@ -9524,20 +9554,26 @@
         orchInstances.forEach((inst) => {
           const sel = elAdminInsts.querySelector(`[data-owner-select="${inst.instanceKey}"]`);
           if (sel) sel.value = inst.ownerUsername;
+          const nSel = elAdminInsts.querySelector(`[data-node-select="${inst.instanceKey}"]`);
+          if (nSel) nSel.value = inst.preferredNodeId || "";
         });
 
         elAdminInsts.querySelectorAll("[data-save-owner]").forEach((b) => {
           b.addEventListener("click", async () => {
             const k = b.getAttribute("data-save-owner");
             const sel = elAdminInsts.querySelector(`[data-owner-select="${k}"]`);
+            const nSel = elAdminInsts.querySelector(`[data-node-select="${k}"]`);
             if (!sel) return;
             await fetch(`${DEFAULT_API_BASE}/api/orch/instances/${encodeURIComponent(k)}`, {
               method: "PATCH",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ ownerUsername: sel.value }),
+              body: JSON.stringify({
+                ownerUsername: sel.value,
+                preferredNodeId: nSel ? (nSel.value || null) : undefined,
+              }),
             });
             await fetchOrchInstances(false);
-            alert(`✅ อัปเดตเจ้าของ ${k} -> ${sel.value} แล้ว`);
+            alert(`✅ บันทึก ${k} (owner=${sel.value}, node=${nSel?.value || "Auto LB"}) แล้ว`);
           });
         });
 
