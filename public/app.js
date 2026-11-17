@@ -746,9 +746,12 @@
   let lineSwingSl = null;
   let lineSwingNextEntry = null;
   let lineMfEntry = null;
+  let lineMfPlanEntry = null;
   let lineMfTp1 = null;
   let lineMfTp2 = null;
   let lineMfSl = null;
+  let lineMfBench4h = null;
+  let lineMfBench1d = null;
   let lineHtfCeil = null;
   let lineHtfFloor = null;
   let linePoc = null;
@@ -1385,6 +1388,120 @@
     }
   }
 
+  let lastPfLearningFetchTs = 0;
+  let lastPfLearningBase = "";
+  let pfLearningFetchInFlight = false;
+
+  function getPortfolioExecutionBlocker(data, pf) {
+    const macro = pf?.macro || {};
+    if (data?.isPaused) {
+      return { code: "PAUSED", shortTag: "PAUSED", label: "⏸️ บอทหยุดชั่วคราว (PAUSED)", detail: "กด Resume เพื่อเปิดรับไม้ใหม่" };
+    }
+    if (data?.isMarketClosed) {
+      const nextOpen = data?.marketClock?.nextOpen ? ` (เปิด ${data.marketClock.nextOpen})` : "";
+      return { code: "CLOSED", shortTag: "CLOSED", label: "⏸️ ตลาดปิดทำการ", detail: `รอตลาดเปิด${nextOpen}` };
+    }
+    if (macro.isSitOut) {
+      const parts = [];
+      if (!macro.pass4h && macro.ema4h75 > 0) parts.push(`4H < $${fmtPrice(macro.ema4h75)} (${Number(macro.gap4hPct || 0).toFixed(1)}%)`);
+      if (!macro.pass1d && macro.ema1d25 > 0) parts.push(`1D < $${fmtPrice(macro.ema1d25)} (${Number(macro.gap1dPct || 0).toFixed(1)}%)`);
+      const detail = parts.length > 0 ? `${macro.benchmarkSymbol || "BTC"} รอ ${parts.join(" & ")}` : (macro.reason || "รอ Macro ผ่านเกณฑ์");
+      return { code: "SIT_OUT", shortTag: "SIT-OUT", label: `🛡️ Macro Sit-Out (${macro.benchmarkSymbol || "SPY"})`, detail };
+    }
+    return null;
+  }
+
+  function describePortfolioCandidateWait(cand, blocker) {
+    if (!cand) return "กำลังสแกนหาเหรียญที่ฟอร์ม Bottom Fan...";
+    const stage = cand.stage || "SCANNING";
+    const px = Number(cand.price ?? cand.livePrice ?? 0);
+    const ema4 = Number(cand.ema4 || 0);
+    const dist4 = ema4 > 0 && px > 0 ? ((px - ema4) / ema4) * 100 : Number(cand.distanceToEma4Pct || 0);
+
+    if (stage === "PULLBACK_READY") {
+      return blocker
+        ? `⚡ ตัวเหรียญพร้อมแล้ว แต่ติด ${blocker.detail}`
+        : `⚡ ผ่านครบทุกข้อ! พร้อมส่งซื้อเข้า Slot (Sc ${Number(cand.score || 0).toFixed(1)})`;
+    }
+    if (stage === "WAITING_PULLBACK") {
+      return `⏳ รอราคาย่อแตะ EMA4 ($${fmtPrice(ema4)} • ห่าง ${dist4 >= 0 ? "+" : ""}${dist4.toFixed(2)}%)`;
+    }
+    if (stage === "CROSS_8X16_FAIL_FILTERS") {
+      return `🚫 ย่อถึงจุดแล้วแต่ติดฟิลเตอร์: ${cand.filterNote || "ไม่ผ่านเงื่อนไข"}`;
+    }
+    if (stage === "BOTTOM_FAN") {
+      return "🌀 ฟอร์ม Bottom Fan แล้ว • รอ EMA8 ตัดขึ้น EMA16";
+    }
+    return "🔭 รอจัดเรียง Bottom Fan (EMA4 < 8 < 16 < 25 < 75 < 200)";
+  }
+
+  async function refreshPortfolioLearningCard(force = false) {
+    const elCard = document.getElementById("pfLearningCard");
+    if (!elCard) return;
+    if (!elCard.dataset.wired) {
+      elCard.dataset.wired = "1";
+      elCard.addEventListener("click", () => openLearningModal());
+    }
+    const now = Date.now();
+    if (!force && lastPfLearningBase === API_BASE && now - lastPfLearningFetchTs < 45_000) return;
+    if (pfLearningFetchInFlight) return;
+    pfLearningFetchInFlight = true;
+    try {
+      const res = await fetch(`${API_BASE}/api/learning/report`);
+      if (!res.ok) return;
+      const rep = await res.json();
+      lastPfLearningFetchTs = Date.now();
+      lastPfLearningBase = API_BASE;
+
+      const elPill = document.getElementById("pfLearningStatusPill");
+      const elGrid = document.getElementById("pfLearningGrid");
+      const elFoot = document.getElementById("pfLearningFoot");
+      if (!rep.supported || !rep.postgresActive) {
+        if (elPill) elPill.textContent = "⚪ Log Only";
+        if (elGrid) elGrid.innerHTML = `<div class="pf-chk-empty">${rep.message || "ยังไม่เปิด PostgreSQL Learning"}</div>`;
+        return;
+      }
+
+      const s = rep.summary || {};
+      const bs = rep.blockedSignals || {};
+      const evalTotal = Number(bs.evaluatedTotal || 0);
+      const pendingEval = Number(bs.pendingEvaluation || 0);
+      const cds = Array.isArray(rep.activeCooldowns) ? rep.activeCooldowns.length : 0;
+      const adjs = Array.isArray(rep.recentAdjustments) ? rep.recentAdjustments.length : 0;
+      const closed = Number(s.closedTrades || 0);
+      const breakdown = Array.isArray(bs.breakdown) ? bs.breakdown : [];
+      const topSaved = breakdown.slice().sort((a, b) => (b.savedPct || 0) - (a.savedPct || 0))[0];
+
+      if (elPill) {
+        elPill.textContent = rep.autoTuneEffective ? `🟢 Auto-Tune (${rep.autoTuneMode || "on"})` : "🟡 Observer";
+      }
+      if (elGrid) {
+        const closedTxt = closed > 0 ? `${closed} ไม้ (WR ${Number(s.winRatePct || 0).toFixed(0)}%)` : `0/20 ไม้ (รอเก็บครบ)`;
+        const blockedTxt = evalTotal > 0 ? `${evalTotal} เฉลย (รอ ${pendingEval})` : `รอตรวจ ${pendingEval} รายการ`;
+        const filterTxt = topSaved
+          ? `${topSaved.reason.replace("FILTER:", "")} (${Number(topSaved.savedPct || 0).toFixed(0)}% กันพลาด)`
+          : "ยังไม่มีสถิติ";
+        const slTxt = s.recommendedDisasterSlPct != null
+          ? `แนะนำ ${s.recommendedDisasterSlPct}%`
+          : `${Number(s.currentDisasterSlPct || 3.5).toFixed(1)}% (จูน ${adjs} • พัก ${cds})`;
+        elGrid.innerHTML = `
+          <div class="pf-learning-stat">สัญญาณบล็อก (4h)<strong>${blockedTxt}</strong></div>
+          <div class="pf-learning-stat">ฟิลเตอร์เด่น<strong>${filterTxt}</strong></div>
+          <div class="pf-learning-stat">เทรดปิด / SL Tune<strong>${closedTxt}</strong></div>
+          <div class="pf-learning-stat">SL / Cooldown<strong>${slTxt}</strong></div>
+        `;
+      }
+      if (elFoot) {
+        elFoot.textContent = evalTotal > 0 || closed > 0
+          ? "🟢 กำลังเรียนรู้ต่อเนื่อง • คลิกดูตารางวิเคราะห์เต็ม ➔"
+          : "⏳ กำลังสะสมข้อมูล 4 ชม. แรก • คลิกดูรายละเอียด ➔";
+      }
+    } catch (_) {
+    } finally {
+      pfLearningFetchInFlight = false;
+    }
+  }
+
   function updatePortfolioUI(data) {
     const pf = data.portfolio;
     const elBar = document.getElementById("portfolioSlotsBar");
@@ -1400,6 +1517,7 @@
     const radar = Array.isArray(pf.radar) ? pf.radar : [];
     const macro = pf.macro || {};
     const inspected = pf.inspectedSymbol || data.symbol || "";
+    const blocker = getPortfolioExecutionBlocker(data, pf);
 
     if (inspected && lastInspectedPortfolioSymbol && inspected !== lastInspectedPortfolioSymbol) {
       lastInspectedPortfolioSymbol = inspected;
@@ -1462,22 +1580,27 @@
             ? `~$${Math.round(emptyInfo.readyBudget).toLocaleString()}`
             : `~${Math.round(100 / maxSlots)}%`;
           const candPrice = Number(nextCand?.price ?? nextCand?.livePrice ?? 0);
-          const emptyHint = macro.isSitOut
-            ? `🛡️ Macro Sit-Out (${macro.benchmarkSymbol || "SPY"})${nextCand ? ` • เฝ้าดู ${nextCand.symbol}` : ""}`
-            : nextCand
-              ? `ถัดไป: ${nextCand.symbol}${candPrice > 0 ? ` ($${fmtPrice(candPrice)})` : ""} • ${nextCand.stage === "PULLBACK_READY" ? "⚡ READY" : `${nextCand.stage} (Sc ${Number(nextCand.score || 0).toFixed(1)})`}`
-              : `กำลังสแกน ${macro.universeCount || 49} ตัว...`;
+          const isInspectedEmpty = Boolean(nextCand?.symbol && nextCand.symbol === inspected);
+          const stageLabel = nextCand
+            ? (nextCand.stage === "PULLBACK_READY" ? (blocker ? `READY (${blocker.shortTag})` : "⚡ READY") : nextCand.stage)
+            : "SCANNING";
+          const emptyHeadline = nextCand
+            ? `ตัวเต็ง: <strong style="color:#e2e8f0;">${nextCand.symbol}</strong>${candPrice > 0 ? ` ($${fmtPrice(candPrice)})` : ""} • <span style="color:${nextCand.stage === "PULLBACK_READY" && !blocker ? "#34d399" : "#fbbf24"};">${stageLabel}</span>`
+            : `กำลังสแกน ${macro.universeCount || 30} ตัว...`;
+          const waitDetail = blocker && nextCand?.stage !== "PULLBACK_READY"
+            ? `${blocker.label} • ${describePortfolioCandidateWait(nextCand, blocker)}`
+            : describePortfolioCandidateWait(nextCand, blocker);
           cardsHtml.push(`
-            <div class="pf-slot-card pf-slot-empty">
+            <div class="pf-slot-card pf-slot-empty ${isInspectedEmpty ? "pf-slot-active" : ""} ${nextCand?.symbol ? "is-clickable" : ""}" ${nextCand?.symbol ? `data-pf-sym="${nextCand.symbol}" title="คลิกเพื่อดูกราฟและจุดรอเข้าของ ${nextCand.symbol}"` : ""}>
               <div class="pf-slot-top">
                 <div class="pf-slot-title-row">
                   <span class="pf-slot-badge" style="background:rgba(148,163,184,0.12); color:#94a3b8; border-color:rgba(148,163,184,0.25);">SLOT ${i + 1}</span>
-                  <span class="pf-slot-symbol" style="color:#64748b; font-size:14px;">ว่าง (Standby Cash)</span>
+                  <span class="pf-slot-symbol" style="color:#94a3b8; font-size:13px;">ว่าง (Standby Cash)</span>
                 </div>
                 <span style="font-size:11px; color:#64748b;">งบ ${readyBudgetStr}</span>
               </div>
-              <div style="font-size:11px; color:#94a3b8; margin-top:4px;">${emptyHint}</div>
-              <div style="font-size:10px; color:#64748b;">รอ Bottom Fan ➔ EMA4 Pullback • 1H RSI ≥ 40 • Vol ≥ 1.3x</div>
+              <div style="font-size:11px; color:#cbd5e1; margin-top:4px;">${emptyHeadline}</div>
+              <div style="font-size:10px; color:${blocker ? "#fbbf24" : "#94a3b8"}; margin-top:2px;">${waitDetail}</div>
             </div>
           `);
         }
@@ -1507,6 +1630,14 @@
       const elMacroSub = document.getElementById("pfMacroSub");
       if (elMacroBanner) {
         elMacroBanner.className = `pf-macro-banner ${macro.isSitOut ? "is-sitout" : ""}`;
+        elMacroBanner.title = `คลิกเพื่อดูกราฟ ${macro.benchmarkSymbol || "Benchmark"} พร้อมเส้นปลดล็อก Macro`;
+        if (!elMacroBanner.dataset.wired) {
+          elMacroBanner.dataset.wired = "1";
+          elMacroBanner.addEventListener("click", () => {
+            const bm = latestGridData?.portfolio?.macro?.benchmarkSymbol;
+            if (bm) inspectPortfolioSymbol(bm);
+          });
+        }
       }
       if (elMacroTitle) {
         elMacroTitle.textContent = macro.isSitOut
@@ -1517,7 +1648,11 @@
         const breadthStr = macro.breadthAboveEma25Pct !== undefined
           ? ` • Breadth > EMA25: ${Number(macro.breadthAboveEma25Pct).toFixed(0)}%`
           : "";
-        elMacroSub.textContent = `${macro.reason || `Universe ${macro.universeCount || 0} ตัว`}${breadthStr}`;
+        const targetParts = [];
+        if (macro.ema4h75 > 0) targetParts.push(`4H EMA75 $${fmtPrice(macro.ema4h75)} (${Number(macro.gap4hPct || 0) >= 0 ? "+" : ""}${Number(macro.gap4hPct || 0).toFixed(1)}%)`);
+        if (macro.ema1d25 > 0) targetParts.push(`1D EMA25 $${fmtPrice(macro.ema1d25)} (${Number(macro.gap1dPct || 0) >= 0 ? "+" : ""}${Number(macro.gap1dPct || 0).toFixed(1)}%)`);
+        const targetStr = targetParts.length > 0 ? ` • ${targetParts.join(" | ")}` : "";
+        elMacroSub.textContent = `${macro.reason || `Universe ${macro.universeCount || 0} ตัว`}${targetStr}${breadthStr}`;
       }
 
       const inspectedRadar = radar.find((r) => r.symbol === inspected) || radar[0];
@@ -1528,13 +1663,16 @@
 
       if (elChkTitle) elChkTitle.textContent = `🔎 สัญญาณ: ${inspected || "--"}`;
       if (elChkStage) {
-        elChkStage.textContent = inspectedSlot
+        const stg = inspectedSlot
           ? `HOLDING SLOT ${inspectedSlot.slotIndex + 1}`
-          : (inspectedRadar?.stage || "SCANNING");
+          : (inspectedRadar?.symbol === inspected ? (inspectedRadar?.stage || "SCANNING") : "BENCHMARK");
+        elChkStage.textContent = !inspectedSlot && stg === "PULLBACK_READY" && blocker
+          ? `PULLBACK_READY (${blocker.shortTag})`
+          : stg;
       }
 
       if (elChkGrid) {
-        if (inspectedRadar) {
+        if (inspectedRadar && inspectedRadar.symbol === inspected) {
           const rStage = inspectedRadar.stage || "SCANNING";
           const hasBottomFan = Boolean(
             inspectedRadar.hadBottomFan ||
@@ -1551,6 +1689,8 @@
           const volRatio = Number(inspectedRadar.buyVolRatio12 ?? inspectedRadar.volRatio12 ?? 0);
           const rs24h = Number(inspectedRadar.relStrength24h ?? 0);
           const sc = Number(inspectedRadar.score ?? 0);
+          const macroOk = !macro.isSitOut;
+          const execOk = !data.isPaused && !data.isMarketClosed;
           const checks = [
             { label: "Bottom Fan", ok: hasBottomFan },
             { label: "EMA4 Hook", ok: hasPullbackHook },
@@ -1558,15 +1698,31 @@
             { label: "Vol ≥ 1.3x", ok: volRatio >= 1.3, val: `${volRatio.toFixed(2)}x` },
             { label: "RS 24h ≥ -1%", ok: rs24h >= -1.0, val: `${rs24h >= 0 ? "+" : ""}${rs24h.toFixed(1)}%` },
             { label: "Score", ok: sc > 0, val: sc.toFixed(1) },
+            { label: "Macro Gate", ok: macroOk, blocked: !macroOk, val: macroOk ? "PASS" : "SIT-OUT" },
+            { label: "บอท / ตลาด", ok: execOk, blocked: !execOk, val: data.isPaused ? "PAUSED" : (data.isMarketClosed ? "CLOSED" : "ACTIVE") },
           ];
-          elChkGrid.innerHTML = checks.map((c) => `
-            <div class="pf-chk-item ${c.ok ? "is-pass" : "is-fail"}">
-              <span>${c.ok ? "✅" : "⏳"} ${c.label}</span>
-              <strong>${c.val !== undefined ? c.val : (c.ok ? "PASS" : "WAIT")}</strong>
-            </div>
-          `).join("");
+          elChkGrid.innerHTML = checks.map((c) => {
+            const cls = c.ok ? "is-pass" : (c.blocked ? "is-blocked" : "is-fail");
+            const icon = c.ok ? "✅" : (c.blocked ? "🛡️" : "⏳");
+            return `
+              <div class="pf-chk-item ${cls}">
+                <span>${icon} ${c.label}</span>
+                <strong>${c.val !== undefined ? c.val : (c.ok ? "PASS" : "WAIT")}</strong>
+              </div>
+            `;
+          }).join("");
         } else {
-          elChkGrid.innerHTML = '<div class="pf-chk-empty">คลิกดู Slot หรือรายชื่อในเรดาร์</div>';
+          const macroOk = !macro.isSitOut;
+          elChkGrid.innerHTML = `
+            <div class="pf-chk-item ${macroOk ? "is-pass" : "is-blocked"}">
+              <span>${macroOk ? "✅" : "🛡️"} 4H EMA75</span>
+              <strong>${macro.ema4h75 > 0 ? `$${fmtPrice(macro.ema4h75)} (${Number(macro.gap4hPct || 0).toFixed(1)}%)` : (macro.pass4h ? "PASS" : "WAIT")}</strong>
+            </div>
+            <div class="pf-chk-item ${macro.pass1d ? "is-pass" : "is-blocked"}">
+              <span>${macro.pass1d ? "✅" : "🛡️"} 1D EMA25</span>
+              <strong>${macro.ema1d25 > 0 ? `$${fmtPrice(macro.ema1d25)} (${Number(macro.gap1dPct || 0).toFixed(1)}%)` : (macro.pass1d ? "PASS" : "WAIT")}</strong>
+            </div>
+          `;
         }
       }
 
@@ -1582,23 +1738,30 @@
             const stageCls = isHeld
               ? "pf-stage-held"
               : item.stage === "PULLBACK_READY"
-                ? "pf-stage-ready"
-                : (item.stage === "WAITING_PULLBACK" || item.stage === "BOTTOM_FAN")
-                  ? "pf-stage-wait"
-                  : "pf-stage-watch";
+                ? (blocker ? "pf-stage-blocked" : "pf-stage-ready")
+                : item.stage === "CROSS_8X16_FAIL_FILTERS"
+                  ? "pf-stage-filtered"
+                  : (item.stage === "WAITING_PULLBACK" || item.stage === "BOTTOM_FAN")
+                    ? "pf-stage-wait"
+                    : "pf-stage-watch";
             const stageLbl = isHeld
               ? "HELD"
               : item.stage === "PULLBACK_READY"
-                ? "READY"
-                : item.stage === "WAITING_PULLBACK"
-                  ? "PULLBACK"
-                  : item.stage === "BOTTOM_FAN"
-                    ? "FAN"
-                    : "WATCH";
+                ? (blocker ? `READY • ${blocker.shortTag}` : "READY")
+                : item.stage === "CROSS_8X16_FAIL_FILTERS"
+                  ? "FILTERED"
+                  : item.stage === "WAITING_PULLBACK"
+                    ? "PULLBACK"
+                    : item.stage === "BOTTOM_FAN"
+                      ? "FAN"
+                      : "WATCH";
             const itemPx = Number(item.price ?? item.livePrice ?? 0);
             const dist200 = Number(item.distanceToEma200Pct ?? item.distToEma200Pct ?? 0);
+            const rowTitle = item.filterNote
+              ? `${item.symbol} ติดฟิลเตอร์: ${item.filterNote} (คลิกดูกราฟ)`
+              : `คลิกเพื่อดูกราฟและจุดรอเข้าของ ${item.symbol}`;
             return `
-              <div class="pf-radar-row ${item.symbol === inspected ? "is-inspected" : ""}" data-radar-sym="${item.symbol}" title="คลิกเพื่อดูกราฟและ EMA 6 เส้นของ ${item.symbol}">
+              <div class="pf-radar-row ${item.symbol === inspected ? "is-inspected" : ""}" data-radar-sym="${item.symbol}" title="${rowTitle}">
                 <div class="pf-radar-left">
                   <span class="pf-radar-sym">${item.symbol}</span>
                   <span class="pf-radar-stage ${stageCls}">${stageLbl}</span>
@@ -1619,6 +1782,8 @@
           });
         }
       }
+
+      void refreshPortfolioLearningCard(false);
     }
   }
 
@@ -1857,6 +2022,61 @@
     }
 
     if (elLegFanSpreadChip && elLegFanSpreadVal) {
+      if (isPortfolioType(latestGridData?.strategyType, latestGridData?.strategyMode) && latestGridData?.portfolio) {
+        const pf = latestGridData.portfolio;
+        const inspectedSym = pf.inspectedSymbol || latestGridData.symbol || "";
+        const radarCand = (pf.radar || []).find((r) => r.symbol === inspectedSym);
+        const heldSlot = (pf.slots || []).find((s) => s.status === "HOLDING" && s.symbol === inspectedSym);
+        const blocker = getPortfolioExecutionBlocker(latestGridData, pf);
+
+        elLegFanSpreadVal.textContent = `${data.spreadPct.toFixed(2)}%`;
+        if (heldSlot) {
+          elLegFanSpreadChip.style.background = "rgba(56, 189, 248, 0.2)";
+          elLegFanSpreadChip.style.borderColor = "rgba(56, 189, 248, 0.55)";
+          elLegFanSpreadChip.style.color = "#38bdf8";
+          if (elLegChecklistVal) elLegChecklistVal.textContent = `💼 ถือ Slot ${heldSlot.slotIndex + 1} (${heldSlot.phaseText || "Holding"})`;
+          elLegFanSpreadChip.title = `กำลังถือ ${heldSlot.symbol} ใน Slot ${heldSlot.slotIndex + 1} • ทุน $${fmtPrice(heldSlot.entryPrice)} • เป้า TP1 $${fmtPrice(heldSlot.tp1TargetPrice)}`;
+        } else if (radarCand) {
+          const st = radarCand.stage || "SCANNING";
+          if (st === "PULLBACK_READY" && !blocker) {
+            elLegFanSpreadChip.style.background = "rgba(16, 185, 129, 0.25)";
+            elLegFanSpreadChip.style.borderColor = "rgba(16, 185, 129, 0.6)";
+            elLegFanSpreadChip.style.color = "#34d399";
+            if (elLegChecklistVal) elLegChecklistVal.textContent = `⚡ READY เข้า Slot (ผ่านครบ)`;
+          } else if (st === "PULLBACK_READY" && blocker) {
+            elLegFanSpreadChip.style.background = "rgba(245, 158, 11, 0.2)";
+            elLegFanSpreadChip.style.borderColor = "rgba(245, 158, 11, 0.5)";
+            elLegFanSpreadChip.style.color = "#fbbf24";
+            if (elLegChecklistVal) elLegChecklistVal.textContent = `⚡ READY • ติด ${blocker.shortTag}`;
+          } else if (st === "WAITING_PULLBACK") {
+            elLegFanSpreadChip.style.background = "rgba(245, 158, 11, 0.16)";
+            elLegFanSpreadChip.style.borderColor = "rgba(245, 158, 11, 0.4)";
+            elLegFanSpreadChip.style.color = "#fbbf24";
+            if (elLegChecklistVal) elLegChecklistVal.textContent = `⏳ รอย่อ EMA4 ($${fmtPrice(radarCand.ema4)})`;
+          } else if (st === "CROSS_8X16_FAIL_FILTERS") {
+            elLegFanSpreadChip.style.background = "rgba(244, 63, 94, 0.16)";
+            elLegFanSpreadChip.style.borderColor = "rgba(244, 63, 94, 0.45)";
+            elLegFanSpreadChip.style.color = "#fda4af";
+            if (elLegChecklistVal) elLegChecklistVal.textContent = `🚫 ${radarCand.filterNote || "ติดฟิลเตอร์"}`;
+          } else {
+            elLegFanSpreadChip.style.background = "rgba(148, 163, 184, 0.12)";
+            elLegFanSpreadChip.style.borderColor = "rgba(148, 163, 184, 0.3)";
+            elLegFanSpreadChip.style.color = "#94a3b8";
+            if (elLegChecklistVal) elLegChecklistVal.textContent = st === "BOTTOM_FAN" ? "🌀 Bottom Fan (รอ 8x16)" : "🔭 รอ Bottom Fan";
+          }
+          elLegFanSpreadChip.title = describePortfolioCandidateWait(radarCand, blocker);
+        } else {
+          const macro = pf.macro || {};
+          elLegFanSpreadChip.style.background = macro.isSitOut ? "rgba(245, 158, 11, 0.18)" : "rgba(16, 185, 129, 0.2)";
+          elLegFanSpreadChip.style.borderColor = macro.isSitOut ? "rgba(245, 158, 11, 0.45)" : "rgba(16, 185, 129, 0.5)";
+          elLegFanSpreadChip.style.color = macro.isSitOut ? "#fbbf24" : "#34d399";
+          if (elLegChecklistVal) elLegChecklistVal.textContent = macro.isSitOut ? `🛡️ ${blocker?.detail || "Macro Sit-Out"}` : "🟢 Macro PASS";
+          elLegFanSpreadChip.title = macro.reason || "Benchmark Macro Gate";
+        }
+        elLegFanSpreadChip.onclick = () => openCandleInspector(data.time);
+        return;
+      }
+
       const pCount = cl?.passedCount ?? 0;
       const tCount = cl?.totalCount ?? 7;
       const allOk = cl?.allPassed;
@@ -3259,7 +3479,20 @@
     const activeChartTf = (isMaFan || isPortfolio) ? execTf : macroTf;
 
     if (elNavSymbolBadge) elNavSymbolBadge.textContent = displaySymbol;
-    if (elChartSymbolBadge) elChartSymbolBadge.textContent = isPortfolio ? `🔎 ${displaySymbol}` : displaySymbol;
+    if (elChartSymbolBadge) {
+      if (isPortfolio && data.portfolio) {
+        const pf = data.portfolio;
+        const heldSlot = (pf.slots || []).find((s) => s.status === "HOLDING" && s.symbol === displaySymbol);
+        const emptySlot = (pf.slots || []).find((s) => s.status === "EMPTY" && s.nextCandidate?.symbol === displaySymbol);
+        const isBench = pf.macro?.benchmarkSymbol === displaySymbol;
+        if (heldSlot) elChartSymbolBadge.textContent = `💼 ${displaySymbol} (Slot ${heldSlot.slotIndex + 1})`;
+        else if (isBench) elChartSymbolBadge.textContent = `🛡️ ${displaySymbol} (Benchmark)`;
+        else if (emptySlot) elChartSymbolBadge.textContent = `🔎 ${displaySymbol} (เต็ง Slot ${emptySlot.slotIndex + 1})`;
+        else elChartSymbolBadge.textContent = `🔎 ${displaySymbol}`;
+      } else {
+        elChartSymbolBadge.textContent = displaySymbol;
+      }
+    }
     if (elLegendSymbol) elLegendSymbol.textContent = displaySymbol;
     if (elLegendTf) elLegendTf.textContent = activeChartTf;
     if (elLegendLivePrice && data.mid !== undefined) elLegendLivePrice.textContent = `$${fmtPrice(data.mid)}`;
@@ -4290,6 +4523,9 @@
           try { candleSeries.removePriceLine(lineMfSl); } catch (_) {}
           lineMfSl = null;
         }
+        if (lineMfPlanEntry) { try { candleSeries.removePriceLine(lineMfPlanEntry); } catch (_) {} lineMfPlanEntry = null; }
+        if (lineMfBench4h) { try { candleSeries.removePriceLine(lineMfBench4h); } catch (_) {} lineMfBench4h = null; }
+        if (lineMfBench1d) { try { candleSeries.removePriceLine(lineMfBench1d); } catch (_) {} lineMfBench1d = null; }
       } else if (isPortfolio && data.portfolio) {
         // Clear grid & swing lines
         while (gridZoneLevelLines.length > 0) {
@@ -4305,8 +4541,11 @@
 
         const pf = data.portfolio;
         const inspectedSym = pf.inspectedSymbol || data.symbol;
-        const slot = (pf.slots || []).find((s) => s.symbol === inspectedSym);
+        const slot = (pf.slots || []).find((s) => s.status === "HOLDING" && s.symbol === inspectedSym);
+        const radarCand = (pf.radar || []).find((r) => r.symbol === inspectedSym);
+        const macro = pf.macro || {};
         const tp1Target = slot?.tp1TargetPrice || pf.inspectedEmas?.ema200 || 0;
+        const disasterSlPct = Number(pf.disasterSlPct || 3.5);
 
         if (slot && slot.entryPrice > 0) {
           lineMfEntry = setPriceLine(lineMfEntry, {
@@ -4322,6 +4561,24 @@
           lineMfEntry = null;
         }
 
+        // Planned EMA4 pullback entry & planned SL when inspecting an empty-slot radar candidate
+        const planEntryPx = !slot && radarCand && (radarCand.stage === "PULLBACK_READY" || radarCand.stage === "WAITING_PULLBACK" || radarCand.stage === "CROSS_8X16_FAIL_FILTERS")
+          ? Number(radarCand.ema4 || 0)
+          : 0;
+        if (planEntryPx > 0) {
+          lineMfPlanEntry = setPriceLine(lineMfPlanEntry, {
+            price: planEntryPx,
+            color: radarCand.stage === "PULLBACK_READY" ? "#34d399" : "#f59e0b",
+            lineWidth: 1.5,
+            lineStyle: LightweightCharts.LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: radarCand.stage === "PULLBACK_READY" ? "⚡ แผนเข้า EMA4" : "⏳ รอย่อเข้า EMA4",
+          });
+        } else if (lineMfPlanEntry) {
+          try { candleSeries.removePriceLine(lineMfPlanEntry); } catch (_) {}
+          lineMfPlanEntry = null;
+        }
+
         if (tp1Target > 0) {
           lineMfTp1 = setPriceLine(lineMfTp1, {
             price: tp1Target,
@@ -4329,32 +4586,67 @@
             lineWidth: 1.5,
             lineStyle: LightweightCharts.LineStyle.Dashed,
             axisLabelVisible: true,
-            title: "🎯 TP1 (EMA200)",
+            title: slot ? "🎯 TP1 (EMA200)" : "🎯 เป้า TP1 (EMA200)",
           });
         } else if (lineMfTp1) {
           try { candleSeries.removePriceLine(lineMfTp1); } catch (_) {}
           lineMfTp1 = null;
         }
 
-        if (slot && slot.stopLossPrice > 0) {
+        const activeSlPx = slot && slot.stopLossPrice > 0
+          ? slot.stopLossPrice
+          : (planEntryPx > 0 && disasterSlPct > 0 ? planEntryPx * (1 - disasterSlPct / 100) : 0);
+        if (activeSlPx > 0) {
           lineMfSl = setPriceLine(lineMfSl, {
-            price: slot.stopLossPrice,
-            color: slot.beLocked ? "#3b82f6" : "#ef4444",
-            lineWidth: 2,
-            lineStyle: LightweightCharts.LineStyle.Solid,
+            price: activeSlPx,
+            color: slot?.beLocked ? "#3b82f6" : "#ef4444",
+            lineWidth: slot ? 2 : 1,
+            lineStyle: slot ? LightweightCharts.LineStyle.Solid : LightweightCharts.LineStyle.Dotted,
             axisLabelVisible: true,
-            title: slot.beLocked ? "🛡️ BE Lock" : "🔴 Disaster SL",
+            title: slot ? (slot.beLocked ? "🛡️ BE Lock" : "🔴 Disaster SL") : `🔴 แผน SL (-${disasterSlPct}%)`,
           });
         } else if (lineMfSl) {
           try { candleSeries.removePriceLine(lineMfSl); } catch (_) {}
           lineMfSl = null;
         }
+
+        // Benchmark unlock thresholds (4H EMA75 & 1D EMA25) when inspecting BTCUSDT / SPY
+        const isBenchmarkChart = Boolean(macro.benchmarkSymbol && macro.benchmarkSymbol === inspectedSym && macro.sitOutMode !== "off");
+        if (isBenchmarkChart && macro.ema4h75 > 0) {
+          lineMfBench4h = setPriceLine(lineMfBench4h, {
+            price: macro.ema4h75,
+            color: macro.pass4h ? "#34d399" : "#fbbf24",
+            lineWidth: 1.5,
+            lineStyle: LightweightCharts.LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: "🛡️ ปลดล็อก 4H EMA75",
+          });
+        } else if (lineMfBench4h) {
+          try { candleSeries.removePriceLine(lineMfBench4h); } catch (_) {}
+          lineMfBench4h = null;
+        }
+        if (isBenchmarkChart && macro.ema1d25 > 0) {
+          lineMfBench1d = setPriceLine(lineMfBench1d, {
+            price: macro.ema1d25,
+            color: macro.pass1d ? "#34d399" : "#f97316",
+            lineWidth: 1.5,
+            lineStyle: LightweightCharts.LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: "🛡️ ปลดล็อก 1D EMA25",
+          });
+        } else if (lineMfBench1d) {
+          try { candleSeries.removePriceLine(lineMfBench1d); } catch (_) {}
+          lineMfBench1d = null;
+        }
       } else {
         // Clear MA Fan lines when in Grid or Swing mode
         if (lineMfEntry) { try { candleSeries.removePriceLine(lineMfEntry); } catch (_) {} lineMfEntry = null; }
+        if (lineMfPlanEntry) { try { candleSeries.removePriceLine(lineMfPlanEntry); } catch (_) {} lineMfPlanEntry = null; }
         if (lineMfTp1) { try { candleSeries.removePriceLine(lineMfTp1); } catch (_) {} lineMfTp1 = null; }
         if (lineMfTp2) { try { candleSeries.removePriceLine(lineMfTp2); } catch (_) {} lineMfTp2 = null; }
         if (lineMfSl) { try { candleSeries.removePriceLine(lineMfSl); } catch (_) {} lineMfSl = null; }
+        if (lineMfBench4h) { try { candleSeries.removePriceLine(lineMfBench4h); } catch (_) {} lineMfBench4h = null; }
+        if (lineMfBench1d) { try { candleSeries.removePriceLine(lineMfBench1d); } catch (_) {} lineMfBench1d = null; }
 
         // Clear Swing Lines when in Grid mode
         if (lineSwingEntry) {

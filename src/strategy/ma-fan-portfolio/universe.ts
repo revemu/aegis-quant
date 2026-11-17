@@ -440,17 +440,25 @@ export function evaluateBenchmarkSitOut(opts: {
   pass1d: boolean;
   benchmarkPrice: number;
   benchmarkRet24h: number;
+  ema4h75?: number;
+  ema1d25?: number;
+  gap4hPct?: number;
+  gap1dPct?: number;
   reason: string;
 } {
   const closed4h = opts.benchmark4h.filter((c) => c.isClosed !== false);
   const closed1d = opts.benchmark1d.filter((c) => c.isClosed !== false);
-  const ema4h75 = closed4h.length >= 75 ? calcEMA(closed4h.map((c) => c.close), 75) : [];
-  const ema1d25 = closed1d.length >= 25 ? calcEMA(closed1d.map((c) => c.close), 25) : [];
+  const ema4h75Arr = closed4h.length >= 75 ? calcEMA(closed4h.map((c) => c.close), 75) : [];
+  const ema1d25Arr = closed1d.length >= 25 ? calcEMA(closed1d.map((c) => c.close), 25) : [];
 
   const last4h = closed4h[closed4h.length - 1];
   const last1d = closed1d[closed1d.length - 1];
-  const pass4h = ema4h75.length >= 75 && last4h ? last4h.close >= ema4h75[ema4h75.length - 1]! : true;
-  const pass1d = ema1d25.length >= 25 && last1d ? last1d.close >= ema1d25[ema1d25.length - 1]! : true;
+  const val4h75 = ema4h75Arr.length >= 75 ? ema4h75Arr[ema4h75Arr.length - 1] : undefined;
+  const val1d25 = ema1d25Arr.length >= 25 ? ema1d25Arr[ema1d25Arr.length - 1] : undefined;
+  const pass4h = val4h75 !== undefined && last4h ? last4h.close >= val4h75 : true;
+  const pass1d = val1d25 !== undefined && last1d ? last1d.close >= val1d25 : true;
+  const gap4hPct = val4h75 && val4h75 > 0 && last4h ? ((last4h.close - val4h75) / val4h75) * 100 : undefined;
+  const gap1dPct = val1d25 && val1d25 > 0 && last1d ? ((last1d.close - val1d25) / val1d25) * 100 : undefined;
 
   let isSitOut = false;
   if (opts.sitOutMode === "dual") isSitOut = !pass4h || !pass1d;
@@ -472,5 +480,16 @@ export function evaluateBenchmarkSitOut(opts: {
     reason = `Macro Sit-Out (${opts.benchmarkSymbol} ${fails.join(" & ")})`;
   }
 
-  return { isSitOut, pass4h, pass1d, benchmarkPrice, benchmarkRet24h, reason };
+  return {
+    isSitOut,
+    pass4h,
+    pass1d,
+    benchmarkPrice,
+    benchmarkRet24h,
+    ema4h75: val4h75,
+    ema1d25: val1d25,
+    gap4hPct,
+    gap1dPct,
+    reason,
+  };
 }

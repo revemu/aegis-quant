@@ -105,5 +105,9 @@ export interface PortfolioMacroState {
   universeCount: number;
   pass4h: boolean;
   pass1d: boolean;
+  ema4h75?: number;
+  ema1d25?: number;
+  gap4hPct?: number;
+  gap1dPct?: number;
   lastScanTime: number;
 }

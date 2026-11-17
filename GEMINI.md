@@ -14,18 +14,23 @@ This document is the persistent operational and architectural knowledge base for
 ---
 
 > [!IMPORTANT]
-> ### 🌐 LIVE PRODUCTION BOT ENDPOINTS (ตรวจสอบสถานะสดจากเซิร์ฟเวอร์จริงเสมอ)
-> บอทไม่ได้รันบนเครื่อง Local แต่รันอยู่บนเซิร์ฟเวอร์จริง 2 Instance:
-> 1. **DreamDEX Spot (DEX)**: `http://210.246.253.13:3333/`
->    - Telemetry & State API: `http://210.246.253.13:3333/api/state`
->    - Configuration API: `http://210.246.253.13:3333/api/config`
->    - Version API: `http://210.246.253.13:3333/api/version`
-> 2. **Binance Spot (CEX)**: `http://210.246.253.13:3334/`
->    - Telemetry & State API: `http://210.246.253.13:3334/api/state`
->    - Configuration API: `http://210.246.253.13:3334/api/config`
->    - Version API: `http://210.246.253.13:3334/api/version`
+> ### 🌐 LIVE PRODUCTION ORCHESTRATOR ENDPOINTS (ตรวจสอบสถานะสดจากเซิร์ฟเวอร์จริงเสมอ)
+> บอทไม่ได้รันบนเครื่อง Local แต่รันผ่าน **Multi-Instance Orchestrator** บนเซิร์ฟเวอร์จริง:
+> - **Orchestrator Hub**: `http://210.246.253.13:3333`
+>   - Version API (Public): `GET /api/version`
+>   - Auth Login: `POST /api/orch/auth/login` (อ่าน `ORCH_URL`, `ORCH_USERNAME`, `ORCH_PASSWORD` จากไฟล์ `.env` บนเครื่อง Local; **ห้ามเขียนรหัสผ่าน/Token ลงใน `GEMINI.md` หรือ Commit ขึ้น Git เด็ดขาด**)
+>   - Instance List & Telemetry: `GET /api/orch/instances`
+>   - Instance Logs: `GET /api/orch/instances/<instanceKey>/logs`
+>   - Per-Instance Proxy APIs:
+>     - State: `GET /i/<instanceKey>/api/state`
+>     - Config: `GET / POST /i/<instanceKey>/api/config`
+>     - Portfolio Radar: `GET /i/<instanceKey>/api/portfolio/radar`
+>     - Learning Report: `GET /i/<instanceKey>/api/learning/report`
+>     - Trades DB: `GET /i/<instanceKey>/api/db/trades`
 >
-> ⚠️ **STRICT INVESTIGATION RULE**: เมื่อผู้ใช้ส่งรูปภาพปัญหา หรือแจ้งพฤติกรรมผิดปกติ **ต้องดึงข้อมูลสถานะสด (State, Config, Swings, Orders, Version) จาก Endpoints บนเซิร์ฟเวอร์ 210.246.253.13:3333 (DreamDEX) หรือ :3334 (Binance) ตามกระดานที่ผู้ใช้ระบุเสมอ** ห้ามตรวจเช็คหรือสรุปปัญหาจากไฟล์ `data/settings.db.json` หรือ `data/grid-bot.db.json` บนเครื่อง Local เด็ดขาด!
+> ⚠️ **STRICT INVESTIGATION & CONFIG GUARDRAILS**:
+> 1. **ต้องดึงสถานะสดจาก Orchestrator เสมอ**: เมื่อผู้ใช้ถามสถานะ แจ้งปัญหา หรือส่งรูปภาพ ต้องล็อกอินด้วย `.env` (`ORCH_URL` / `ORCH_USERNAME` / `ORCH_PASSWORD`) แล้วดึงข้อมูลจาก `/api/orch/instances` และ `/i/<instanceKey>/api/*` เสมอ ห้ามสรุปจากไฟล์บนเครื่อง Local เด็ดขาด
+> 2. **Safe Partial Config Patch**: เมื่อปรับค่า Runtime Settings ผ่าน `POST /i/<instanceKey>/api/config` ให้ส่งเฉพาะฟิลด์ที่ต้องการเปลี่ยน ห้ามส่งค่า `"******"` ทับ credentials และห้ามส่ง `strategyType`/`strategyMode` เว้นแต่ตั้งใจสลับโหมดกลยุทธ์
 
 ---
 
@@ -9920,5 +9925,18 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - ปรับ `.top-nav`, `.brand`, `.nav-system-pills` และ `.nav-metrics` จาก `flex-wrap: nowrap` + `.brand { flex-shrink: 1 }` / `.nav-system-pills { flex-shrink: 0 }` ให้รองรับ `flex-wrap: wrap`, `max-width: 100%` และรวม `.market-clock-pill` เข้าชุดสไตล์ความสูง `26px` เดียวกัน
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.90`** ใน `package.json`, `src/version.ts` และ `public/index.html` (`style.css?v=0.3.0.90`, `app.js?v=0.3.0.90`)
+
+---
+
+## 335. v0.3.0.91 — Portfolio Chart Alignment, Blocker Badges, Slot Wait Details & Sidebar Learning Pulse (`src/strategy/ma-fan-portfolio/*`, `public/*`)
+
+- **Macro Benchmark Threshold Telemetry (`src/strategy/ma-fan-portfolio/types.ts`, `universe.ts`, `index.ts`)**:
+  - เพิ่ม `ema4h75`, `ema1d25`, `gap4hPct`, `gap1dPct` ใน `PortfolioMacroState` จาก `evaluateBenchmarkSitOut`
+  - อัปเดต `buildSlotTelemetryList()` ให้ดึงตัวเต็งลำดับถัดไปจาก `radarList` มาแสดงบน Slot ว่างได้ครบทุกช่อง และให้ `inspectedEmas` fallback จาก `snapshots` เมื่อคลิกดู Benchmark (`BTCUSDT` / `SPY`)
+- **Portfolio Chart & Slot UI Alignment (`public/app.js`, `public/style.css`, `public/index.html`)**:
+  - **แก้ไขป้าย Legend บนกราฟ (`updateMaLegendForCandle`)**: ในโหมด `ma_fan_portfolio` เลิกใช้สูตร Sniper 7 ข้อเก่า (`3/7 รอ 4 ข้อ`) เปลี่ยนมาแสดงสถานะจริงของพอร์ต (`💼 ถือ Slot`, `⚡ READY เข้า Slot`, `⚡ READY • ติด SIT-OUT/CLOSED/PAUSED`, `⏳ รอย่อ EMA4`, `🚫 ติดฟิลเตอร์`, หรือ `🛡️ Benchmark`)
+  - **วาดเส้นแผนเทรดและเส้นปลดล็อกบนกราฟ**: แสดงเส้น `⏳ รอย่อเข้า EMA4` / `⚡ แผนเข้า EMA4`, `🎯 เป้า TP1 (EMA200)`, `🔴 แผน SL (-X%)` สำหรับตัวเต็งเมื่อ Slot ว่าง และแสดงเส้น `🛡️ ปลดล็อก 4H EMA75` / `🛡️ ปลดล็อก 1D EMA25` เมื่อเปิดกราฟ Benchmark (`BTCUSDT` / `SPY`)
+  - **การ์ด Slot ว่าง, Macro Banner, เรดาร์ & เช็คลิสต์**: แสดงเงื่อนไขจริงที่กำลังรอ (รวมราคาเป้าหมายและ `%`), คลิกการ์ด Slot ว่างหรือ Macro Banner เพื่อสลับกราฟได้ทันที, เพิ่มช่อง `Macro Gate` + `บอท / ตลาด` ในกล่องเช็คลิสต์ (`8` ช่อง), และเปลี่ยนป้าย `READY` เป็น `READY • SIT-OUT` / `CLOSED` / `PAUSED` เมื่อถูกบล็อก + `FILTERED` เมื่อติดฟิลเตอร์
+  - **Sidebar Learning Pulse (`#pfLearningCard`)**: เพิ่มการ์ดสรุปการทำงานของ Learning Engine (`/api/learning/report` รีเฟรชทุก 45 วินาที) แสดงจำนวนสัญญาณบล็อกที่เฉลย/รอตรวจ 4h, ฟิลเตอร์เด่น, เทรดปิด/SL Tune, และ Cooldown พร้อมคลิกเปิด Learning Insights Modal
 - **Version Bump**:
-  - อัปเดตเวอร์ชันเป็น **`0.3.0.86`** ใน `package.json` และ `src/version.ts`
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.91`** ใน `package.json`, `src/version.ts` และ `public/index.html` (`style.css?v=0.3.0.91`, `app.js?v=0.3.0.91`)

@@ -991,6 +991,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
       universeCount: this.snapshots.size,
       pass4h: sitOutEval.pass4h,
       pass1d: sitOutEval.pass1d,
+      ema4h75: sitOutEval.ema4h75,
+      ema1d25: sitOutEval.ema1d25,
+      gap4hPct: sitOutEval.gap4hPct,
+      gap1dPct: sitOutEval.gap1dPct,
       lastScanTime: Date.now(),
     };
 
@@ -1541,7 +1545,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
     const maxSlots = this.getMaxSlots();
     const list: PortfolioSlotTelemetry[] = [];
     const freeCash = this.getAvailableBuyCash();
-    const readyCandidates = this.radarList.filter((r) => r.stage === "PULLBACK_READY" || r.stage === "WAITING_PULLBACK" || r.stage === "BOTTOM_FAN");
+    const heldSyms = new Set(this.slots.map((s) => s.symbol));
+    const readyCandidates = this.radarList.filter((r) => !heldSyms.has(r.symbol));
     let waitCursor = 0;
 
     for (let i = 0; i < maxSlots; i++) {
@@ -1745,7 +1750,19 @@ export class MaFanPortfolioStrategy implements IStrategy {
         radar: this.radarList.slice(0, 15),
         macro: this.macroState,
         inspectedSymbol: inspectedSym,
-        inspectedEmas: inspectedSlot?.emas || this.radarList.find((r) => r.symbol === inspectedSym) || null,
+        inspectedEmas:
+          inspectedSlot?.emas ||
+          this.radarList.find((r) => r.symbol === inspectedSym) ||
+          (inspectedInd
+            ? {
+                ema4: inspectedInd.m4[inspectedInd.lastClosedIdx] || 0,
+                ema8: inspectedInd.m8[inspectedInd.lastClosedIdx] || 0,
+                ema16: inspectedInd.m16[inspectedInd.lastClosedIdx] || 0,
+                ema25: inspectedInd.m25[inspectedInd.lastClosedIdx] || 0,
+                ema75: inspectedInd.m75[inspectedInd.lastClosedIdx] || 0,
+                ema200: inspectedInd.m200[inspectedInd.lastClosedIdx] || 0,
+              }
+            : null),
         tp1Mode: this.cfg.portfolioTp1TargetMode || "EMA200",
         disasterSlPct: Number(this.cfg.portfolioDisasterSlPct ?? 3.5),
         wsConnected: isAlpaca
