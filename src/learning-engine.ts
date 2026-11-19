@@ -332,9 +332,9 @@ export class LearningEngine {
       updatedAt: Date.now(),
     };
 
-    const isSlHit = params.exitReason.startsWith("SL_");
     const isWin = params.totalPnlQuote > 0;
-    const nextConsecSl = isSlHit ? prev.consecutiveSl + 1 : isWin ? 0 : prev.consecutiveSl;
+    const isSlHit = params.exitReason.startsWith("SL_") && params.exitReason !== "SL_BREAKEVEN" && !isWin;
+    const nextConsecSl = isSlHit ? prev.consecutiveSl + 1 : (isWin || params.exitReason === "SL_BREAKEVEN") ? 0 : prev.consecutiveSl;
     let nextCooldownUntil = prev.cooldownUntilMs;
     let nextPenalty = isWin ? 0 : prev.scorePenalty;
 

@@ -201,7 +201,13 @@ export function calculateTradeRounds(orders: UnifiedOrderRecord[], activeSymbol?
       } else if (notional > 0) {
         cexFeeQuote = notional * 0.00075;
       }
-    } else if (!f.dryRun && !gasQuote && !(f.symbol || "").toUpperCase().endsWith("FDUSD") && notional > 0) {
+    } else if (
+      !f.dryRun &&
+      !gasQuote &&
+      !(f.symbol || "").toUpperCase().endsWith("FDUSD") &&
+      (f.quoteAsset || "").toUpperCase() !== "USD" &&
+      notional > 0
+    ) {
       // Fallback for live Binance fills where fee field might not yet be reconciled
       const isSomnia = Boolean(f.explorerUrl?.includes("somnia") || (f.txHash && typeof f.txHash === "string" && f.txHash.startsWith("0x")));
       if (!isSomnia) {

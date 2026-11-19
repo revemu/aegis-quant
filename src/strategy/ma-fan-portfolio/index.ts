@@ -139,7 +139,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
 
   private getAvailableBuyCash(): number {
     const cap = Number(this.cfg.portfolioMaxBudgetUsd) || 0;
-    const deployed = this.slots.reduce((s, slot) => s + slot.allocatedCapital, 0);
+    const deployed = this.slots.reduce((s, slot) => s + (slot.entryPrice > 0 ? slot.qty * slot.entryPrice : slot.allocatedCapital), 0);
     if (cap > 0) {
       const budgetRemaining = Math.max(0, cap + this.realizedPnl - deployed);
       if (!this.cfg.dryRun && this.walletQuoteBalance > 0) {
@@ -660,7 +660,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
     if (this.initialCapital <= 0) {
       this.initialCapital = this.cfg.portfolioMaxBudgetUsd > 0 ? this.cfg.portfolioMaxBudgetUsd : defaultCap;
     }
-    const deployed = this.slots.reduce((s, slot) => s + slot.allocatedCapital, 0);
+    const deployed = this.slots.reduce((s, slot) => s + (slot.entryPrice > 0 ? slot.qty * slot.entryPrice : slot.allocatedCapital), 0);
     const estFree = Math.max(0, this.initialCapital + this.realizedPnl - deployed);
     this.cashBalance = estFree;
     this.walletQuoteBalance = estFree;
@@ -1464,9 +1464,11 @@ export class MaFanPortfolioStrategy implements IStrategy {
     const proceeds = sellQty * execPrice;
     const feePct = this.exchange.exchangeName === "alpaca" || slot.symbol.endsWith("FDUSD") ? 0 : 0.00075;
     const exitFee = proceeds * feePct;
-    const portionRatio = slot.qty > 0 ? Math.min(1, sellQty / slot.qty) : 1;
-    const costBasisSlice = (slot.allocatedCapital - slot.realizedProceeds) * portionRatio;
-    const legPnl = proceeds - exitFee - costBasisSlice - (slot.entryFeeQuote * portionRatio);
+    const origQty = slot.initialQty > 0 ? slot.initialQty : slot.qty;
+    const soldShareOfInitial = origQty > 0 ? Math.min(1, sellQty / origQty) : 1;
+    const costBasisSlice = slot.entryPrice > 0 ? sellQty * slot.entryPrice : slot.allocatedCapital * soldShareOfInitial;
+    const entryFeeSlice = slot.entryFeeQuote * soldShareOfInitial;
+    const legPnl = proceeds - exitFee - costBasisSlice - entryFeeSlice;
 
     slot.realizedProceeds += proceeds - exitFee;
     slot.realizedExitFees += exitFee;
@@ -1555,7 +1557,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
         const ind = this.snapshots.get(slot.symbol);
         const curPx = ind?.livePrice || slot.lastKnownPrice || slot.entryPrice;
         const mktVal = slot.qty * curPx;
-        const remainingCost = Math.max(0.01, slot.allocatedCapital - slot.realizedProceeds);
+        const remainingCost = Math.max(0.01, slot.entryPrice > 0 ? slot.qty * slot.entryPrice : slot.allocatedCapital);
         const unreal = mktVal - remainingCost;
         const unrealPct = remainingCost > 0 ? (unreal / remainingCost) * 100 : 0;
         const tp1 = slot.tp1TargetPrice || slot.entryPrice * 1.008;

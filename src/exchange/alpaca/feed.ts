@@ -146,14 +146,24 @@ export function parseAlpacaSnapshotToBook(snap: {
   const qAskSize = Number(q?.as || 0);
 
   const hasTwoSidedQuote = qBid > 0 && qAsk > 0 && qBid <= qAsk && qBidSize > 0 && qAskSize > 0;
+  const quoteMid = hasTwoSidedQuote ? (qBid + qAsk) / 2 : 0;
+  const isTightQuote =
+    hasTwoSidedQuote &&
+    quoteMid > 0 &&
+    (qAsk - qBid) / quoteMid <= 0.005 &&
+    (tradePrice <= 0 || Math.abs(quoteMid - tradePrice) / tradePrice <= 0.005);
+
   let bestBid: number;
   let bestAsk: number;
-  if (hasTwoSidedQuote) {
+  if (isTightQuote) {
     bestBid = qBid;
     bestAsk = qAsk;
   } else if (fallbackPrice > 0) {
     bestBid = fallbackPrice;
     bestAsk = fallbackPrice;
+  } else if (hasTwoSidedQuote) {
+    bestBid = qBid;
+    bestAsk = qAsk;
   } else {
     bestBid = qBid > 0 ? qBid : qAsk;
     bestAsk = qAsk > 0 ? qAsk : qBid;
@@ -162,7 +172,7 @@ export function parseAlpacaSnapshotToBook(snap: {
   const mid = bestBid > 0 && bestAsk > 0 ? (bestBid + bestAsk) / 2 : bestBid || bestAsk || fallbackPrice;
   if (!mid || mid <= 0) return undefined;
 
-  const tsStr = hasTwoSidedQuote ? q?.t : (snap?.latestTrade?.t || snap?.minuteBar?.t || q?.t);
+  const tsStr = isTightQuote ? q?.t : (snap?.latestTrade?.t || snap?.minuteBar?.t || q?.t);
   const parsedMs = tsStr ? new Date(tsStr).getTime() : Date.now();
   const time = Number.isFinite(parsedMs) ? Math.floor(parsedMs / 1000) : Math.floor(Date.now() / 1000);
 
@@ -170,8 +180,8 @@ export function parseAlpacaSnapshotToBook(snap: {
     bestBid: bestBid > 0 ? bestBid : mid,
     bestAsk: bestAsk > 0 ? bestAsk : mid,
     mid,
-    bidQty: hasTwoSidedQuote ? qBidSize : 100,
-    askQty: hasTwoSidedQuote ? qAskSize : 100,
+    bidQty: isTightQuote ? qBidSize : 100,
+    askQty: isTightQuote ? qAskSize : 100,
     time,
   };
 }

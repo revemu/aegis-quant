@@ -318,10 +318,12 @@ export class AlpacaPortfolioWsClient {
       state.bidSize = bs;
       state.askSize = as;
 
-      // Reject one-sided or abnormally wide IEX stub quotes (>5% spread)
+      // Reject one-sided, wide (>0.5% spread), or trade-divergent (>0.5% from lastTrade) IEX stub quotes
       if (bp > 0 && ap > 0 && bp <= ap && bs > 0 && as > 0) {
         const mid = (bp + ap) / 2;
-        if ((ap - bp) / mid <= 0.05) {
+        const spreadTight = (ap - bp) / mid <= 0.005;
+        const nearLastTrade = state.lastTrade <= 0 || Math.abs(mid - state.lastTrade) / state.lastTrade <= 0.005;
+        if (spreadTight && nearLastTrade) {
           const tsMs = msg.t ? Date.parse(msg.t) : Date.now();
           this.emitPrice(sym, mid, Number.isFinite(tsMs) ? tsMs : Date.now());
         }

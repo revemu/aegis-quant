@@ -9940,3 +9940,21 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - **Sidebar Learning Pulse (`#pfLearningCard`)**: เพิ่มการ์ดสรุปการทำงานของ Learning Engine (`/api/learning/report` รีเฟรชทุก 45 วินาที) แสดงจำนวนสัญญาณบล็อกที่เฉลย/รอตรวจ 4h, ฟิลเตอร์เด่น, เทรดปิด/SL Tune, และ Cooldown พร้อมคลิกเปิด Learning Insights Modal
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.91`** ใน `package.json`, `src/version.ts` และ `public/index.html` (`style.css?v=0.3.0.91`, `app.js?v=0.3.0.91`)
+
+---
+
+## 336. v0.3.0.92 — Alpaca IEX Stub Quote Guard, Market Order Fill Polling, Partial-Exit PnL Fix, USD Fee & BE Strike Fix (`src/exchange/alpaca/*`, `src/strategy/ma-fan-portfolio/index.ts`, `src/trade-rounds.ts`, `src/learning-engine.ts`)
+
+- **Strict Alpaca IEX Stub Quote Guard (`src/exchange/alpaca/ws.ts`, `src/exchange/alpaca/feed.ts`)**:
+  - บีบเกณฑ์ความกว้าง Bid/Ask quote บน IEX WebSocket (`handleMessage`) และ REST Snapshot (`parseAlpacaSnapshotToBook`) จากเดิม 5% เหลือ **0.5%** และบังคับเทียบกับราคาเทรดจริงล่าสุด (`lastTrade` / `latestTrade`) ไม่เกิน **0.5%** ป้องกัน quote ชั่วคราวที่ถ่างผิดปกติหลอกทริกเกอร์ `TP1_EMA200` หรือ `SL`
+- **Alpaca MARKET Order Fill Confirmation Polling (`src/exchange/alpaca/client.ts`)**:
+  - ใน `placeOrder`: เมื่อส่งคำสั่ง `market` แล้ว Alpaca ตอบกลับสถานะเริ่มต้น (`accepted`/`new`) ที่ยังไม่มี `filled_avg_price` ให้ poll `GET /v2/orders/{id}` ด้วย backoff `[250, 350, 500, 700, 1000, 1200]` ms (รวม ~4 วินาที) จนกว่าจะได้ `FILLED` พร้อม `filled_qty > 0 && filled_avg_price > 0` และโยน error หากคำสั่งถูก `CANCELED`/`REJECTED`/`EXPIRED` โดยไม่แมตช์
+- **Partial-Exit PnL & Remaining Cost Basis Fix (`src/strategy/ma-fan-portfolio/index.ts`)**:
+  - แก้ `executeExitSlot`: เปลี่ยนจาก `(slot.allocatedCapital - slot.realizedProceeds) * portionRatio` (ซึ่งหักกำไรขาแรกออกจากต้นทุนขาที่ 2 ทำให้บวกกำไรซ้ำ) เป็นการหักต้นทุนตามสัดส่วนจริงของจำนวนหุ้นที่ขาย (`sellQty * slot.entryPrice` และ `entryFeeQuote * (sellQty / initialQty)`)
+  - แก้ `buildSlotTelemetryList`, `refreshWalletBalances` และ `getAvailableBuyCash` ให้คำนวณต้นทุนคงเหลือจาก `slot.qty * slot.entryPrice` อย่างสอดคล้องกัน
+- **Zero-Commission US Equities Round Calculation (`src/trade-rounds.ts`)**:
+  - ยกเว้นคู่เทรด `quoteAsset === "USD"` จาก fallback ค่าธรรมเนียม CEX `0.075%` ใน `computeTradeRounds`
+- **Breakeven Stop Loss Strike Guard (`src/learning-engine.ts`)**:
+  - ไม่นับ `SL_BREAKEVEN` หรือไม้ที่ปิดเป็นกำไรเป็น `consecutiveSl` และรีเซ็ต `consecutiveSl` เป็น `0` เมื่อปิดด้วย `SL_BREAKEVEN` หรือกำไร
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.92`** ใน `package.json`, `src/version.ts` และ `public/index.html` (`style.css?v=0.3.0.92`, `app.js?v=0.3.0.92`)

@@ -354,7 +354,31 @@ export class AlpacaClient implements IExchangeClient {
       throw new Error(`Alpaca placeOrder failed: HTTP ${res.status} - ${errTxt}`);
     }
 
-    const o = await res.json();
+    let o = await res.json();
+    if (type === "market" && o?.id) {
+      const delays = [250, 350, 500, 700, 1000, 1200];
+      for (const waitMs of delays) {
+        const curStatus = mapAlpacaOrderStatus(o.status);
+        const curFilledQty = parseFloat(o.filled_qty || 0);
+        const curFilledAvg = parseFloat(o.filled_avg_price || 0);
+        if (curStatus === "FILLED" && curFilledQty > 0 && curFilledAvg > 0) break;
+        if (curStatus === "CANCELED" || curStatus === "REJECTED" || curStatus === "EXPIRED") break;
+        await new Promise((r) => setTimeout(r, waitMs));
+        try {
+          const pollRes = await fetch(`${this.baseUrl}/v2/orders/${o.id}`, { headers: this.getHeaders() });
+          if (pollRes.ok) {
+            o = await pollRes.json();
+          }
+        } catch {
+          // ignore transient poll failure and retry
+        }
+      }
+      const finalStatus = mapAlpacaOrderStatus(o.status);
+      const finalFilledQty = parseFloat(o.filled_qty || 0);
+      if ((finalStatus === "CANCELED" || finalStatus === "REJECTED" || finalStatus === "EXPIRED") && finalFilledQty <= 0) {
+        throw new Error(`Alpaca market order ${o.id} ${o.status} without fill`);
+      }
+    }
     return {
       symbol: o.symbol,
       orderId: o.id,
