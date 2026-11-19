@@ -687,8 +687,9 @@ export class MaFanPortfolioStrategy implements IStrategy {
       benchmarkFallback15m: this.benchmark15m,
       force,
     });
+    await this.learning.applyAutonomousTuning(this.cfg, (patch) => this.updateRuntimeSettings(patch)).catch(() => {});
     this.emitTelemetryTick();
-    return summary;
+    return this.learning.getShadowSummary() ?? summary;
   }
 
   public async reconcileLearningJournal() {

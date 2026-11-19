@@ -10034,3 +10034,24 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - ใน `analyzeTuning`: ให้คะแนนบน Train ด้วย `quantScore` (`totalPnlPct` + PF bonus + `>= 55%` trade retention), บังคับ 8-bar per-symbol cooldown ให้ตรงกัน, คัด `trainWinners` สำหรับ `combined` จาก **Train ล้วน (Zero Test Leakage)** แล้วค่อยตรวจสอบ `combined.passedOos` บน Test 1 ครั้ง
   - ปิดความขัดแย้งระหว่าง SL Auto-Tune เก่า กับ OOS Tuning: เมื่อเทรดจริง `< 20` ไม้ จะจูน `portfolioDisasterSlPct` เฉพาะเมื่อ `analyzeTuning` ยืนยันความเชื่อมั่น `HIGH` หรือ `MEDIUM` เท่านั้น (ไม่บีบ SL ลง `2.5%` จาก `WinMAE P80` เมื่อผล Test ปฏิเสธว่าเป็น `LOW`/Overfit) และแสดงผลสอดคล้องกันใน `summary.recommendedDisasterSlPct` + UI `#lrTuningBox`
 - **Version Bump**: **`0.3.0.97`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 342. v0.3.0.98 — Zero-Config Autonomous OOS Auto-Pilot & Simplified Portfolio Settings (`src/config.ts`, `src/learning-engine.ts`, `src/strategy/ma-fan-portfolio/index.ts`, `public/*`)
+
+- **Default Auto-Pilot ON Out-of-the-Box (`src/config.ts`, `src/learning-engine.ts`, `public/app.js`, `public/index.html`)**:
+  - เปลี่ยนค่าเริ่มต้น `learningAutoTuneMode` จาก `"dry_run_only"` เป็น `"all"` ทั้งใน `defaultStrategyConfig` และ fallback ของ `LearningEngine`/`public/app.js` เพื่อให้ระบบปรับจูนอัตโนมัติทำงานทันทีโดยผู้ใช้ไม่ต้องเข้าไปเปิดเอง
+- **Autonomous Bounded OOS Auto-Pilot & Safety Guardrails (`src/learning-engine.ts`, `src/strategy/ma-fan-portfolio/index.ts`)**:
+  - เพิ่ม `autoApplicable` (`(confidence === "HIGH" || "MEDIUM") && testTrades >= 12 && testDelta >= 0.03 && testPF > basePF`) ใน `TuningRecommendation` และแคช `lastTuningEvents`/`lastTuningCostPct` เพื่อรีคำนวณ `tuning` ใน memory ทันที (`refreshShadowTuningFromConfig`) หลังปรับค่าใดๆ หรือเมื่อเปิดดูรายงาน
+  - เพิ่ม `encodeTpModeNumeric`/`decodeTpModeNumeric` (`EMA25 <-> 25`, `EMA75 <-> 75`, `EMA200 <-> 200`) ให้บันทึก `portfolioTp1TargetMode` ลงตาราง `learning_adjustments` (`DOUBLE PRECISION`) ได้ปลอดภัย
+  - เพิ่ม `LearningEngine.applyAutonomousTuning(cfg, onApplySetting)` เรียกทั้งจาก `runPeriodicCycle` และทันทีหลัง `MaFanPortfolioStrategy.runLearningShadowScan`:
+    1. **Self-Heal Legacy `WinMAE P80`**: ตรวจจับและคืนค่า `portfolioDisasterSlPct` จาก adjustment เก่าของ `v0.3.0.95` ที่ขยับจาก WinMAE Shadow โดยยังไม่ผ่าน OOS Test
+    2. **Auto-Rollback Guard**: หลังจูน >= 6 ชม. หาก OOS ย้อนกลับหรือเทรดจริงหลังจูน `>= 4` ไม้มี Win Rate `< 25%` และ PnL ติดลบ จะถอยกลับค่าเดิมอัตโนมัติ
+    3. **OOS-Confirmed Bounded Auto-Tune**: ปรับทีละ 1 พารามิเตอร์ที่ชนะมากที่สุดบน Test พร้อม Cooldown 7 วันต่อตัว (`SL ±0.25% [2.5–5.0]`, `VolR ±0.30x [1.0–2.0]`, `RS ±1.0% [-3.0–1.0]`, `1hRSI ±5 [35–50]`, `TP1 EMA25/75/200`) และยังบล็อกค่าที่ `LOW` (Overfit) ทั้งหมด
+    4. คง Real-Trade `WinMAE P80` SL calibration ไว้เมื่อปิดครบ `>= 20` ไม้และไม่ขัดกับผล OOS
+  - เพิ่ม `summary.activeTechnicalParams` ใน `/api/learning/report`
+- **Zero-Config Portfolio Settings UI & Report Clarity (`public/index.html`, `public/app.js`)**:
+  - คลีนหน้า Settings หลัก (`#tab-portfolio`) ให้เหลือเฉพาะ **3 ค่าหลักที่ไม่ใช่เทคนิค** (งบพอร์ตสูงสุด, จำนวน Slot, ชุดหุ้น/เหรียญที่สแกน) พร้อมแบนเนอร์ `#portfolioAutoPilotBanner` แสดงสถานะ Auto-Pilot และชิปค่าเทคนิคที่บอทกำลังใช้งานแบบ Read-Only (`#pfAutoPilotActiveParams`)
+  - ย้าย `cfg_portfolioSitOutMode` และ `cfg_portfolioDisasterSlPct` ลงไปไว้ในส่วนพับด้านล่าง `#portfolioAdvancedDetails` ("ตั้งค่าเทคนิคสำหรับผู้เชี่ยวชาญ / Expert Manual Override")
+  - อัปเดต Learning Report: แสดงแถบค่าเทคนิคที่ Auto-Pilot ใช้งานอยู่บน `#lrTuningBox`, ป้าย `🤖 Auto-Pilot พร้อมจูน` / `🛡️ บล็อก Overfit (LOW)`, และแปลง `25/75/200 -> EMA25/EMA75/EMA200` + `0/1/2/3 -> NORMAL/...` ใน `#lrAdjustmentsBox` (`formatLearningAdjustment`)
+- **Version Bump**: **`0.3.0.98`** (`package.json`, `src/version.ts`, `public/index.html`)

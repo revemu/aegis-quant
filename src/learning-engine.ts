@@ -274,6 +274,33 @@ function normalizeTpMode(m?: string): TpModeName {
   return m === "EMA25" || m === "EMA75" ? m : "EMA200";
 }
 
+export function encodeTpModeNumeric(mode: string | undefined): number {
+  if (mode === "EMA25") return 25;
+  if (mode === "EMA75") return 75;
+  return 200;
+}
+
+export function decodeTpModeNumeric(num: number): TpModeName {
+  const n = Math.round(Number(num));
+  if (n === 25) return "EMA25";
+  if (n === 75) return "EMA75";
+  return "EMA200";
+}
+
+function tuneCfgFromConfig(cfg: Config): TuneCfg {
+  return {
+    sl: Math.max(1.5, Math.min(5.0, Number(cfg.portfolioDisasterSlPct || 3.5))),
+    minVolR: Number.isFinite(Number(cfg.portfolioMinBuyVolRatio)) ? Number(cfg.portfolioMinBuyVolRatio) : 1.3,
+    minRs: Number.isFinite(Number(cfg.portfolioMinRelStrength24h)) ? Number(cfg.portfolioMinRelStrength24h) : -1.0,
+    minRsi1h: Number.isFinite(Number(cfg.portfolioMinRsi1h)) ? Number(cfg.portfolioMinRsi1h) : 40,
+    tpMode: normalizeTpMode(cfg.portfolioTp1TargetMode),
+  };
+}
+
+function tuneCfgKey(t: TuneCfg): string {
+  return `${t.sl}|${t.minVolR}|${t.minRs}|${t.minRsi1h}|${t.tpMode}`;
+}
+
 interface TuningEvent {
   setupId: string;
   symbol: string;
@@ -314,7 +341,8 @@ export interface TuningRecommendation {
   suggestedTest: TuningMetrics;
   confidence: "HIGH" | "MEDIUM" | "LOW";
   verdict: string;
-  advisoryOnly: true;
+  advisoryOnly: boolean;
+  autoApplicable?: boolean;
 }
 
 export interface TuningAnalysis {
@@ -490,10 +518,18 @@ function analyzeTuning(events: TuningEvent[], cur: TuneCfg, costPct = 0): Tuning
           ? "MEDIUM"
           : "LOW";
 
+    const autoApplicable =
+      (confidence === "HIGH" || confidence === "MEDIUM") &&
+      testN >= 12 &&
+      testDelta >= 0.03 &&
+      best.res.test.profitFactor > base.test.profitFactor;
+
     const verdict =
       confidence === "LOW"
-        ? "ไม่ผ่านการยืนยันช่วงทดสอบ (อาจ Overfit หรือจำนวนไม้/PF ลดลง) — ไม่แนะนำให้เปลี่ยน"
-        : `ช่วงทดสอบเฉลี่ย/ไม้ ${testDelta >= 0 ? "+" : ""}${testDelta.toFixed(2)}pp (Total ${best.res.test.totalPnlPct >= 0 ? "+" : ""}${best.res.test.totalPnlPct}%, PF ${best.res.test.profitFactor}) • ความเชื่อมั่น ${confidence}`;
+        ? "🛡️ บล็อกอัตโนมัติ (ไม่ผ่าน OOS Test — ป้องกัน Overfit)"
+        : autoApplicable
+          ? `🤖 พร้อมปรับอัตโนมัติ (OOS Test เฉลี่ย/ไม้ +${testDelta.toFixed(2)}pp, Total ${best.res.test.totalPnlPct >= 0 ? "+" : ""}${best.res.test.totalPnlPct}%, PF ${best.res.test.profitFactor}) • ความเชื่อมั่น ${confidence}`
+          : `ช่วงทดสอบเฉลี่ย/ไม้ ${testDelta >= 0 ? "+" : ""}${testDelta.toFixed(2)}pp (Total ${best.res.test.totalPnlPct >= 0 ? "+" : ""}${best.res.test.totalPnlPct}%, PF ${best.res.test.profitFactor}) • ความเชื่อมั่น ${confidence}`;
 
     recs.push({
       param: cand.param,
@@ -506,7 +542,8 @@ function analyzeTuning(events: TuningEvent[], cur: TuneCfg, costPct = 0): Tuning
       suggestedTest: best.res.test,
       confidence,
       verdict,
-      advisoryOnly: true,
+      advisoryOnly: !autoApplicable,
+      autoApplicable,
     });
   }
 
@@ -540,11 +577,90 @@ function analyzeTuning(events: TuningEvent[], cur: TuneCfg, costPct = 0): Tuning
     baselineTest: base.test,
     recommendations: recs,
     combined,
-    note: `คำแนะนำเท่านั้น (Advisory, หักต้นทุนจำลอง ${costPct.toFixed(2)}%/รอบ) — คัดผู้ชนะจาก Train 70% ล้วนแล้วทดสอบครั้งเดียวบน Test 30%`,
+    note: `🤖 Auto-Pilot OOS (หักต้นทุนจำลอง ${costPct.toFixed(2)}%/รอบ) — คัดจาก Train 70% และปรับใช้เฉพาะค่าที่ผ่าน OOS Test 30% (HIGH/MEDIUM) อัตโนมัติ พร้อม Cooldown 7 วัน & Auto-Rollback`,
   };
 }
 
 export type LearningAutoTuneConfig = Pick<Config, "learningAutoTuneMode" | "dryRun" | "exchange" | "alpacaBaseUrl">;
+
+type AutoTunableParam = TuningRecommendation["param"];
+
+const AUTO_TUNABLE_PARAMS: readonly AutoTunableParam[] = [
+  "portfolioTp1TargetMode",
+  "portfolioDisasterSlPct",
+  "portfolioMinBuyVolRatio",
+  "portfolioMinRelStrength24h",
+  "portfolioMinRsi1h",
+];
+
+function matchesRecordedAdjustment(param: AutoTunableParam, cfg: Config, recordedNum: number): boolean {
+  switch (param) {
+    case "portfolioTp1TargetMode":
+      return encodeTpModeNumeric(cfg.portfolioTp1TargetMode) === Math.round(recordedNum);
+    case "portfolioDisasterSlPct":
+      return Math.abs(Number(cfg.portfolioDisasterSlPct || 3.5) - recordedNum) < 0.05;
+    case "portfolioMinBuyVolRatio": {
+      const v = Number.isFinite(Number(cfg.portfolioMinBuyVolRatio)) ? Number(cfg.portfolioMinBuyVolRatio) : 1.3;
+      return Math.abs(v - recordedNum) < 0.05;
+    }
+    case "portfolioMinRelStrength24h": {
+      const v = Number.isFinite(Number(cfg.portfolioMinRelStrength24h)) ? Number(cfg.portfolioMinRelStrength24h) : -1.0;
+      return Math.abs(v - recordedNum) < 0.05;
+    }
+    case "portfolioMinRsi1h": {
+      const v = Number.isFinite(Number(cfg.portfolioMinRsi1h)) ? Number(cfg.portfolioMinRsi1h) : 40;
+      return Math.abs(v - recordedNum) < 0.5;
+    }
+  }
+}
+
+function buildTunableCandidatePatch(
+  param: AutoTunableParam,
+  cfg: Config,
+  suggested: number | string,
+): { patchVal: number | TpModeName; oldNum: number; newNum: number; displayChange: string } | null {
+  switch (param) {
+    case "portfolioTp1TargetMode": {
+      const curMode = cfg.portfolioTp1TargetMode || "EMA200";
+      const nextMode = String(suggested) as TpModeName;
+      if (!["EMA25", "EMA75", "EMA200"].includes(nextMode) || nextMode === curMode) return null;
+      return {
+        patchVal: nextMode,
+        oldNum: encodeTpModeNumeric(curMode),
+        newNum: encodeTpModeNumeric(nextMode),
+        displayChange: `${curMode} -> ${nextMode}`,
+      };
+    }
+    case "portfolioMinBuyVolRatio": {
+      const curVal = Number.isFinite(Number(cfg.portfolioMinBuyVolRatio)) ? Number(cfg.portfolioMinBuyVolRatio) : 1.3;
+      const target = clamp(Number(suggested), 1.0, 2.0);
+      const nextVal = Number(clamp(curVal + clamp(target - curVal, -0.30, 0.30), 1.0, 2.0).toFixed(2));
+      if (Math.abs(nextVal - curVal) < 0.10) return null;
+      return { patchVal: nextVal, oldNum: curVal, newNum: nextVal, displayChange: `${curVal} -> ${nextVal}` };
+    }
+    case "portfolioMinRelStrength24h": {
+      const curVal = Number.isFinite(Number(cfg.portfolioMinRelStrength24h)) ? Number(cfg.portfolioMinRelStrength24h) : -1.0;
+      const target = clamp(Number(suggested), -3.0, 1.0);
+      const nextVal = Number(clamp(curVal + clamp(target - curVal, -1.0, 1.0), -3.0, 1.0).toFixed(2));
+      if (Math.abs(nextVal - curVal) < 0.40) return null;
+      return { patchVal: nextVal, oldNum: curVal, newNum: nextVal, displayChange: `${curVal}% -> ${nextVal}%` };
+    }
+    case "portfolioMinRsi1h": {
+      const curVal = Number.isFinite(Number(cfg.portfolioMinRsi1h)) ? Number(cfg.portfolioMinRsi1h) : 40;
+      const target = clamp(Number(suggested), 35, 50);
+      const nextVal = Math.round(clamp(curVal + clamp(target - curVal, -5, 5), 35, 50));
+      if (Math.abs(nextVal - curVal) < 3) return null;
+      return { patchVal: nextVal, oldNum: curVal, newNum: nextVal, displayChange: `${curVal} -> ${nextVal}` };
+    }
+    case "portfolioDisasterSlPct": {
+      const curVal = Number(cfg.portfolioDisasterSlPct || 3.5);
+      const target = clamp(Number(suggested), 2.5, 5.0);
+      const nextVal = Number(clamp(curVal + clamp(target - curVal, -0.25, 0.25), 2.5, 5.0).toFixed(2));
+      if (Math.abs(nextVal - curVal) < 0.20) return null;
+      return { patchVal: nextVal, oldNum: curVal, newNum: nextVal, displayChange: `${curVal}% -> ${nextVal}%` };
+    }
+  }
+}
 
 export class LearningEngine {
   private readonly db: BotDatabase;
@@ -553,11 +669,15 @@ export class LearningEngine {
   private recordedBlockedKeys = new Set<string>();
   private lastPeriodicRunTs = 0;
   private periodicInProgress = false;
+  private autoTuneInProgress = false;
   private symbolStatesLoaded = false;
 
   // Shadow Walk-Forward & Survival Telemetry state
   private shadowSummary: ShadowLearningSummary | null = null;
   private shadowWinMaeAbs: number[] = [];
+  private lastTuningEvents: TuningEvent[] = [];
+  private lastTuningCostPct = 0;
+  private lastTuningBaselineKey = "";
   private lastShadowRunTs = 0;
   private shadowInProgress = false;
 
@@ -576,7 +696,7 @@ export class LearningEngine {
   }
 
   public isAutoTuneAllowed(cfg: LearningAutoTuneConfig): boolean {
-    const mode = cfg.learningAutoTuneMode || "dry_run_only";
+    const mode = cfg.learningAutoTuneMode || "all";
     if (mode === "off") return false;
     if (mode === "all") return true;
     const isAlpacaPaper =
@@ -1451,6 +1571,13 @@ export class LearningEngine {
       const recSlPct = maeP80Abs !== null ? Math.round(clamp(maeP80Abs + 0.8, 2.5, 5.0) * 4) / 4 : null;
       const overallPf = sumLossAbsPct > 0 ? sumWinPct / sumLossAbsPct : sumWinPct > 0 ? 99 : 0;
 
+      const initTuneCfg = tuneCfgFromConfig({
+        portfolioDisasterSlPct: opts.slPct || 3.5,
+        portfolioMinBuyVolRatio: baseMinVolR,
+        portfolioMinRelStrength24h: baseMinRs,
+        portfolioMinRsi1h: baseMinRsi1h,
+        portfolioTp1TargetMode: baseTpMode,
+      } as Config);
       const summary: ShadowLearningSummary = {
         updatedAt: now,
         exchange: ex,
@@ -1473,21 +1600,14 @@ export class LearningEngine {
         topProvenSymbols,
         riskyWhipsawSymbols,
         bySymbol,
-        tuning: analyzeTuning(
-          tuningEvents,
-          {
-            sl: Math.max(1.5, Math.min(5.0, opts.slPct || 3.5)),
-            minVolR: baseMinVolR,
-            minRs: baseMinRs,
-            minRsi1h: baseMinRsi1h,
-            tpMode: baseTpMode,
-          },
-          costPct,
-        ),
+        tuning: analyzeTuning(tuningEvents, initTuneCfg, costPct),
       };
 
       this.shadowSummary = summary;
       this.shadowWinMaeAbs = winMaeAbs;
+      this.lastTuningEvents = tuningEvents;
+      this.lastTuningCostPct = costPct;
+      this.lastTuningBaselineKey = tuneCfgKey(initTuneCfg);
       this.lastShadowRunTs = now;
       this.log(
         `🔬 [Shadow Learning] Scanned ${summary.symbolsAnalyzed} tickers (~${summary.barsPerSymbolAvg} bars): ${summary.totalSetups} setups, WR ${summary.winRatePct}%, PF ${summary.profitFactor}, BearAvg ${summary.bearMacroAvgPnlPct >= 0 ? "+" : ""}${summary.bearMacroAvgPnlPct}% (${summary.bearMacroSetups}t)`,
@@ -1694,6 +1814,214 @@ export class LearningEngine {
     return decision;
   }
 
+  private refreshShadowTuningFromConfig(cfg: Config): void {
+    if (!this.shadowSummary || this.lastTuningEvents.length === 0) return;
+    const nextTuneCfg = tuneCfgFromConfig(cfg);
+    const nextKey = tuneCfgKey(nextTuneCfg);
+    if (nextKey === this.lastTuningBaselineKey) return;
+    this.shadowSummary = {
+      ...this.shadowSummary,
+      tuning: analyzeTuning(this.lastTuningEvents, nextTuneCfg, this.lastTuningCostPct),
+    };
+    this.lastTuningBaselineKey = nextKey;
+  }
+
+  public async applyAutonomousTuning(
+    cfg: Config,
+    onApplySetting: (patch: Record<string, any>) => void,
+  ): Promise<void> {
+    let effectiveCfg: Config = { ...cfg };
+    this.refreshShadowTuningFromConfig(effectiveCfg);
+
+    const pg = this.getPg();
+    if (!pg || !this.isAutoTuneAllowed(effectiveCfg) || this.autoTuneInProgress) return;
+
+    this.autoTuneInProgress = true;
+    try {
+      const now = Date.now();
+      const [adjustmentsRaw, closed] = await Promise.all([
+        pg.loadLearningAdjustments(50).catch(() => [] as LearningAdjustmentRecord[]),
+        pg.loadLearningJournal("TRADE", "CLOSED", 200).catch(() => [] as LearningJournalRecord[]),
+      ]);
+      const adjustments = [...adjustmentsRaw];
+      const sampleBase = closed.length + (this.shadowSummary?.totalSetups ?? 0);
+
+      // Step A: Self-heal legacy un-gated WinMAE P80 shadow SL nudges (e.g. v0.3.0.95)
+      let restoredSlThisCycle = false;
+      const lastSlAdj = adjustments.find((a) => a.paramName === "portfolioDisasterSlPct");
+      const isLegacyShadowWinMaeSl = Boolean(
+        lastSlAdj &&
+          lastSlAdj.rationale.includes("Shadow(") &&
+          lastSlAdj.rationale.includes("WinMAE_P80") &&
+          !lastSlAdj.rationale.includes("OOS-Confirmed") &&
+          !lastSlAdj.rationale.includes("OOS Auto-Pilot") &&
+          !lastSlAdj.rationale.includes("Auto-Restore") &&
+          !lastSlAdj.rationale.includes("Auto-Rollback"),
+      );
+      if (isLegacyShadowWinMaeSl && lastSlAdj) {
+        const curSl = Number(effectiveCfg.portfolioDisasterSlPct || 3.5);
+        const slRec = this.shadowSummary?.tuning?.recommendations.find((r) => r.param === "portfolioDisasterSlPct");
+        const slDownConfirmed = Boolean(
+          slRec && (slRec.confidence === "HIGH" || slRec.confidence === "MEDIUM") && Number(slRec.suggested) <= curSl,
+        );
+        if (!slDownConfirmed && Math.abs(curSl - lastSlAdj.newValue) < 0.05 && Math.abs(lastSlAdj.oldValue - curSl) >= 0.2) {
+          const restoreSl = Number(clamp(lastSlAdj.oldValue, 2.5, 5.0).toFixed(2));
+          const rationale = `Auto-Restore: คืนค่า SL จาก WinMAE Shadow เดิมที่ยังไม่ผ่าน OOS Test -> ${restoreSl.toFixed(2)}%`;
+          onApplySetting({ portfolioDisasterSlPct: restoreSl });
+          effectiveCfg = { ...effectiveCfg, portfolioDisasterSlPct: restoreSl };
+          this.log(
+            `🔄 [Learning Auto-Restore] portfolioDisasterSlPct: ${curSl}% -> ${restoreSl}% (คืนค่าจาก WinMAE Shadow เดิมที่ยังไม่ยืนยัน OOS)`,
+          );
+          const recRow: LearningAdjustmentRecord = {
+            paramName: "portfolioDisasterSlPct",
+            oldValue: curSl,
+            newValue: restoreSl,
+            sampleSize: sampleBase,
+            rationale,
+            applied: true,
+            createdAt: now,
+          };
+          await pg.recordLearningAdjustment(recRow).catch(() => {});
+          adjustments.unshift(recRow);
+          this.refreshShadowTuningFromConfig(effectiveCfg);
+          restoredSlThisCycle = true;
+        }
+      }
+
+      // Step B: Auto-Rollback Guard if previously tuned setting reverses in OOS or degrades live
+      for (const param of AUTO_TUNABLE_PARAMS) {
+        const lastAdj = adjustments.find((a) => a.paramName === param);
+        if (!lastAdj) continue;
+        if (lastAdj.rationale.startsWith("Auto-Restore") || lastAdj.rationale.startsWith("Auto-Rollback")) continue;
+        if (now - lastAdj.createdAt < 6 * 3_600_000) continue;
+        if (!matchesRecordedAdjustment(param, effectiveCfg, lastAdj.newValue)) continue;
+
+        const rec = this.shadowSummary?.tuning?.recommendations.find((r) => r.param === param);
+        let oosReversal = false;
+        if (rec && (rec.confidence === "HIGH" || rec.confidence === "MEDIUM")) {
+          oosReversal =
+            param === "portfolioTp1TargetMode"
+              ? encodeTpModeNumeric(String(rec.suggested)) === Math.round(lastAdj.oldValue)
+              : (Number(rec.suggested) - lastAdj.newValue) * (lastAdj.oldValue - lastAdj.newValue) > 0;
+        }
+
+        const postTrades = closed.filter((t) => Number(t.entryTimeMs || 0) >= lastAdj.createdAt);
+        const postWins = postTrades.filter((t) => Number(t.pnlQuote ?? 0) > 0).length;
+        const postPnl = postTrades.reduce((s, t) => s + Number(t.pnlQuote ?? 0), 0);
+        const liveDegraded = postTrades.length >= 4 && postWins / postTrades.length < 0.25 && postPnl < 0;
+
+        if (oosReversal || liveDegraded) {
+          const rollbackVal = param === "portfolioTp1TargetMode" ? decodeTpModeNumeric(lastAdj.oldValue) : lastAdj.oldValue;
+          const reasonTag = oosReversal && liveDegraded ? "OOS+Live" : oosReversal ? "OOS" : "Live";
+          const rationale = `Auto-Rollback: ถอยกลับค่าเดิมเนื่องจากผลทดสอบ OOS/ผลเทรดจริงหลังจูนอ่อนตัวลง (${reasonTag})`;
+          onApplySetting({ [param]: rollbackVal });
+          effectiveCfg = { ...effectiveCfg, [param]: rollbackVal };
+          this.log(`↩️ [Learning Auto-Rollback] ${param}: ${lastAdj.newValue} -> ${rollbackVal} (${reasonTag})`);
+          await pg
+            .recordLearningAdjustment({
+              paramName: param,
+              oldValue: lastAdj.newValue,
+              newValue: lastAdj.oldValue,
+              sampleSize: sampleBase,
+              rationale,
+              applied: true,
+              createdAt: now,
+            })
+            .catch(() => {});
+          this.refreshShadowTuningFromConfig(effectiveCfg);
+          return;
+        }
+      }
+
+      // Step C: OOS-Confirmed Autonomous Tuning (at most 1 parameter change per cycle, 7d per-param cooldown)
+      const sortedRecs = (this.shadowSummary?.tuning?.recommendations ?? [])
+        .slice()
+        .sort((a, b) => b.testAvgDeltaPct - a.testAvgDeltaPct);
+
+      for (const rec of sortedRecs) {
+        if (!rec.autoApplicable) continue;
+        const lastParamAdj = adjustments.find(
+          (a) => a.paramName === rec.param && !a.rationale.startsWith("Auto-Restore"),
+        );
+        if (lastParamAdj && now - lastParamAdj.createdAt < PARAM_NUDGE_INTERVAL_MS) continue;
+
+        const candidate = buildTunableCandidatePatch(rec.param, effectiveCfg, rec.suggested);
+        if (!candidate) continue;
+
+        const rationale = `OOS Auto-Pilot (${rec.confidence}): ${rec.label} ${candidate.displayChange} • Test +${rec.testAvgDeltaPct.toFixed(2)}pp/ไม้ (Total ${rec.suggestedTest.totalPnlPct >= 0 ? "+" : ""}${rec.suggestedTest.totalPnlPct}%, PF ${rec.suggestedTest.profitFactor}, ${rec.suggestedTest.trades} ไม้)`;
+        onApplySetting({ [rec.param]: candidate.patchVal });
+        effectiveCfg = { ...effectiveCfg, [rec.param]: candidate.patchVal };
+        this.log(`🧠 [Learning Auto-Pilot] ${rec.param}: ${candidate.displayChange} (${rationale})`);
+        await pg
+          .recordLearningAdjustment({
+            paramName: rec.param,
+            oldValue: candidate.oldNum,
+            newValue: candidate.newNum,
+            sampleSize: sampleBase,
+            rationale,
+            applied: true,
+            createdAt: now,
+          })
+          .catch(() => {});
+        this.refreshShadowTuningFromConfig(effectiveCfg);
+        return;
+      }
+
+      // Fallback Real-Trade SL Calibration when >= 20 real trades exist and no OOS change fired
+      if (restoredSlThisCycle) return;
+      const lastSlNonRestore = adjustments.find(
+        (a) => a.paramName === "portfolioDisasterSlPct" && !a.rationale.startsWith("Auto-Restore"),
+      );
+      if (lastSlNonRestore && now - lastSlNonRestore.createdAt < PARAM_NUDGE_INTERVAL_MS) return;
+
+      const wins = closed.filter((t) => (t.pnlQuote ?? 0) > 0 && typeof t.maePct === "number");
+      const realEnough = closed.length >= MIN_CLOSED_TRADES_FOR_SL_NUDGE && wins.length >= MIN_WIN_TRADES_FOR_SL_NUDGE;
+      if (!realEnough) return;
+
+      const slRec = this.shadowSummary?.tuning?.recommendations.find((r) => r.param === "portfolioDisasterSlPct");
+      const weightedWinMaeAbs: number[] = [];
+      for (const w of wins) {
+        const val = Math.abs(Number(w.maePct || 0));
+        weightedWinMaeAbs.push(val, val, val); // Real wins carry 3x weight
+      }
+      for (const sm of this.shadowWinMaeAbs) {
+        weightedWinMaeAbs.push(sm);
+      }
+      if (weightedWinMaeAbs.length === 0) return;
+
+      const curSl = Number(effectiveCfg.portfolioDisasterSlPct || 3.5);
+      const maeP80 = percentile(weightedWinMaeAbs, 0.8);
+      const maeTargetSl = Math.round(clamp(maeP80 + 0.8, 2.5, 5.0) * 4) / 4; // 0.25% step
+      const realBlockedByOos = Boolean(
+        slRec?.confidence === "LOW" && (maeTargetSl - curSl) * (Number(slRec.suggested) - curSl) > 0,
+      );
+      if (realBlockedByOos) return;
+
+      const boundedStep = clamp(maeTargetSl - curSl, -0.25, 0.25);
+      const nextSl = Number(clamp(curSl + boundedStep, 2.5, 5.0).toFixed(2));
+      if (Math.abs(nextSl - curSl) >= 0.2) {
+        const rationale = `Real(${closed.length}t/${wins.length}w) WinMAE_P80=-${maeP80.toFixed(2)}% -> target=${maeTargetSl.toFixed(2)}%, bounded step ${curSl.toFixed(2)}% -> ${nextSl.toFixed(2)}%`;
+        onApplySetting({ portfolioDisasterSlPct: nextSl });
+        effectiveCfg = { ...effectiveCfg, portfolioDisasterSlPct: nextSl };
+        this.log(`🧠 [Learning Auto-Tune] portfolioDisasterSlPct: ${curSl}% -> ${nextSl}% (${rationale})`);
+        await pg
+          .recordLearningAdjustment({
+            paramName: "portfolioDisasterSlPct",
+            oldValue: curSl,
+            newValue: nextSl,
+            sampleSize: sampleBase,
+            rationale,
+            applied: true,
+            createdAt: now,
+          })
+          .catch(() => {});
+        this.refreshShadowTuningFromConfig(effectiveCfg);
+      }
+    } finally {
+      this.autoTuneInProgress = false;
+    }
+  }
+
   public async runPeriodicCycle(
     cfg: Config,
     onApplySetting: (patch: Record<string, any>) => void,
@@ -1717,75 +2045,34 @@ export class LearningEngine {
         await this.runShadowWalkForward(shadowContext).catch(() => {});
       }
 
-      if (!pg || !this.isAutoTuneAllowed(cfg)) return;
-
-      const adjustments = await pg.loadLearningAdjustments(30).catch(() => [] as LearningAdjustmentRecord[]);
-      const lastSlAdj = adjustments.find((a) => a.paramName === "portfolioDisasterSlPct");
-      if (lastSlAdj && now - lastSlAdj.createdAt < PARAM_NUDGE_INTERVAL_MS) {
-        return;
-      }
-
-      const closed = await pg.loadLearningJournal("TRADE", "CLOSED", 200).catch(() => [] as LearningJournalRecord[]);
-      const wins = closed.filter((t) => (t.pnlQuote ?? 0) > 0 && typeof t.maePct === "number");
-      const realEnough = closed.length >= MIN_CLOSED_TRADES_FOR_SL_NUDGE && wins.length >= MIN_WIN_TRADES_FOR_SL_NUDGE;
-
-      const slRec = this.shadowSummary?.tuning?.recommendations.find((r) => r.param === "portfolioDisasterSlPct");
-      const slRecConfirmed = Boolean(slRec && (slRec.confidence === "HIGH" || slRec.confidence === "MEDIUM"));
-
-      const weightedWinMaeAbs: number[] = [];
-      for (const w of wins) {
-        const val = Math.abs(Number(w.maePct || 0));
-        weightedWinMaeAbs.push(val, val, val); // Real wins carry 3x weight
-      }
-      for (const sm of this.shadowWinMaeAbs) {
-        weightedWinMaeAbs.push(sm);
-      }
-
-      if (!realEnough && !slRecConfirmed) return;
-
-      const curSl = Number(cfg.portfolioDisasterSlPct || 3.5);
-      const maeP80 = weightedWinMaeAbs.length > 0 ? percentile(weightedWinMaeAbs, 0.8) : 0;
-      const maeTargetSl = Math.round(clamp(maeP80 + 0.8, 2.5, 5.0) * 4) / 4; // 0.25% step
-      const realBlockedByOos = Boolean(
-        slRec?.confidence === "LOW" && (maeTargetSl - curSl) * (Number(slRec.suggested) - curSl) > 0,
-      );
-      if (realEnough && !slRecConfirmed && (weightedWinMaeAbs.length === 0 || realBlockedByOos)) return;
-
-      const targetSl = slRecConfirmed ? clamp(Number(slRec!.suggested), 2.5, 5.0) : maeTargetSl;
-      const boundedStep = clamp(targetSl - curSl, -0.25, 0.25);
-      const nextSl = Number(clamp(curSl + boundedStep, 2.5, 5.0).toFixed(2));
-
-      if (Math.abs(nextSl - curSl) >= 0.2) {
-        const sourceTag = slRecConfirmed
-          ? `OOS-Confirmed Shadow (${slRec!.confidence}, Test ${slRec!.testAvgDeltaPct >= 0 ? "+" : ""}${slRec!.testAvgDeltaPct}pp)`
-          : `Real(${closed.length}t/${wins.length}w) WinMAE_P80=-${maeP80.toFixed(2)}%`;
-        const rationale = `${sourceTag} -> target=${targetSl.toFixed(2)}%, bounded step ${curSl.toFixed(2)}% -> ${nextSl.toFixed(2)}%`;
-        onApplySetting({ portfolioDisasterSlPct: nextSl });
-        this.log(`🧠 [Learning Auto-Tune] portfolioDisasterSlPct: ${curSl}% -> ${nextSl}% (${rationale})`);
-        await pg
-          .recordLearningAdjustment({
-            paramName: "portfolioDisasterSlPct",
-            oldValue: curSl,
-            newValue: nextSl,
-            sampleSize: closed.length + (this.shadowSummary?.totalSetups ?? 0),
-            rationale,
-            applied: true,
-            createdAt: now,
-          })
-          .catch(() => {});
-      }
+      await this.applyAutonomousTuning(cfg, onApplySetting);
     } finally {
       this.periodicInProgress = false;
     }
   }
 
   public async buildReport(cfg: Config) {
+    this.refreshShadowTuningFromConfig(cfg);
+    const activeTechnicalParams = {
+      portfolioTp1TargetMode: cfg.portfolioTp1TargetMode || "EMA200",
+      portfolioDisasterSlPct: Number(cfg.portfolioDisasterSlPct || 3.5),
+      portfolioMinBuyVolRatio: Number.isFinite(Number(cfg.portfolioMinBuyVolRatio))
+        ? Number(cfg.portfolioMinBuyVolRatio)
+        : 1.3,
+      portfolioMinRelStrength24h: Number.isFinite(Number(cfg.portfolioMinRelStrength24h))
+        ? Number(cfg.portfolioMinRelStrength24h)
+        : -1.0,
+      portfolioMinRsi1h: Number.isFinite(Number(cfg.portfolioMinRsi1h)) ? Number(cfg.portfolioMinRsi1h) : 40,
+      portfolioSitOutMode: cfg.portfolioSitOutMode || "dual",
+    };
+
     const pg = this.getPg();
     if (!pg) {
       return {
         postgresActive: false,
-        autoTuneMode: cfg.learningAutoTuneMode || "dry_run_only",
+        autoTuneMode: cfg.learningAutoTuneMode || "all",
         autoTuneEffective: false,
+        summary: { activeTechnicalParams },
         survival: this.lastSurvivalDecision,
         shadowLearning: this.shadowSummary,
         message: "PostgreSQL not connected; learning journal requires DATABASE_URL.",
@@ -1878,7 +2165,7 @@ export class LearningEngine {
     return {
       postgresActive: true,
       instanceKey: pg.instanceKey,
-      autoTuneMode: cfg.learningAutoTuneMode || "dry_run_only",
+      autoTuneMode: cfg.learningAutoTuneMode || "all",
       autoTuneEffective: this.isAutoTuneAllowed(cfg),
       summary: {
         closedTrades: closedTrades.length,
@@ -1895,6 +2182,7 @@ export class LearningEngine {
         currentDisasterSlPct: Number(cfg.portfolioDisasterSlPct || 3.5),
         recommendedDisasterSlPct: recommendedSlPct,
         samplesNeededForSlTune: slTuneReady ? 0 : Math.max(0, MIN_CLOSED_TRADES_FOR_SL_NUDGE - closedTrades.length),
+        activeTechnicalParams,
       },
       survival: this.lastSurvivalDecision,
       shadowLearning: this.shadowSummary,

@@ -6544,12 +6544,31 @@
       setVal("cfg_portfolioDisasterSlPct", data.portfolioDisasterSlPct ?? 3.5);
       setVal("cfg_portfolioSitOutMode", data.portfolioSitOutMode || "dual");
       setVal("cfg_portfolioMaxHoldHours", data.portfolioMaxHoldHours ?? 0);
-      setVal("cfg_learningAutoTuneMode", data.learningAutoTuneMode || "dry_run_only");
+      setVal("cfg_learningAutoTuneMode", data.learningAutoTuneMode || "all");
       setVal("cfg_portfolioMinBuyVolRatio", data.portfolioMinBuyVolRatio ?? 1.3);
       setVal("cfg_portfolioMinRelStrength24h", data.portfolioMinRelStrength24h ?? -1.0);
       setVal("cfg_portfolioMinRsi1h", data.portfolioMinRsi1h ?? 40);
       setCheck("cfg_portfolioPartialTpAtEma200", data.portfolioPartialTpAtEma200 !== false);
       setCheck("cfg_portfolioLockBreakevenAtEma200", data.portfolioLockBreakevenAtEma200 !== false);
+
+      const elApBadge = document.getElementById("pfAutoPilotModeBadge");
+      const elApParams = document.getElementById("pfAutoPilotActiveParams");
+      const apMode = data.learningAutoTuneMode || "all";
+      if (elApBadge) {
+        if (apMode === "off") {
+          elApBadge.textContent = "📊 Auto-Pilot: ปิด (ใช้ค่าคงที่)";
+          elApBadge.style.color = "#fbbf24";
+        } else if (apMode === "dry_run_only") {
+          elApBadge.textContent = "🧪 Auto-Pilot: เฉพาะ Dry Run / Paper";
+          elApBadge.style.color = "#93c5fd";
+        } else {
+          elApBadge.textContent = "🟢 Auto-Pilot: ทำงานอัตโนมัติ (Full)";
+          elApBadge.style.color = "#a7f3d0";
+        }
+      }
+      if (elApParams) {
+        elApParams.innerHTML = buildActiveTechParamChipsHtml(data);
+      }
 
       const maColors = getMaFanColors();
       setVal("cfg_maColor4", maColors.c4);
@@ -6869,7 +6888,7 @@
       portfolioDisasterSlPct: parseFloat(document.getElementById("cfg_portfolioDisasterSlPct")?.value || "3.5") || 3.5,
       portfolioSitOutMode: document.getElementById("cfg_portfolioSitOutMode")?.value || "dual",
       portfolioMaxHoldHours: parseFloat(document.getElementById("cfg_portfolioMaxHoldHours")?.value || "0") || 0,
-      learningAutoTuneMode: document.getElementById("cfg_learningAutoTuneMode")?.value || "dry_run_only",
+      learningAutoTuneMode: document.getElementById("cfg_learningAutoTuneMode")?.value || "all",
       portfolioMinBuyVolRatio: (() => {
         const v = parseFloat(document.getElementById("cfg_portfolioMinBuyVolRatio")?.value ?? "");
         return Number.isFinite(v) ? v : 1.3;
@@ -9295,6 +9314,50 @@
     }).join("");
   }
 
+  function buildActiveTechParamChipsHtml(p) {
+    if (!p || typeof p !== "object") return "";
+    const tp = p.portfolioTp1TargetMode || "EMA200";
+    const sl = Number(p.portfolioDisasterSlPct ?? 3.5);
+    const slTxt = Number.isFinite(sl) ? Number(sl.toFixed(2)) : 3.5;
+    const volR = Number.isFinite(Number(p.portfolioMinBuyVolRatio)) ? Number(p.portfolioMinBuyVolRatio) : 1.3;
+    const rs = Number.isFinite(Number(p.portfolioMinRelStrength24h)) ? Number(p.portfolioMinRelStrength24h) : -1.0;
+    const rsi = Number.isFinite(Number(p.portfolioMinRsi1h)) ? Number(p.portfolioMinRsi1h) : 40;
+    const macro = String(p.portfolioSitOutMode || "dual").toUpperCase();
+    const chipStyle = "padding:2px 8px; border-radius:999px; background:rgba(15,23,42,0.75); border:1px solid rgba(148,163,184,0.25); color:#e2e8f0;";
+    return [
+      `TP1: <b>${tp}</b>`,
+      `Disaster SL: <b>${slTxt}%</b>`,
+      `Buy VolRatio: <b>&ge;${volR}x</b>`,
+      `RS 24h: <b>&ge;${rs}%</b>`,
+      `1h RSI: <b>&ge;${rsi}</b>`,
+      `Macro Guard: <b>${macro}</b>`,
+    ].map((txt) => `<span style="${chipStyle}">${txt}</span>`).join("");
+  }
+
+  function formatLearningAdjustment(a) {
+    const labelMap = {
+      portfolioTp1TargetMode: "TP1 Target Mode",
+      portfolioDisasterSlPct: "Disaster SL %",
+      portfolioMinBuyVolRatio: "Min Buy VolRatio",
+      portfolioMinRelStrength24h: "Min RS 24h (%)",
+      portfolioMinRsi1h: "Min 1h RSI",
+      survival_posture: "Survival Posture",
+    };
+    const tpMap = { 25: "EMA25", 75: "EMA75", 200: "EMA200" };
+    const postureMap = { 0: "NORMAL", 1: "CAUTIOUS", 2: "DEFENSIVE", 3: "CAPITAL_PRESERVATION" };
+    const fmtVal = (v) => {
+      const n = Math.round(Number(v));
+      if (a.paramName === "portfolioTp1TargetMode") return tpMap[n] || String(v);
+      if (a.paramName === "survival_posture") return postureMap[n] || String(v);
+      return String(v);
+    };
+    return {
+      label: labelMap[a.paramName] || a.paramName,
+      oldDisp: fmtVal(a.oldValue),
+      newDisp: fmtVal(a.newValue),
+    };
+  }
+
   async function loadLearningReportUI() {
     const elSub = document.getElementById("lrModalSubtitle");
     const elSurv = document.getElementById("lrSurvivalBanner");
@@ -9324,9 +9387,9 @@
         return;
       }
 
-      const tuneBadge = rep.autoTuneEffective ? "🟢 Auto-Tune: ON" : "🟡 Auto-Tune: OFF";
+      const tuneBadge = rep.autoTuneEffective ? "🟢 Auto-Pilot: ON" : "🟡 Auto-Pilot: OFF";
       if (elSub) {
-        elSub.textContent = `Instance: ${rep.instanceKey || "--"} • Mode: ${rep.autoTuneMode || "dry_run_only"} • ${tuneBadge}`;
+        elSub.textContent = `Instance: ${rep.instanceKey || "--"} • Mode: ${rep.autoTuneMode || "all"} • ${tuneBadge}`;
       }
 
       const surv = rep.survival || null;
@@ -9460,8 +9523,15 @@
           : "รอสแกน";
       }
       if (elTuneBox) {
+        const activeParams = rep.summary?.activeTechnicalParams;
+        const activeStrip = activeParams
+          ? `<div class="lr-list-item" style="flex-direction:column; align-items:flex-start; gap:5px; background:rgba(16,185,129,0.06); border-color:rgba(16,185,129,0.25);">
+               <div style="font-size:11.5px; font-weight:700; color:#34d399;">🤖 ค่าเทคนิคที่ Auto-Pilot ใช้งานอยู่ตอนนี้ (Zero-Config)</div>
+               <div style="display:flex; gap:6px; flex-wrap:wrap; font-size:11px;">${buildActiveTechParamChipsHtml(activeParams)}</div>
+             </div>`
+          : "";
         if (!tun) {
-          elTuneBox.innerHTML = '<span style="color:#64748b;">ยังไม่มีผลวิเคราะห์ — กด "🔬 รัน Shadow Scan"</span>';
+          elTuneBox.innerHTML = `${activeStrip}<span style="color:#64748b;">ยังไม่มีผลวิเคราะห์ — กด "🔬 รัน Shadow Scan"</span>`;
         } else {
           const fmtM = (m) => {
             const tot = Number(m?.totalPnlPct || 0);
@@ -9471,17 +9541,27 @@
           const confCol = { HIGH: "#4ade80", MEDIUM: "#fbbf24", LOW: "#94a3b8" };
           const recs = Array.isArray(tun.recommendations) ? tun.recommendations : [];
           const recHtml = recs.length === 0
-            ? `<div style="color:#94a3b8;">${(tun.setups || 0) >= 20 ? "ยังไม่พบค่าที่ชนะค่าปัจจุบันอย่างมีนัยสำคัญบนช่วง Train (70%)" : "รอสะสม setups เพิ่มอย่างน้อย 20 setups เพื่อวิเคราะห์ Train/Test"}</div>`
-            : recs.map((r) => `
+            ? `<div style="color:#94a3b8;">${(tun.setups || 0) >= 20 ? "✅ ค่าที่ใช้อยู่เหมาะสมดีแล้ว (ไม่พบค่าที่ชนะใน Train 70% + Test 30%)" : "รอสะสม setups เพิ่มอย่างน้อย 20 setups เพื่อวิเคราะห์ Train/Test"}</div>`
+            : recs.map((r) => {
+                const statusPill = r.autoApplicable
+                  ? `<span style="color:#4ade80; font-weight:700;">🤖 Auto-Pilot พร้อมจูน (${r.confidence})</span>`
+                  : r.confidence === "LOW"
+                    ? `<span style="color:#94a3b8; font-weight:700;">🛡️ บล็อก Overfit (LOW)</span>`
+                    : `<span style="color:${confCol[r.confidence] || "#94a3b8"}; font-weight:700;">${r.confidence}</span>`;
+                return `
                 <div class="lr-list-item" style="flex-direction:column; align-items:flex-start; gap:4px;">
-                  <div style="width:100%; display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap;">
+                  <div style="width:100%; display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap; align-items:center;">
                     <strong style="color:#f8fafc;">${r.label}: ${r.current} ➔ ${r.suggested}</strong>
-                    <span style="color:${confCol[r.confidence] || "#94a3b8"}; font-weight:700;">${r.confidence} • Test ${r.testAvgDeltaPct >= 0 ? "+" : ""}${r.testAvgDeltaPct}pp/ไม้</span>
+                    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; font-size:11px;">
+                      ${statusPill}
+                      <span style="color:${confCol[r.confidence] || "#94a3b8"}; font-weight:700;">Test ${r.testAvgDeltaPct >= 0 ? "+" : ""}${r.testAvgDeltaPct}pp/ไม้</span>
+                    </div>
                   </div>
                   <div style="font-size:11px; color:#94a3b8;">ปัจจุบัน (Test): ${fmtM(r.baselineTest)}</div>
                   <div style="font-size:11px; color:#cbd5e1;">ถ้าเปลี่ยน (Test): ${fmtM(r.suggestedTest)}</div>
                   <div style="font-size:11px; color:#94a3b8;">${r.verdict}</div>
-                </div>`).join("");
+                </div>`;
+              }).join("");
           const comb = tun.combined
             ? `<div class="lr-list-item" style="flex-direction:column; align-items:flex-start; gap:3px; border-color:${tun.combined.passedOos ? "rgba(74,222,128,0.4)" : "rgba(251,191,36,0.35)"};">
                  <div style="width:100%; display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap;">
@@ -9491,7 +9571,7 @@
                  <div style="font-size:11px; color:#cbd5e1;">Test เดิม: ${fmtM(tun.baselineTest)}</div>
                  <div style="font-size:11px; color:#cbd5e1;">Test หลังรวม: ${fmtM(tun.combined.test)}</div>
                </div>` : "";
-          elTuneBox.innerHTML = `${recHtml}${comb}<div style="font-size:10.5px; color:#64748b;">${tun.note || ""}</div>`;
+          elTuneBox.innerHTML = `${activeStrip}${recHtml}${comb}<div style="font-size:10.5px; color:#64748b;">${tun.note || ""}</div>`;
         }
       }
 
@@ -9536,15 +9616,18 @@
       if (elAdjBox) {
         elAdjBox.innerHTML = adjs.length === 0
           ? '<div style="color:#64748b;">ยังไม่มีประวัติการจูนค่าอัตโนมัติ</div>'
-          : adjs.slice(0, 10).map((a) => `
+          : adjs.slice(0, 10).map((a) => {
+              const fmtA = formatLearningAdjustment(a);
+              return `
               <div class="lr-list-item" style="flex-direction:column; align-items:flex-start; gap:3px;">
                 <div style="width:100%; display:flex; justify-content:space-between; color:#e2e8f0; font-weight:600;">
-                  <span>${a.paramName}: ${a.oldValue} ➔ ${a.newValue}</span>
+                  <span>${fmtA.label}: ${fmtA.oldDisp} ➔ ${fmtA.newDisp}</span>
                   <span style="color:#64748b; font-size:10px;">${new Date(a.createdAt).toLocaleString()}</span>
                 </div>
                 <div style="font-size:11px; color:#94a3b8;">${a.rationale}</div>
               </div>
-            `).join("");
+            `;
+            }).join("");
       }
 
       const syms = Array.isArray(rep.symbolPerformance) ? rep.symbolPerformance : [];

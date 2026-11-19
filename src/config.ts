@@ -442,8 +442,8 @@ export const defaultStrategyConfig = {
   portfolioMinRsi1h: 40,
   /** Active symbol currently inspected on the main chart in portfolio mode. */
   portfolioInspectedSymbol: "",
-  /** Bounded Learning Engine Auto-Tuning mode: "dry_run_only" (safe default), "all", or "off". */
-  learningAutoTuneMode: "dry_run_only" as "dry_run_only" | "all" | "off",
+  /** Bounded Learning Engine Auto-Tuning mode: "all" (autonomous zero-config default), "dry_run_only", or "off". */
+  learningAutoTuneMode: "all" as "dry_run_only" | "all" | "off",
 };
 
 /**
