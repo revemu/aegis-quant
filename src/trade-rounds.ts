@@ -286,9 +286,10 @@ export function calculateTradeRounds(orders: UnifiedOrderRecord[], activeSymbol?
 
     currentRound.endTime = time;
 
-    // Auto-calculate sell PnL against current round's avg buy price if missing
+    // Always calculate sell PnL against current round's avg buy price when buys exist in the round
+    // (prevents stale/corrupted stored f.pnl values from double-counting across partial exits)
     let effectivePnl = pnl;
-    if (!isBuy && (!effectivePnl || effectivePnl === 0) && currentRound.avgBuyPrice > 0) {
+    if (!isBuy && currentRound.buyCount > 0 && currentRound.avgBuyPrice > 0) {
       effectivePnl = (price - currentRound.avgBuyPrice) * qty;
     }
 

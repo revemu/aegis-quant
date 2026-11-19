@@ -9958,3 +9958,15 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - ไม่นับ `SL_BREAKEVEN` หรือไม้ที่ปิดเป็นกำไรเป็น `consecutiveSl` และรีเซ็ต `consecutiveSl` เป็น `0` เมื่อปิดด้วย `SL_BREAKEVEN` หรือกำไร
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.92`** ใน `package.json`, `src/version.ts` และ `public/index.html` (`style.css?v=0.3.0.92`, `app.js?v=0.3.0.92`)
+
+---
+
+## 337. v0.3.0.93 — Round Sell PnL Derivation from Fill Prices & Alpaca USD Price/Fee Sync Hardening (`src/trade-rounds.ts`, `src/db.ts`)
+
+- **Authoritative Round Sell PnL Derivation (`src/trade-rounds.ts`)**:
+  - ใน `calculateTradeRounds`: เมื่อในรอบมีไม้ซื้อ (`currentRound.buyCount > 0 && currentRound.avgBuyPrice > 0`) ให้คำนวณ `effectivePnl = (price - currentRound.avgBuyPrice) * qty` จากราคา Fill จริงของรอบเสมอ แทนการใช้ `f.pnl` ที่บันทึกไว้ใน DB (ป้องกันยอด PnL เก่าที่ถูกบวกซ้ำหรือคลาดเคลื่อนไม่ให้มาทับสรุปรอบเทรด)
+- **Sync Authoritative Price & Exclude USD Equities in DB Fee Tally (`src/db.ts`)**:
+  - ใน `syncRecentTradesFromExchange`: อัปเดต `existing.price = price` ควบคู่กับ `existing.fillPrice = price` ให้ตรงกับราคา Fill จริงจากกระดาน
+  - ใน `recalculateAllRealizedPnl`: ยกเว้นคู่เทรด `quoteAsset === "USD"` จาก fallback ค่าธรรมเนียม CEX `0.075%` ให้สอดคล้องกับ `calculateTradeRounds`
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.93`** ใน `package.json`, `src/version.ts` และ `public/index.html` (`style.css?v=0.3.0.93`, `app.js?v=0.3.0.93`)

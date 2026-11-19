@@ -1636,6 +1636,7 @@ export class BotDatabase {
           existing.tradeId = tId;
           existing.symbol = tradeSym;
           existing.status = "FILLED";
+          existing.price = price;
           existing.fillPrice = price;
           existing.fillTime = time;
           existing.executedQty = qty;
@@ -1904,7 +1905,12 @@ export class BotDatabase {
           } else if (notional > 0) {
             totalCexFees += notional * 0.00075;
           }
-        } else if (!o.dryRun && notional > 0 && !(o.symbol || "").toUpperCase().endsWith("FDUSD")) {
+        } else if (
+          !o.dryRun &&
+          notional > 0 &&
+          !(o.symbol || "").toUpperCase().endsWith("FDUSD") &&
+          (o.quoteAsset || "").toUpperCase() !== "USD"
+        ) {
           const isSomnia = Boolean(o.explorerUrl?.includes("somnia") || (o.txHash && typeof o.txHash === "string" && o.txHash.startsWith("0x")));
           if (!isSomnia) {
             totalCexFees += notional * 0.00075;
