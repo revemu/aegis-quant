@@ -434,6 +434,12 @@ export const defaultStrategyConfig = {
   portfolioMaxHoldHours: 0,
   /** Max total capital allocated across all portfolio slots in USD/Quote (0 = use full free wallet cash). */
   portfolioMaxBudgetUsd: 0,
+  /** Minimum 12-bar buy volume ratio required before entering a pullback (default 1.3). */
+  portfolioMinBuyVolRatio: 1.3,
+  /** Minimum 24h relative strength vs benchmark in % required before entering (default -1.0). */
+  portfolioMinRelStrength24h: -1.0,
+  /** Minimum 1h RSI required before entering a pullback (default 40). */
+  portfolioMinRsi1h: 40,
   /** Active symbol currently inspected on the main chart in portfolio mode. */
   portfolioInspectedSymbol: "",
   /** Bounded Learning Engine Auto-Tuning mode: "dry_run_only" (safe default), "all", or "off". */
@@ -652,6 +658,15 @@ export function loadConfigFromDatabase(): typeof defaultStrategyConfig {
       }
       if (saved.portfolioMaxHoldHours !== undefined) merged.portfolioMaxHoldHours = Math.max(0, Number(saved.portfolioMaxHoldHours) || 0);
       if (saved.portfolioMaxBudgetUsd !== undefined) merged.portfolioMaxBudgetUsd = Math.max(0, Number(saved.portfolioMaxBudgetUsd) || 0);
+      if (saved.portfolioMinBuyVolRatio !== undefined && Number.isFinite(Number(saved.portfolioMinBuyVolRatio))) {
+        merged.portfolioMinBuyVolRatio = Math.min(5.0, Math.max(0.5, Number(saved.portfolioMinBuyVolRatio)));
+      }
+      if (saved.portfolioMinRelStrength24h !== undefined && Number.isFinite(Number(saved.portfolioMinRelStrength24h))) {
+        merged.portfolioMinRelStrength24h = Math.min(10, Math.max(-10, Number(saved.portfolioMinRelStrength24h)));
+      }
+      if (saved.portfolioMinRsi1h !== undefined && Number.isFinite(Number(saved.portfolioMinRsi1h))) {
+        merged.portfolioMinRsi1h = Math.min(70, Math.max(15, Number(saved.portfolioMinRsi1h)));
+      }
       if (typeof saved.portfolioInspectedSymbol === "string") merged.portfolioInspectedSymbol = saved.portfolioInspectedSymbol.toUpperCase().trim();
       if (saved.learningAutoTuneMode === "dry_run_only" || saved.learningAutoTuneMode === "all" || saved.learningAutoTuneMode === "off") {
         merged.learningAutoTuneMode = saved.learningAutoTuneMode;

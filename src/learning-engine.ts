@@ -204,18 +204,28 @@ function aggregateBlockedStats(
   }));
 }
 
+function estimateRoundTripCostPct(exchange: string, symbols: string[]): number {
+  const ex = (exchange || "binance").toLowerCase();
+  if (ex === "alpaca") return 0.06; // Zero commission; conservative synthetic spread/slippage allowance
+  if (symbols.length > 0 && symbols.every((s) => s.toUpperCase().endsWith("FDUSD"))) {
+    return 0.04; // Zero-maker FDUSD pairs with minor spread/slippage
+  }
+  return 0.15; // Binance USDT 0.075% x 2 round-trip fee + minor slippage
+}
+
 /**
- * Simulate MA-Fan TP1 (50% exit at EMA200 with +0.8% floor, lock BE +0.25% on remaining 50%)
- * vs hard Disaster SL over the forward 15m horizon bars.
+ * Simulate MA-Fan TP1 (50% exit at target with +0.8% floor, lock BE +0.25% on remaining 50%)
+ * vs hard Disaster SL over the forward 15m horizon bars, deducting round-trip trading costs.
  */
 function simulateMaFanCounterfactual(
   entryPrice: number,
-  distEma200Pct: number,
+  distTargetPct: number,
   slTriggerPct: number,
   futureBars: Array<{ high: number; low: number; close: number }>,
+  costPct = 0,
 ): { finalRet: number; maePct: number; mfePct: number; verdict: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL" } {
-  const tp1Pct = Number.isFinite(distEma200Pct) && distEma200Pct > 0
-    ? Math.max(0.8, Math.min(distEma200Pct, 8.0))
+  const tp1Pct = Number.isFinite(distTargetPct) && distTargetPct > 0
+    ? Math.max(0.8, Math.min(distTargetPct, 8.0))
     : 2.0;
   const beLockPct = 0.25;
 
@@ -250,11 +260,12 @@ function simulateMaFanCounterfactual(
     finalRet = tp1Hit ? 0.5 * tp1Pct + 0.5 * closeRetPct : closeRetPct;
   }
 
+  const netRet = finalRet - Math.max(0, costPct);
   const maePct = ((minLow - entryPrice) / entryPrice) * 100;
   const mfePct = ((maxHigh - entryPrice) / entryPrice) * 100;
   const verdict: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL" =
-    finalRet >= 0.35 ? "WOULD_WIN" : finalRet <= -0.35 ? "WOULD_LOSE" : "NEUTRAL";
-  return { finalRet, maePct, mfePct, verdict };
+    netRet >= 0.35 ? "WOULD_WIN" : netRet <= -0.35 ? "WOULD_LOSE" : "NEUTRAL";
+  return { finalRet: netRet, maePct, mfePct, verdict };
 }
 
 type TpModeName = "EMA25" | "EMA75" | "EMA200";
@@ -266,6 +277,7 @@ function normalizeTpMode(m?: string): TpModeName {
 interface TuningEvent {
   setupId: string;
   symbol: string;
+  barIdx: number;
   timeSec: number;
   entryPrice: number;
   rsi1h: number;
@@ -282,11 +294,17 @@ export interface TuningMetrics {
   wins: number;
   winRatePct: number;
   avgPnlPct: number;
+  totalPnlPct: number;
   profitFactor: number;
 }
 
 export interface TuningRecommendation {
-  param: "portfolioDisasterSlPct" | "minBuyVolRatio" | "minRelStrength24h" | "minRsi1h" | "portfolioTp1TargetMode";
+  param:
+    | "portfolioDisasterSlPct"
+    | "portfolioMinBuyVolRatio"
+    | "portfolioMinRelStrength24h"
+    | "portfolioMinRsi1h"
+    | "portfolioTp1TargetMode";
   label: string;
   current: number | string;
   suggested: number | string;
@@ -301,6 +319,7 @@ export interface TuningRecommendation {
 
 export interface TuningAnalysis {
   generatedAt: number;
+  roundTripCostPct: number;
   events: number;
   setups: number;
   trainSetups: number;
@@ -309,7 +328,12 @@ export interface TuningAnalysis {
   baselineTrain: TuningMetrics;
   baselineTest: TuningMetrics;
   recommendations: TuningRecommendation[];
-  combined: { train: TuningMetrics; test: TuningMetrics; params: Record<string, number | string> } | null;
+  combined: {
+    train: TuningMetrics;
+    test: TuningMetrics;
+    params: Record<string, number | string>;
+    passedOos: boolean;
+  } | null;
   note: string;
 }
 
@@ -339,18 +363,34 @@ function finalizeAcc(a: MetricAcc): TuningMetrics {
     wins: a.wins,
     winRatePct: a.n > 0 ? Number(((a.wins / a.n) * 100).toFixed(1)) : 0,
     avgPnlPct: a.n > 0 ? Number((a.sum / a.n).toFixed(3)) : 0,
+    totalPnlPct: Number(a.sum.toFixed(2)),
     profitFactor: Number((a.lossAbs > 0 ? a.winSum / a.lossAbs : a.winSum > 0 ? 99 : 0).toFixed(2)),
   };
 }
 
-function evalTuneConfig(groups: TuningEvent[][], cfg: TuneCfg, splitTime: number) {
+function quantScore(m: TuningMetrics): number {
+  if (m.trades <= 0) return -1e9;
+  return m.totalPnlPct + Math.max(-2, Math.min(3, m.profitFactor - 1)) * Math.max(1, Math.sqrt(m.trades));
+}
+
+function evalTuneConfig(groups: TuningEvent[][], cfg: TuneCfg, splitTime: number, costPct: number) {
   const train = newAcc();
   const test = newAcc();
+  const lastBarBySym = new Map<string, number>();
+
   for (const g of groups) {
-    const e = g.find((ev) => ev.rsi1h >= cfg.minRsi1h && ev.volR >= cfg.minVolR && ev.rs24 >= cfg.minRs);
+    const e = g.find(
+      (ev) =>
+        ev.barIdx - (lastBarBySym.get(ev.symbol) ?? -999) >= 8 &&
+        ev.rsi1h >= cfg.minRsi1h &&
+        ev.volR >= cfg.minVolR &&
+        ev.rs24 >= cfg.minRs,
+    );
     if (!e) continue;
+    lastBarBySym.set(e.symbol, e.barIdx);
+
     const dist = cfg.tpMode === "EMA25" ? e.dist25 : cfg.tpMode === "EMA75" ? e.dist75 : e.dist200;
-    const sim = simulateMaFanCounterfactual(e.entryPrice, dist, -cfg.sl, e.futureBars);
+    const sim = simulateMaFanCounterfactual(e.entryPrice, dist, -cfg.sl, e.futureBars, costPct);
     const acc = e.timeSec < splitTime ? train : test;
     acc.n++;
     acc.sum += sim.finalRet;
@@ -365,10 +405,11 @@ function evalTuneConfig(groups: TuningEvent[][], cfg: TuneCfg, splitTime: number
 }
 
 /**
- * Advisory-only what-if analysis: one-at-a-time sensitivity of SL / filters / TP1 mode on raw shadow
- * pullback events with a chronological 70/30 train-test split. Never applies anything automatically.
+ * Advisory-only quant sensitivity analysis: optimizes strictly on Train (70%) using
+ * fee-adjusted Total PnL + PF + retention, selects combined winners from Train alone
+ * (zero Test data leakage), and validates once out-of-sample on Test (30%).
  */
-function analyzeTuning(events: TuningEvent[], cur: TuneCfg): TuningAnalysis | null {
+function analyzeTuning(events: TuningEvent[], cur: TuneCfg, costPct = 0): TuningAnalysis | null {
   const groupsMap = new Map<string, TuningEvent[]>();
   for (const e of events) {
     const g = groupsMap.get(e.setupId) || [];
@@ -379,10 +420,11 @@ function analyzeTuning(events: TuningEvent[], cur: TuneCfg): TuningAnalysis | nu
   for (const g of groups) g.sort((a, b) => a.timeSec - b.timeSec);
   groups.sort((a, b) => a[0]!.timeSec - b[0]!.timeSec);
 
-  const emptyM: TuningMetrics = { trades: 0, wins: 0, winRatePct: 0, avgPnlPct: 0, profitFactor: 0 };
+  const emptyM: TuningMetrics = { trades: 0, wins: 0, winRatePct: 0, avgPnlPct: 0, totalPnlPct: 0, profitFactor: 0 };
   if (groups.length < 20) {
     return {
       generatedAt: Date.now(),
+      roundTripCostPct: costPct,
       events: events.length,
       setups: groups.length,
       trainSetups: 0,
@@ -397,8 +439,9 @@ function analyzeTuning(events: TuningEvent[], cur: TuneCfg): TuningAnalysis | nu
   }
 
   const splitTime = groups[Math.floor(groups.length * 0.7)]![0]!.timeSec;
-  const base = evalTuneConfig(groups, cur, splitTime);
-  const minTrainN = Math.max(10, Math.floor(base.train.trades * 0.4));
+  const base = evalTuneConfig(groups, cur, splitTime, costPct);
+  const baseTrainScore = quantScore(base.train);
+  const minTrainN = Math.max(12, Math.floor(base.train.trades * 0.55));
 
   const candidates: Array<{
     param: TuningRecommendation["param"];
@@ -408,34 +451,50 @@ function analyzeTuning(events: TuningEvent[], cur: TuneCfg): TuningAnalysis | nu
     curVal: number | string;
   }> = [
     { param: "portfolioDisasterSlPct", label: "Disaster SL %", values: [2.5, 3, 3.5, 4, 4.5, 5], apply: (c, v) => ({ ...c, sl: v }), curVal: cur.sl },
-    { param: "minBuyVolRatio", label: "Min Buy VolRatio (12 bars)", values: [1.0, 1.15, 1.3, 1.6, 2.0], apply: (c, v) => ({ ...c, minVolR: v }), curVal: cur.minVolR },
-    { param: "minRelStrength24h", label: "Min RS 24h vs Benchmark (%)", values: [-3, -2, -1, 0, 1], apply: (c, v) => ({ ...c, minRs: v }), curVal: cur.minRs },
-    { param: "minRsi1h", label: "Min 1h RSI", values: [35, 40, 45, 50], apply: (c, v) => ({ ...c, minRsi1h: v }), curVal: cur.minRsi1h },
+    { param: "portfolioMinBuyVolRatio", label: "Min Buy VolRatio (12 bars)", values: [1.0, 1.15, 1.3, 1.6, 2.0], apply: (c, v) => ({ ...c, minVolR: v }), curVal: cur.minVolR },
+    { param: "portfolioMinRelStrength24h", label: "Min RS 24h vs Benchmark (%)", values: [-3, -2, -1, 0, 1], apply: (c, v) => ({ ...c, minRs: v }), curVal: cur.minRs },
+    { param: "portfolioMinRsi1h", label: "Min 1h RSI", values: [35, 40, 45, 50], apply: (c, v) => ({ ...c, minRsi1h: v }), curVal: cur.minRsi1h },
     { param: "portfolioTp1TargetMode", label: "TP1 Target Mode", values: ["EMA25", "EMA75", "EMA200"], apply: (c, v) => ({ ...c, tpMode: v }), curVal: cur.tpMode },
   ];
 
   const recs: TuningRecommendation[] = [];
-  const winners: Array<{ cand: (typeof candidates)[number]; value: number | string; testDelta: number }> = [];
+  const trainWinners: Array<{ cand: (typeof candidates)[number]; value: number | string }> = [];
 
   for (const cand of candidates) {
-    let best: { v: number | string; res: ReturnType<typeof evalTuneConfig> } | null = null;
+    let best: { v: number | string; res: ReturnType<typeof evalTuneConfig>; score: number } | null = null;
     for (const v of cand.values) {
       if (v === cand.curVal) continue;
-      const res = evalTuneConfig(groups, cand.apply(cur, v), splitTime);
+      const res = evalTuneConfig(groups, cand.apply(cur, v), splitTime, costPct);
       if (res.train.trades < minTrainN) continue;
-      if (!best || res.train.avgPnlPct > best.res.train.avgPnlPct) best = { v, res };
+      if (res.train.avgPnlPct <= base.train.avgPnlPct + 0.03) continue;
+      if (res.train.profitFactor < base.train.profitFactor) continue;
+      const sc = quantScore(res.train);
+      if (sc <= baseTrainScore) continue;
+      if (!best || sc > best.score) best = { v, res, score: sc };
     }
     if (!best) continue;
+
     const trainDelta = best.res.train.avgPnlPct - base.train.avgPnlPct;
-    if (trainDelta <= 0.02) continue;
+    // Strict Train-only selection for combined simulation (zero Test leakage)
+    if (trainDelta >= 0.08 && best.res.train.profitFactor > base.train.profitFactor) {
+      trainWinners.push({ cand, value: best.v });
+    }
+
     const testDelta = best.res.test.avgPnlPct - base.test.avgPnlPct;
     const testN = best.res.test.trades;
+    const pfHeld = best.res.test.profitFactor >= base.test.profitFactor;
     const confidence: TuningRecommendation["confidence"] =
-      trainDelta >= 0.15 && testDelta >= 0.15 && testN >= 15 ? "HIGH" : testDelta > 0 && testN >= 8 ? "MEDIUM" : "LOW";
+      trainDelta >= 0.15 && testDelta >= 0.12 && testN >= 15 && pfHeld
+        ? "HIGH"
+        : testDelta > 0 && testN >= 8 && pfHeld
+          ? "MEDIUM"
+          : "LOW";
+
     const verdict =
       confidence === "LOW"
-        ? "ไม่ผ่านการยืนยันช่วงทดสอบ (อาจ Overfit) — ยังไม่แนะนำให้เปลี่ยน"
-        : `เฉลี่ย/ไม้ในช่วงทดสอบดีขึ้น ${testDelta >= 0 ? "+" : ""}${testDelta.toFixed(2)}pp (${cur.sl === best.v ? "" : ""}ความเชื่อมั่น ${confidence})`;
+        ? "ไม่ผ่านการยืนยันช่วงทดสอบ (อาจ Overfit หรือจำนวนไม้/PF ลดลง) — ไม่แนะนำให้เปลี่ยน"
+        : `ช่วงทดสอบเฉลี่ย/ไม้ ${testDelta >= 0 ? "+" : ""}${testDelta.toFixed(2)}pp (Total ${best.res.test.totalPnlPct >= 0 ? "+" : ""}${best.res.test.totalPnlPct}%, PF ${best.res.test.profitFactor}) • ความเชื่อมั่น ${confidence}`;
+
     recs.push({
       param: cand.param,
       label: cand.label,
@@ -449,25 +508,29 @@ function analyzeTuning(events: TuningEvent[], cur: TuneCfg): TuningAnalysis | nu
       verdict,
       advisoryOnly: true,
     });
-    if (confidence !== "LOW") winners.push({ cand, value: best.v, testDelta });
   }
 
   let combined: TuningAnalysis["combined"] = null;
-  if (winners.length > 0) {
+  if (trainWinners.length > 0) {
     let cfg2: TuneCfg = { ...cur };
     const params: Record<string, number | string> = {};
-    for (const w of winners) {
+    for (const w of trainWinners) {
       cfg2 = w.cand.apply(cfg2, w.value);
       params[w.cand.param] = w.value;
     }
-    const res = evalTuneConfig(groups, cfg2, splitTime);
-    combined = { train: res.train, test: res.test, params };
+    const res = evalTuneConfig(groups, cfg2, splitTime, costPct);
+    const passedOos =
+      res.test.trades >= 8 &&
+      res.test.avgPnlPct > base.test.avgPnlPct &&
+      res.test.profitFactor >= base.test.profitFactor;
+    combined = { train: res.train, test: res.test, params, passedOos };
   }
 
   const trainSetups = groups.filter((g) => g[0]!.timeSec < splitTime).length;
   recs.sort((a, b) => b.testAvgDeltaPct - a.testAvgDeltaPct);
   return {
     generatedAt: Date.now(),
+    roundTripCostPct: costPct,
     events: events.length,
     setups: groups.length,
     trainSetups,
@@ -477,7 +540,7 @@ function analyzeTuning(events: TuningEvent[], cur: TuneCfg): TuningAnalysis | nu
     baselineTest: base.test,
     recommendations: recs,
     combined,
-    note: "คำแนะนำเท่านั้น (Advisory) — ไม่มีการปรับค่าอัตโนมัติ; เทียบทีละพารามิเตอร์บนข้อมูล Train 70% ยืนยันบน Test 30%",
+    note: `คำแนะนำเท่านั้น (Advisory, หักต้นทุนจำลอง ${costPct.toFixed(2)}%/รอบ) — คัดผู้ชนะจาก Train 70% ล้วนแล้วทดสอบครั้งเดียวบน Test 30%`,
   };
 }
 
@@ -886,6 +949,7 @@ export class LearningEngine {
     }> = [];
 
     const slTriggerPct = -Math.max(1.5, slPct || 3.5);
+    const costPct = estimateRoundTripCostPct(exchange, syms);
 
     for (const p of pending) {
       let bars: Candle[] = candleMap.get(p.symbol) || [];
@@ -897,7 +961,7 @@ export class LearningEngine {
       if (futureBars.length < 8 || p.entryPrice <= 0) continue;
 
       const distEma200Pct = Number(p.features?.distEma200Pct);
-      const sim = simulateMaFanCounterfactual(p.entryPrice, distEma200Pct, slTriggerPct, futureBars);
+      const sim = simulateMaFanCounterfactual(p.entryPrice, distEma200Pct, slTriggerPct, futureBars, costPct);
 
       updates.push({
         journalUid: p.journalUid,
@@ -1062,10 +1126,10 @@ export class LearningEngine {
       const allNeed15m = Array.from(new Set([benchSym, ...cleanSymbols]));
 
       const pg15m = pg
-        ? await pg.loadMarketCandlesBatch(ex, allNeed15m, "15m", 800).catch(() => new Map<string, Candle[]>())
+        ? await pg.loadMarketCandlesBatch(ex, allNeed15m, "15m", 2400).catch(() => new Map<string, Candle[]>())
         : new Map<string, Candle[]>();
       const pg1h = pg
-        ? await pg.loadMarketCandlesBatch(ex, cleanSymbols, "1h", 250).catch(() => new Map<string, Candle[]>())
+        ? await pg.loadMarketCandlesBatch(ex, cleanSymbols, "1h", 700).catch(() => new Map<string, Candle[]>())
         : new Map<string, Candle[]>();
 
       const getBars = (sym: string, tf: "15m" | "1h"): Candle[] => {
@@ -1149,6 +1213,12 @@ export class LearningEngine {
       if (precalc.length === 0) return this.shadowSummary;
 
       const slTriggerPct = -Math.max(1.5, Math.min(5.0, opts.slPct || 3.5));
+      const costPct = estimateRoundTripCostPct(ex, cleanSymbols);
+      const baseMinVolR = Number.isFinite(Number(opts.minVolRatio)) ? Number(opts.minVolRatio) : 1.3;
+      const baseMinRs = Number.isFinite(Number(opts.minRelStrength)) ? Number(opts.minRelStrength) : -1.0;
+      const baseMinRsi1h = Number.isFinite(Number(opts.minRsi1h)) ? Number(opts.minRsi1h) : 40;
+      const baseTpMode = normalizeTpMode(opts.tpMode);
+
       const bySymbol: Record<string, ShadowSymbolProfile> = {};
       const tuningEvents: TuningEvent[] = [];
       const winMaeAbs: number[] = [];
@@ -1169,12 +1239,19 @@ export class LearningEngine {
 
       for (const coin of precalc) {
         const n = coin.c15.length;
+        // Primary shadow state machine (kept identical to live strategy + backtest)
         let hadBottomFan = false;
         let fanStartIdx = -1;
         let waitingPullback = false;
-        let enteredSetup = false;
         let waitFromIdx = -1;
         let lastEntryIdx = -999;
+
+        // Independent raw setup state machine strictly for filter what-if analysis
+        let rawHadBottomFan = false;
+        let rawFanStartIdx = -1;
+        let rawWaitingPullback = false;
+        let rawWaitFromIdx = -1;
+
         let p1 = -1;
 
         let sTrades = 0;
@@ -1193,94 +1270,97 @@ export class LearningEngine {
 
           if (waitingPullback && (idx - waitFromIdx >= 12 || coin.m8[idx]! < coin.m16[idx]!)) {
             waitingPullback = false;
-            enteredSetup = false;
+          }
+          if (rawWaitingPullback && (idx - rawWaitFromIdx >= 12 || coin.m8[idx]! < coin.m16[idx]!)) {
+            rawWaitingPullback = false;
           }
 
           const prev = idx - 1;
-          if (waitingPullback && idx > waitFromIdx && coin.m8[prev]! >= coin.m16[prev]!) {
-            const limitP = coin.m4[prev]!;
-            if (limitP > 0 && c.low <= limitP * 1.001) {
-              const rsi1hVal = coin.rsi1h.length >= 20 && p1 >= 14 ? (coin.rsi1h[p1] ?? 50) : 50;
-              const rsi1hOk = rsi1hVal >= 40;
-              let upV = 0;
-              let dnV = 0;
-              for (let k = Math.max(0, prev - 11); k <= prev; k++) {
-                const b = coin.c15[k]!;
-                const qv = (b.volume || 1) * b.close;
-                if (b.close >= b.open) upV += qv;
-                else dnV += qv;
+          const prevBar = coin.c15[prev]!;
+          const limitP = coin.m4[prev]!;
+          const touchedEma4 = limitP > 0 && coin.m8[prev]! >= coin.m16[prev]! && c.low <= limitP * 1.001;
+          const activePrimary = waitingPullback && idx > waitFromIdx && idx - lastEntryIdx >= 8;
+          const activeRaw = rawWaitingPullback && idx > rawWaitFromIdx;
+
+          if (touchedEma4 && (activePrimary || activeRaw)) {
+            const rsi1hVal = coin.rsi1h.length >= 20 && p1 >= 14 ? (coin.rsi1h[p1] ?? 50) : 50;
+            let upV = 0;
+            let dnV = 0;
+            for (let k = Math.max(0, prev - 11); k <= prev; k++) {
+              const b = coin.c15[k]!;
+              const qv = (b.volume || 1) * b.close;
+              if (b.close >= b.open) upV += qv;
+              else dnV += qv;
+            }
+            const volR = dnV > 0 ? upV / dnV : 2.0;
+
+            const ref24 = coin.c15[Math.max(0, prev - 96)]!;
+            const coinRet24 = ref24.open > 0 ? ((prevBar.close - ref24.open) / ref24.open) * 100 : 0;
+            const benchInfo = benchStateByTime.get(prevBar.time);
+            const rs24 = coinRet24 - (benchInfo?.ret24h ?? 0);
+            const entryPrice = Math.min(c.open, limitP);
+            const futureBars = coin.c15.slice(idx + 1, Math.min(n, idx + 33));
+
+            if (entryPrice > 0 && futureBars.length >= 8) {
+              const dist25 = ((coin.m25[prev]! - entryPrice) / entryPrice) * 100;
+              const dist75 = ((coin.m75[prev]! - entryPrice) / entryPrice) * 100;
+              const dist200 = ((coin.m200[prev]! - entryPrice) / entryPrice) * 100;
+
+              if (activeRaw) {
+                tuningEvents.push({
+                  setupId: `${coin.symbol}|${rawWaitFromIdx}`,
+                  symbol: coin.symbol,
+                  barIdx: idx,
+                  timeSec: c.time,
+                  entryPrice,
+                  rsi1h: rsi1hVal,
+                  volR,
+                  rs24,
+                  dist25,
+                  dist75,
+                  dist200,
+                  futureBars,
+                });
               }
-              const volR = dnV > 0 ? upV / dnV : 2.0;
 
-              const prevBar = coin.c15[prev]!;
-              const ref24 = coin.c15[Math.max(0, prev - 96)]!;
-              const coinRet24 = ref24.open > 0 ? ((prevBar.close - ref24.open) / ref24.open) * 100 : 0;
-              const benchInfo = benchStateByTime.get(prevBar.time);
-              const rs24 = coinRet24 - (benchInfo?.ret24h ?? 0);
+              if (activePrimary && rsi1hVal >= baseMinRsi1h && volR >= baseMinVolR && rs24 >= baseMinRs) {
+                const distTarget = baseTpMode === "EMA25" ? dist25 : baseTpMode === "EMA75" ? dist75 : dist200;
+                const sim = simulateMaFanCounterfactual(entryPrice, distTarget, slTriggerPct, futureBars, costPct);
 
-              // Raw pullback-touch event (no filters) for offline tuning/what-if analysis
-              {
-                const rawEntry = Math.min(c.open, limitP);
-                const rawFuture = coin.c15.slice(idx + 1, Math.min(n, idx + 33));
-                if (rawEntry > 0 && rawFuture.length >= 8) {
-                  tuningEvents.push({
-                    setupId: `${coin.symbol}|${waitFromIdx}`,
-                    symbol: coin.symbol,
-                    timeSec: c.time,
-                    entryPrice: rawEntry,
-                    rsi1h: rsi1hVal,
-                    volR,
-                    rs24,
-                    dist25: ((coin.m25[prev]! - rawEntry) / rawEntry) * 100,
-                    dist75: ((coin.m75[prev]! - rawEntry) / rawEntry) * 100,
-                    dist200: ((coin.m200[prev]! - rawEntry) / rawEntry) * 100,
-                    futureBars: rawFuture,
-                  });
+                lastEntryIdx = idx;
+                waitingPullback = false;
+                hadBottomFan = false;
+
+                totalSetups++;
+                totalPnlSum += sim.finalRet;
+                sTrades++;
+                sPnlSum += sim.finalRet;
+                sMaeSum += sim.maePct;
+                sMfeSum += sim.mfePct;
+
+                const isWin = sim.finalRet > 0;
+                if (isWin) {
+                  totalWins++;
+                  sumWinPct += sim.finalRet;
+                  sWins++;
+                  sWinSum += sim.finalRet;
+                  winMaeAbs.push(Math.abs(sim.maePct));
+                } else {
+                  sumLossAbsPct += Math.abs(sim.finalRet);
+                  sLossAbs += Math.abs(sim.finalRet);
                 }
-              }
 
-              if (!enteredSetup && idx - lastEntryIdx >= 8 && rsi1hOk && volR >= 1.3 && rs24 >= -1.0) {
-                const entryPrice = Math.min(c.open, limitP);
-                const futureBars = coin.c15.slice(idx + 1, Math.min(n, idx + 33));
-                if (entryPrice > 0 && futureBars.length >= 8) {
-                  const dist200 = ((coin.m200[prev]! - entryPrice) / entryPrice) * 100;
-                  const sim = simulateMaFanCounterfactual(entryPrice, dist200, slTriggerPct, futureBars);
+                if (benchInfo?.isBear) {
+                  bearSetups++;
+                  if (isWin) bearWins++;
+                  bearPnlSum += sim.finalRet;
+                }
 
-                  lastEntryIdx = idx;
-                  enteredSetup = true;
-                  hadBottomFan = false;
-
-                  totalSetups++;
-                  totalPnlSum += sim.finalRet;
-                  sTrades++;
-                  sPnlSum += sim.finalRet;
-                  sMaeSum += sim.maePct;
-                  sMfeSum += sim.mfePct;
-
-                  const isWin = sim.finalRet > 0;
-                  if (isWin) {
-                    totalWins++;
-                    sumWinPct += sim.finalRet;
-                    sWins++;
-                    sWinSum += sim.finalRet;
-                    winMaeAbs.push(Math.abs(sim.maePct));
-                  } else {
-                    sumLossAbsPct += Math.abs(sim.finalRet);
-                    sLossAbs += Math.abs(sim.finalRet);
-                  }
-
-                  if (benchInfo?.isBear) {
-                    bearSetups++;
-                    if (isWin) bearWins++;
-                    bearPnlSum += sim.finalRet;
-                  }
-
-                  const bStats = breadthByTime.get(prevBar.time);
-                  if (bStats && bStats.total >= 5 && (bStats.above25 / bStats.total) * 100 < 30) {
-                    lowBreadthSetups++;
-                    if (isWin) lowBreadthWins++;
-                    lowBreadthPnlSum += sim.finalRet;
-                  }
+                const bStats = breadthByTime.get(prevBar.time);
+                if (bStats && bStats.total >= 5 && (bStats.above25 / bStats.total) * 100 < 30) {
+                  lowBreadthSetups++;
+                  if (isWin) lowBreadthWins++;
+                  lowBreadthPnlSum += sim.finalRet;
                 }
               }
             }
@@ -1295,19 +1375,29 @@ export class LearningEngine {
           if (isBottomFan) {
             hadBottomFan = true;
             fanStartIdx = idx;
+            rawHadBottomFan = true;
+            rawFanStartIdx = idx;
           }
           if (hadBottomFan && idx - fanStartIdx > 20 && !waitingPullback) {
             hadBottomFan = false;
           }
+          if (rawHadBottomFan && idx - rawFanStartIdx > 20 && !rawWaitingPullback) {
+            rawHadBottomFan = false;
+          }
 
           const is8Cross16Up = coin.m8[idx - 1]! <= coin.m16[idx - 1]! && coin.m8[idx]! > coin.m16[idx]!;
-          if (!waitingPullback && hadBottomFan && is8Cross16Up) {
+          if (is8Cross16Up) {
             const rsiOk = (coin.rsi15[idx] ?? 0) >= 35 && (coin.rsi15[idx] ?? 0) > (coin.rsi15[idx - 1] ?? 0);
             const macdOk = (coin.macdHist15[idx] ?? 0) > (coin.macdHist15[idx - 1] ?? 0);
             if (rsiOk && macdOk) {
-              waitingPullback = true;
-              enteredSetup = false;
-              waitFromIdx = idx;
+              if (!waitingPullback && hadBottomFan) {
+                waitingPullback = true;
+                waitFromIdx = idx;
+              }
+              if (!rawWaitingPullback && rawHadBottomFan) {
+                rawWaitingPullback = true;
+                rawWaitFromIdx = idx;
+              }
             }
           }
         }
@@ -1383,13 +1473,17 @@ export class LearningEngine {
         topProvenSymbols,
         riskyWhipsawSymbols,
         bySymbol,
-        tuning: analyzeTuning(tuningEvents, {
-          sl: Math.max(1.5, Math.min(5.0, opts.slPct || 3.5)),
-          minVolR: opts.minVolRatio ?? 1.3,
-          minRs: opts.minRelStrength ?? -1.0,
-          minRsi1h: opts.minRsi1h ?? 40,
-          tpMode: normalizeTpMode(opts.tpMode),
-        }),
+        tuning: analyzeTuning(
+          tuningEvents,
+          {
+            sl: Math.max(1.5, Math.min(5.0, opts.slPct || 3.5)),
+            minVolR: baseMinVolR,
+            minRs: baseMinRs,
+            minRsi1h: baseMinRsi1h,
+            tpMode: baseTpMode,
+          },
+          costPct,
+        ),
       };
 
       this.shadowSummary = summary;
@@ -1475,12 +1569,22 @@ export class LearningEngine {
     const lastLossWithin24h = latestLossMs > 0 && now - latestLossMs < 24 * 3_600_000;
     const recoveryOk = pass4h || pass1d || breadth >= 45;
 
+    const baseMinRs = Number.isFinite(Number(params.cfg.portfolioMinRelStrength24h))
+      ? Number(params.cfg.portfolioMinRelStrength24h)
+      : -1.0;
+    const baseMinRsi1h = Number.isFinite(Number(params.cfg.portfolioMinRsi1h))
+      ? Number(params.cfg.portfolioMinRsi1h)
+      : 40;
+    const baseMinVolR = Number.isFinite(Number(params.cfg.portfolioMinBuyVolRatio))
+      ? Number(params.cfg.portfolioMinBuyVolRatio)
+      : 1.3;
+
     let posture: SurvivalPostureLevel = "NORMAL";
     let effectiveMaxSlots = configuredMaxSlots;
     let positionSizeScale = 1.0;
-    let minRelStrength24h = -1.0;
-    let minRsi1h = 40;
-    let minBuyVolRatio12 = 1.3;
+    let minRelStrength24h = baseMinRs;
+    let minRsi1h = baseMinRsi1h;
+    let minBuyVolRatio12 = baseMinVolR;
     let blockRiskySymbols = false;
     const reasons: string[] = [];
 
@@ -1489,9 +1593,9 @@ export class LearningEngine {
       posture = "CAPITAL_PRESERVATION";
       effectiveMaxSlots = 0;
       positionSizeScale = 0;
-      minRelStrength24h = 1.5;
-      minRsi1h = 45;
-      minBuyVolRatio12 = 1.6;
+      minRelStrength24h = Math.max(baseMinRs, 1.5);
+      minRsi1h = Math.max(baseMinRsi1h, 45);
+      minBuyVolRatio12 = Math.max(baseMinVolR, 1.6);
       blockRiskySymbols = true;
       if (rollingDrawdownPct >= 7.0) reasons.push(`Rolling DD ${rollingDrawdownPct.toFixed(1)}% >= 7%`);
       if (capPresStreakTrigger) reasons.push(`${recentConsecutiveLosses} consecutive losses`);
@@ -1504,9 +1608,9 @@ export class LearningEngine {
       posture = "DEFENSIVE";
       effectiveMaxSlots = Math.min(configuredMaxSlots, 1);
       positionSizeScale = 0.5;
-      minRelStrength24h = 1.0;
-      minRsi1h = 42;
-      minBuyVolRatio12 = 1.5;
+      minRelStrength24h = Math.max(baseMinRs, 1.0);
+      minRsi1h = Math.max(baseMinRsi1h, 42);
+      minBuyVolRatio12 = Math.max(baseMinVolR, 1.5);
       blockRiskySymbols = true;
       if (rollingDrawdownPct >= 4.0) reasons.push(`Rolling DD ${rollingDrawdownPct.toFixed(1)}% >= 4%`);
       if (recentConsecutiveLosses >= 3) reasons.push(`${recentConsecutiveLosses} consecutive losses`);
@@ -1522,9 +1626,9 @@ export class LearningEngine {
       posture = "CAUTIOUS";
       effectiveMaxSlots = Math.max(1, Math.min(configuredMaxSlots, configuredMaxSlots - 1));
       positionSizeScale = 0.75;
-      minRelStrength24h = 0.0;
-      minRsi1h = 42;
-      minBuyVolRatio12 = 1.3;
+      minRelStrength24h = Math.max(baseMinRs, 0.0);
+      minRsi1h = Math.max(baseMinRsi1h, 42);
+      minBuyVolRatio12 = Math.max(baseMinVolR, 1.3);
       blockRiskySymbols = true;
       if (recentConsecutiveLosses >= 2) reasons.push(`${recentConsecutiveLosses} consecutive losses`);
       if (rollingDrawdownPct >= 2.5) reasons.push(`Rolling DD ${rollingDrawdownPct.toFixed(1)}% >= 2.5%`);
@@ -1624,10 +1728,9 @@ export class LearningEngine {
       const closed = await pg.loadLearningJournal("TRADE", "CLOSED", 200).catch(() => [] as LearningJournalRecord[]);
       const wins = closed.filter((t) => (t.pnlQuote ?? 0) > 0 && typeof t.maePct === "number");
       const realEnough = closed.length >= MIN_CLOSED_TRADES_FOR_SL_NUDGE && wins.length >= MIN_WIN_TRADES_FOR_SL_NUDGE;
-      const shadowEnough =
-        Boolean(this.shadowSummary && this.shadowSummary.totalSetups >= 30 && this.shadowSummary.wins >= 15 && this.shadowWinMaeAbs.length >= 10);
 
-      if (!realEnough && !shadowEnough) return;
+      const slRec = this.shadowSummary?.tuning?.recommendations.find((r) => r.param === "portfolioDisasterSlPct");
+      const slRecConfirmed = Boolean(slRec && (slRec.confidence === "HIGH" || slRec.confidence === "MEDIUM"));
 
       const weightedWinMaeAbs: number[] = [];
       for (const w of wins) {
@@ -1637,16 +1740,26 @@ export class LearningEngine {
       for (const sm of this.shadowWinMaeAbs) {
         weightedWinMaeAbs.push(sm);
       }
-      if (weightedWinMaeAbs.length === 0) return;
 
-      const maeP80 = percentile(weightedWinMaeAbs, 0.8);
-      const targetSl = Math.round(clamp(maeP80 + 0.8, 2.5, 5.0) * 4) / 4; // 0.25% step
+      if (!realEnough && !slRecConfirmed) return;
+
       const curSl = Number(cfg.portfolioDisasterSlPct || 3.5);
+      const maeP80 = weightedWinMaeAbs.length > 0 ? percentile(weightedWinMaeAbs, 0.8) : 0;
+      const maeTargetSl = Math.round(clamp(maeP80 + 0.8, 2.5, 5.0) * 4) / 4; // 0.25% step
+      const realBlockedByOos = Boolean(
+        slRec?.confidence === "LOW" && (maeTargetSl - curSl) * (Number(slRec.suggested) - curSl) > 0,
+      );
+      if (realEnough && !slRecConfirmed && (weightedWinMaeAbs.length === 0 || realBlockedByOos)) return;
+
+      const targetSl = slRecConfirmed ? clamp(Number(slRec!.suggested), 2.5, 5.0) : maeTargetSl;
       const boundedStep = clamp(targetSl - curSl, -0.25, 0.25);
       const nextSl = Number(clamp(curSl + boundedStep, 2.5, 5.0).toFixed(2));
 
       if (Math.abs(nextSl - curSl) >= 0.2) {
-        const rationale = `Real(${closed.length}t/${wins.length}w) + Shadow(${this.shadowSummary?.totalSetups ?? 0}t/${this.shadowWinMaeAbs.length}w), Combined WinMAE_P80=-${maeP80.toFixed(2)}% -> target=${targetSl.toFixed(2)}%, bounded step ${curSl.toFixed(2)}% -> ${nextSl.toFixed(2)}%`;
+        const sourceTag = slRecConfirmed
+          ? `OOS-Confirmed Shadow (${slRec!.confidence}, Test ${slRec!.testAvgDeltaPct >= 0 ? "+" : ""}${slRec!.testAvgDeltaPct}pp)`
+          : `Real(${closed.length}t/${wins.length}w) WinMAE_P80=-${maeP80.toFixed(2)}%`;
+        const rationale = `${sourceTag} -> target=${targetSl.toFixed(2)}%, bounded step ${curSl.toFixed(2)}% -> ${nextSl.toFixed(2)}%`;
         onApplySetting({ portfolioDisasterSlPct: nextSl });
         this.log(`🧠 [Learning Auto-Tune] portfolioDisasterSlPct: ${curSl}% -> ${nextSl}% (${rationale})`);
         await pg
@@ -1715,13 +1828,22 @@ export class LearningEngine {
     const combinedWinMaeP80Pct = combinedMaeAbs.length >= 5 ? -percentile(combinedMaeAbs, 0.8) : winMaeP80Pct;
 
     const realEnough = closedTrades.length >= MIN_CLOSED_TRADES_FOR_SL_NUDGE && realWinCount >= MIN_WIN_TRADES_FOR_SL_NUDGE;
-    const shadowEnough = Boolean(
-      this.shadowSummary && this.shadowSummary.totalSetups >= 30 && this.shadowSummary.wins >= 15 && this.shadowWinMaeAbs.length >= 10,
+    const slRec = this.shadowSummary?.tuning?.recommendations.find((r) => r.param === "portfolioDisasterSlPct");
+    const slRecConfirmed = Boolean(slRec && (slRec.confidence === "HIGH" || slRec.confidence === "MEDIUM"));
+    const curSlReport = Number(cfg.portfolioDisasterSlPct || 3.5);
+    const maeTargetSl =
+      combinedWinMaeP80Pct !== null ? Math.round(clamp(Math.abs(combinedWinMaeP80Pct) + 0.8, 2.5, 5.0) * 4) / 4 : null;
+    const realBlockedByOos = Boolean(
+      slRec?.confidence === "LOW" &&
+      maeTargetSl !== null &&
+      (maeTargetSl - curSlReport) * (Number(slRec.suggested) - curSlReport) > 0,
     );
-    const recommendedSlPct =
-      (realEnough || shadowEnough) && combinedWinMaeP80Pct !== null
-        ? Math.round(clamp(Math.abs(combinedWinMaeP80Pct) + 0.8, 2.5, 5.0) * 4) / 4
+    const recommendedSlPct = slRecConfirmed
+      ? clamp(Number(slRec!.suggested), 2.5, 5.0)
+      : realEnough && maeTargetSl !== null && !realBlockedByOos
+        ? maeTargetSl
         : null;
+    const slTuneReady = Boolean(slRecConfirmed || (realEnough && !realBlockedByOos));
 
     const byReasonMap = new Map<string, { count: number; wins: number; pnlQuote: number }>();
     for (const t of closedTrades) {
@@ -1772,7 +1894,7 @@ export class LearningEngine {
         combinedWinMaeP80Pct: combinedWinMaeP80Pct !== null ? Number(combinedWinMaeP80Pct.toFixed(2)) : null,
         currentDisasterSlPct: Number(cfg.portfolioDisasterSlPct || 3.5),
         recommendedDisasterSlPct: recommendedSlPct,
-        samplesNeededForSlTune: shadowEnough ? 0 : Math.max(0, MIN_CLOSED_TRADES_FOR_SL_NUDGE - closedTrades.length),
+        samplesNeededForSlTune: slTuneReady ? 0 : Math.max(0, MIN_CLOSED_TRADES_FOR_SL_NUDGE - closedTrades.length),
       },
       survival: this.lastSurvivalDecision,
       shadowLearning: this.shadowSummary,

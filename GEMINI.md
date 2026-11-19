@@ -10018,3 +10018,19 @@ When investigating live production behavior, debugging issues, or analyzing trad
 - เก็บใน `shadowLearning.tuning` ของ `/api/learning/report` และแสดงใน Learning Modal (`#lrTuningSection`) ผู้ใช้ตัดสินใจปรับเองผ่าน Settings
 - `enteredSetup` flag ใน shadow scan: setup เดียวนับ entry ได้ครั้งเดียวแต่ยังเก็บ event ที่เหลือในหน้าต่าง 12 แท่ง
 - **Version Bump**: **`0.3.0.96`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 341. v0.3.0.97 — Quant-Grade OOS Advisory Tuning, Fee-Aware 2,400-Bar Shadow & Configurable Entry Filters (`src/learning-engine.ts`, `src/config.ts`, `src/strategy/ma-fan-portfolio/index.ts`, `public/*`)
+
+- **Configurable Portfolio Entry Filters (`src/config.ts`, `src/strategy/ma-fan-portfolio/index.ts`, `public/index.html`, `public/app.js`)**:
+  - เพิ่มการตั้งค่า `portfolioMinBuyVolRatio` (ค่าเริ่มต้น `1.3`, `[0.5, 5.0]`), `portfolioMinRelStrength24h` (`-1.0%`, `[-10, 10]`), และ `portfolioMinRsi1h` (`40`, `[15, 70]`) พร้อมตัวเลือก `EMA25` ใน `#cfg_portfolioTp1TargetMode`
+  - Survival Guard (`evaluateSurvivalPosture`) ใช้ `Math.max(base, tierFloor)` เพื่อไม่ให้ลดความเข้มของฟิลเตอร์ที่ผู้ใช้ตั้งสูงกว่าเกณฑ์ชั้นป้องกัน
+- **2,400-Bar Fee-Aware Shadow Scan & Independent Raw Tracker (`src/learning-engine.ts`)**:
+  - เพิ่มการโหลดประวัติ `market_candles` จาก PG เป็น `2,400` แท่ง (`15m`) / `700` แท่ง (`1h`) เพื่อให้ช่วง Test 30% มีตัวอย่างเพียงพอโดยไม่เพิ่ม API call ภายนอก
+  - หักค่าธรรมเนียม/สลิปเพจจำลองต่อรอบ (`estimateRoundTripCostPct`: Alpaca `0.06%`, FDUSD `0.04%`, USDT `0.15%`) ทั้งใน Shadow Walk-Forward, Advisory Tuning และ 4h Counterfactual Evaluation
+  - แยก state tracker ของ raw tuning events (`rawHadBottomFan`, `rawWaitingPullback`, `barIdx`) ออกจาก loop หลัก คงพฤติกรรม Shadow หลักตรงกับ Backtest 100%
+- **Leak-Free Quant Sensitivity & OOS-Gated SL Calibration (`src/learning-engine.ts`)**:
+  - ใน `analyzeTuning`: ให้คะแนนบน Train ด้วย `quantScore` (`totalPnlPct` + PF bonus + `>= 55%` trade retention), บังคับ 8-bar per-symbol cooldown ให้ตรงกัน, คัด `trainWinners` สำหรับ `combined` จาก **Train ล้วน (Zero Test Leakage)** แล้วค่อยตรวจสอบ `combined.passedOos` บน Test 1 ครั้ง
+  - ปิดความขัดแย้งระหว่าง SL Auto-Tune เก่า กับ OOS Tuning: เมื่อเทรดจริง `< 20` ไม้ จะจูน `portfolioDisasterSlPct` เฉพาะเมื่อ `analyzeTuning` ยืนยันความเชื่อมั่น `HIGH` หรือ `MEDIUM` เท่านั้น (ไม่บีบ SL ลง `2.5%` จาก `WinMAE P80` เมื่อผล Test ปฏิเสธว่าเป็น `LOW`/Overfit) และแสดงผลสอดคล้องกันใน `summary.recommendedDisasterSlPct` + UI `#lrTuningBox`
+- **Version Bump**: **`0.3.0.97`** (`package.json`, `src/version.ts`, `public/index.html`)

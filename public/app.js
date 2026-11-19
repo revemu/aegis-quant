@@ -6545,6 +6545,9 @@
       setVal("cfg_portfolioSitOutMode", data.portfolioSitOutMode || "dual");
       setVal("cfg_portfolioMaxHoldHours", data.portfolioMaxHoldHours ?? 0);
       setVal("cfg_learningAutoTuneMode", data.learningAutoTuneMode || "dry_run_only");
+      setVal("cfg_portfolioMinBuyVolRatio", data.portfolioMinBuyVolRatio ?? 1.3);
+      setVal("cfg_portfolioMinRelStrength24h", data.portfolioMinRelStrength24h ?? -1.0);
+      setVal("cfg_portfolioMinRsi1h", data.portfolioMinRsi1h ?? 40);
       setCheck("cfg_portfolioPartialTpAtEma200", data.portfolioPartialTpAtEma200 !== false);
       setCheck("cfg_portfolioLockBreakevenAtEma200", data.portfolioLockBreakevenAtEma200 !== false);
 
@@ -6867,6 +6870,18 @@
       portfolioSitOutMode: document.getElementById("cfg_portfolioSitOutMode")?.value || "dual",
       portfolioMaxHoldHours: parseFloat(document.getElementById("cfg_portfolioMaxHoldHours")?.value || "0") || 0,
       learningAutoTuneMode: document.getElementById("cfg_learningAutoTuneMode")?.value || "dry_run_only",
+      portfolioMinBuyVolRatio: (() => {
+        const v = parseFloat(document.getElementById("cfg_portfolioMinBuyVolRatio")?.value ?? "");
+        return Number.isFinite(v) ? v : 1.3;
+      })(),
+      portfolioMinRelStrength24h: (() => {
+        const v = parseFloat(document.getElementById("cfg_portfolioMinRelStrength24h")?.value ?? "");
+        return Number.isFinite(v) ? v : -1.0;
+      })(),
+      portfolioMinRsi1h: (() => {
+        const v = parseFloat(document.getElementById("cfg_portfolioMinRsi1h")?.value ?? "");
+        return Number.isFinite(v) ? v : 40;
+      })(),
       portfolioPartialTpAtEma200: document.getElementById("cfg_portfolioPartialTpAtEma200")
         ? Boolean(document.getElementById("cfg_portfolioPartialTpAtEma200").checked)
         : true,
@@ -9437,17 +9452,26 @@
       const elTuneBadge = document.getElementById("lrTuningMetaBadge");
       const tun = shad?.tuning || null;
       if (elTuneBadge) {
-        elTuneBadge.textContent = tun ? `${tun.setups || 0} setups (Train ${tun.trainSetups || 0} / Test ${tun.testSetups || 0})` : "รอสแกน";
+        const costTxt = tun && Number.isFinite(Number(tun.roundTripCostPct))
+          ? ` • หักต้นทุน ${Number(tun.roundTripCostPct).toFixed(2)}%`
+          : "";
+        elTuneBadge.textContent = tun
+          ? `${tun.setups || 0} setups (Train ${tun.trainSetups || 0} / Test ${tun.testSetups || 0}${costTxt})`
+          : "รอสแกน";
       }
       if (elTuneBox) {
         if (!tun) {
           elTuneBox.innerHTML = '<span style="color:#64748b;">ยังไม่มีผลวิเคราะห์ — กด "🔬 รัน Shadow Scan"</span>';
         } else {
-          const fmtM = (m) => `${m.trades} ไม้ • WR ${m.winRatePct}% • เฉลี่ย ${m.avgPnlPct >= 0 ? "+" : ""}${m.avgPnlPct}% • PF ${m.profitFactor}`;
+          const fmtM = (m) => {
+            const tot = Number(m?.totalPnlPct || 0);
+            const avg = Number(m?.avgPnlPct || 0);
+            return `${m?.trades || 0} ไม้ • WR ${m?.winRatePct || 0}% • รวม ${tot >= 0 ? "+" : ""}${tot.toFixed(2)}% • เฉลี่ย ${avg >= 0 ? "+" : ""}${avg.toFixed(2)}% • PF ${m?.profitFactor || 0}`;
+          };
           const confCol = { HIGH: "#4ade80", MEDIUM: "#fbbf24", LOW: "#94a3b8" };
           const recs = Array.isArray(tun.recommendations) ? tun.recommendations : [];
           const recHtml = recs.length === 0
-            ? `<div style="color:#94a3b8;">${tun.note || "ยังไม่มีค่าที่ดีกว่าค่าปัจจุบันอย่างมีนัยสำคัญ"}</div>`
+            ? `<div style="color:#94a3b8;">${(tun.setups || 0) >= 20 ? "ยังไม่พบค่าที่ชนะค่าปัจจุบันอย่างมีนัยสำคัญบนช่วง Train (70%)" : "รอสะสม setups เพิ่มอย่างน้อย 20 setups เพื่อวิเคราะห์ Train/Test"}</div>`
             : recs.map((r) => `
                 <div class="lr-list-item" style="flex-direction:column; align-items:flex-start; gap:4px;">
                   <div style="width:100%; display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap;">
@@ -9459,8 +9483,11 @@
                   <div style="font-size:11px; color:#94a3b8;">${r.verdict}</div>
                 </div>`).join("");
           const comb = tun.combined
-            ? `<div class="lr-list-item" style="flex-direction:column; align-items:flex-start; gap:3px; border-color:rgba(74,222,128,0.35);">
-                 <strong style="color:#86efac;">รวมคำแนะนำที่ผ่านการยืนยัน: ${Object.entries(tun.combined.params).map(([k, v]) => `${k}=${v}`).join(", ")}</strong>
+            ? `<div class="lr-list-item" style="flex-direction:column; align-items:flex-start; gap:3px; border-color:${tun.combined.passedOos ? "rgba(74,222,128,0.4)" : "rgba(251,191,36,0.35)"};">
+                 <div style="width:100%; display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap;">
+                   <strong style="color:${tun.combined.passedOos ? "#86efac" : "#fde68a"};">ชุดรวมผู้ชนะจาก Train (70%): ${Object.entries(tun.combined.params).map(([k, v]) => `${k}=${v}`).join(", ")}</strong>
+                   <span style="font-size:11px; font-weight:700; color:${tun.combined.passedOos ? "#4ade80" : "#fbbf24"};">${tun.combined.passedOos ? "✅ ผ่าน OOS Test" : "⚠️ ไม่ผ่าน OOS Test"}</span>
+                 </div>
                  <div style="font-size:11px; color:#cbd5e1;">Test เดิม: ${fmtM(tun.baselineTest)}</div>
                  <div style="font-size:11px; color:#cbd5e1;">Test หลังรวม: ${fmtM(tun.combined.test)}</div>
                </div>` : "";

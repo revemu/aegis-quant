@@ -13,7 +13,7 @@
   <link
     href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap"
     rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=0.3.0.96" />
+  <link rel="stylesheet" href="style.css?v=0.3.0.97" />
   <!-- TradingView Lightweight Charts -->
   <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 </head>
@@ -2509,6 +2509,7 @@
                   <select id="cfg_portfolioTp1TargetMode" class="form-select">
                     <option value="EMA200">🎯 EMA 200 (ตามผลทดสอบ Backtest)</option>
                     <option value="EMA75">⚡ EMA 75 (ขายไวขึ้น)</option>
+                    <option value="EMA25">⚡ EMA 25 (เก็บรอบสั้น)</option>
                   </select>
                 </div>
 
@@ -2535,6 +2536,30 @@
                     <option value="all">🚀 เปิดทั้งหมด (All — รวม Live Trading จริง)</option>
                     <option value="off">📊 ปิด Auto-Tune (Off — เก็บสถิติและรายงานอย่างเดียว)</option>
                   </select>
+                </div>
+
+                <div class="form-group">
+                  <label for="cfg_portfolioMinBuyVolRatio">📊 Min Buy VolRatio (12 แท่ง)</label>
+                  <div class="input-with-unit">
+                    <input type="number" id="cfg_portfolioMinBuyVolRatio" min="0.5" max="5" step="0.05" />
+                    <span class="unit">x</span>
+                  </div>
+                </div>
+
+                <div class="form-group">
+                  <label for="cfg_portfolioMinRelStrength24h">💪 Min RS 24h เทียบดัชนี</label>
+                  <div class="input-with-unit">
+                    <input type="number" id="cfg_portfolioMinRelStrength24h" min="-10" max="10" step="0.5" />
+                    <span class="unit">%</span>
+                  </div>
+                </div>
+
+                <div class="form-group">
+                  <label for="cfg_portfolioMinRsi1h">📈 Min 1h RSI</label>
+                  <div class="input-with-unit">
+                    <input type="number" id="cfg_portfolioMinRsi1h" min="15" max="70" step="1" />
+                    <span class="unit">RSI</span>
+                  </div>
                 </div>
 
                 <div class="form-group" style="grid-column: 1 / -1;">
@@ -3382,7 +3407,7 @@
     </div>
   </div>
 
-  <script src="app.js?v=0.3.0.96"></script>
+  <script src="app.js?v=0.3.0.97"></script>
 </body>
 
 </html>

@@ -402,6 +402,15 @@ export class MaFanPortfolioStrategy implements IStrategy {
 
     Object.assign(this.cfg, clean);
     this.cfg.portfolioMaxSlots = Math.max(1, Math.min(5, Number(this.cfg.portfolioMaxSlots) || 3));
+    if (Number.isFinite(Number(this.cfg.portfolioMinBuyVolRatio))) {
+      this.cfg.portfolioMinBuyVolRatio = Math.min(5.0, Math.max(0.5, Number(this.cfg.portfolioMinBuyVolRatio)));
+    }
+    if (Number.isFinite(Number(this.cfg.portfolioMinRelStrength24h))) {
+      this.cfg.portfolioMinRelStrength24h = Math.min(10, Math.max(-10, Number(this.cfg.portfolioMinRelStrength24h)));
+    }
+    if (Number.isFinite(Number(this.cfg.portfolioMinRsi1h))) {
+      this.cfg.portfolioMinRsi1h = Math.min(70, Math.max(15, Number(this.cfg.portfolioMinRsi1h)));
+    }
     if (Array.isArray(clean.portfolioCustomWhitelist)) {
       this.cfg.portfolioCustomWhitelist = clean.portfolioCustomWhitelist.map((x: any) => String(x).toUpperCase().trim()).filter(Boolean);
     } else if (typeof clean.portfolioCustomWhitelist === "string") {
@@ -426,6 +435,9 @@ export class MaFanPortfolioStrategy implements IStrategy {
       }
     }
     this.db.setSetting("portfolioMaxSlots", this.cfg.portfolioMaxSlots);
+    this.db.setSetting("portfolioMinBuyVolRatio", this.cfg.portfolioMinBuyVolRatio ?? 1.3);
+    this.db.setSetting("portfolioMinRelStrength24h", this.cfg.portfolioMinRelStrength24h ?? -1.0);
+    this.db.setSetting("portfolioMinRsi1h", this.cfg.portfolioMinRsi1h ?? 40);
     this.db.setSetting("portfolioCustomWhitelist", this.cfg.portfolioCustomWhitelist);
     this.db.setSetting("portfolioBlacklist", this.cfg.portfolioBlacklist);
 
@@ -653,12 +665,24 @@ export class MaFanPortfolioStrategy implements IStrategy {
   }
 
   public async runLearningShadowScan(force = true) {
+    const baseMinVolR = Number.isFinite(Number(this.cfg.portfolioMinBuyVolRatio))
+      ? Number(this.cfg.portfolioMinBuyVolRatio)
+      : 1.3;
+    const baseMinRs = Number.isFinite(Number(this.cfg.portfolioMinRelStrength24h))
+      ? Number(this.cfg.portfolioMinRelStrength24h)
+      : -1.0;
+    const baseMinRsi1h = Number.isFinite(Number(this.cfg.portfolioMinRsi1h))
+      ? Number(this.cfg.portfolioMinRsi1h)
+      : 40;
     const summary = await this.learning.runShadowWalkForward({
       exchange: this.exchange.exchangeName,
       symbols: Array.from(this.snapshots.keys()),
       benchmarkSymbol: this.benchmarkSymbol,
       slPct: Number(this.cfg.portfolioDisasterSlPct ?? 3.5),
       tpMode: this.cfg.portfolioTp1TargetMode,
+      minVolRatio: baseMinVolR,
+      minRelStrength: baseMinRs,
+      minRsi1h: baseMinRsi1h,
       fallbackSnapshots: this.snapshots,
       benchmarkFallback15m: this.benchmark15m,
       force,
@@ -1148,9 +1172,19 @@ export class MaFanPortfolioStrategy implements IStrategy {
     });
     this.latestSurvival = survival;
 
-    const effMinRsi1h = survival.enforced ? survival.minRsi1h : 40;
-    const effMinVolR = survival.enforced ? survival.minBuyVolRatio12 : 1.3;
-    const effMinRs = survival.enforced ? survival.minRelStrength24h : -1.0;
+    const baseMinRsi1h = Number.isFinite(Number(this.cfg.portfolioMinRsi1h))
+      ? Number(this.cfg.portfolioMinRsi1h)
+      : 40;
+    const baseMinVolR = Number.isFinite(Number(this.cfg.portfolioMinBuyVolRatio))
+      ? Number(this.cfg.portfolioMinBuyVolRatio)
+      : 1.3;
+    const baseMinRs = Number.isFinite(Number(this.cfg.portfolioMinRelStrength24h))
+      ? Number(this.cfg.portfolioMinRelStrength24h)
+      : -1.0;
+
+    const effMinRsi1h = survival.enforced ? Math.max(baseMinRsi1h, survival.minRsi1h) : baseMinRsi1h;
+    const effMinVolR = survival.enforced ? Math.max(baseMinVolR, survival.minBuyVolRatio12) : baseMinVolR;
+    const effMinRs = survival.enforced ? Math.max(baseMinRs, survival.minRelStrength24h) : baseMinRs;
 
     const newRadar: PortfolioRadarCandidate[] = [];
     const entryCandidates: Array<{ sym: string; price: number; score: number; cand: PortfolioRadarCandidate }> = [];
@@ -1249,7 +1283,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
 
       let stage: PortfolioRadarCandidate["stage"] = "SCANNING";
       let filterNote = "";
-      const passesBaseFilters = rsi1h >= 40 && buyVolRatio12 >= 1.3 && relStrength24h >= -1.0;
+      const passesBaseFilters = rsi1h >= baseMinRsi1h && buyVolRatio12 >= baseMinVolR && relStrength24h >= baseMinRs;
       const passesSurvivalFilters =
         rsi1h >= effMinRsi1h && buyVolRatio12 >= effMinVolR && relStrength24h >= effMinRs && !shadowRiskyBlocked;
 
@@ -1383,6 +1417,9 @@ export class MaFanPortfolioStrategy implements IStrategy {
       benchmarkSymbol: this.benchmarkSymbol,
       slPct: disasterSlPct,
       tpMode: this.cfg.portfolioTp1TargetMode,
+      minVolRatio: baseMinVolR,
+      minRelStrength: baseMinRs,
+      minRsi1h: baseMinRsi1h,
       fallbackSnapshots: this.snapshots,
       benchmarkFallback15m: this.benchmark15m,
     });
