@@ -1325,19 +1325,24 @@ export class MaFanPortfolioStrategy implements IStrategy {
       if (execQty <= 0 || execQty * execPrice < (symInfo.minNotional || 1)) return;
 
       if (!this.cfg.dryRun && this.exchange.hasCredentials()) {
+        const capBuffer = this.exchange.exchangeName === "alpaca" ? 1.003 : 1.002;
         const orderRes = await this.exchange.placeOrder({
           symbol,
           side: "BUY",
-          type: this.exchange.exchangeName === "alpaca" ? "MARKET" : "IOC",
+          type: "IOC",
           qty: execQty,
-          price: Number((execPrice * 1.002).toFixed(symInfo.pricePrecision || 2)),
+          price: Number((execPrice * capBuffer).toFixed(symInfo.pricePrecision || 2)),
         });
         orderId = String(orderRes.orderId || orderId);
-        if (orderRes.executedQty && orderRes.executedQty > 0) {
-          execQty = orderRes.executedQty;
-          if (orderRes.cummulativeQuoteQty && orderRes.cummulativeQuoteQty > 0) {
-            execPrice = orderRes.cummulativeQuoteQty / execQty;
-          }
+        if (!orderRes.executedQty || orderRes.executedQty <= 0) {
+          this.log(`⚠️ [Slot ${slotIndex + 1} ${symbol}] Entry limit order unfilled — skipping slot creation.`);
+          return;
+        }
+        execQty = orderRes.executedQty;
+        if (orderRes.cummulativeQuoteQty && orderRes.cummulativeQuoteQty > 0) {
+          execPrice = orderRes.cummulativeQuoteQty / execQty;
+        } else if (orderRes.price && orderRes.price > 0) {
+          execPrice = orderRes.price;
         }
       }
     } catch (err) {
@@ -1441,19 +1446,27 @@ export class MaFanPortfolioStrategy implements IStrategy {
       if (sellQty <= 0) return false;
 
       if (!this.cfg.dryRun && this.exchange.hasCredentials()) {
+        const isUrgentExit = reason.startsWith("SL_") || reason.startsWith("EMERGENCY") || reason.startsWith("MANUAL");
+        const isAlpaca = this.exchange.exchangeName === "alpaca";
+        const orderType = isAlpaca && isUrgentExit ? "MARKET" : "IOC";
+        const floorBuffer = isAlpaca ? 0.997 : 0.998;
         const orderRes = await this.exchange.placeOrder({
           symbol: slot.symbol,
           side: "SELL",
-          type: this.exchange.exchangeName === "alpaca" ? "MARKET" : "IOC",
+          type: orderType,
           qty: sellQty,
-          price: Number((execPrice * 0.998).toFixed(symInfo.pricePrecision || 2)),
+          price: Number((execPrice * floorBuffer).toFixed(symInfo.pricePrecision || 2)),
         });
         orderId = String(orderRes.orderId || orderId);
-        if (orderRes.executedQty && orderRes.executedQty > 0) {
-          sellQty = Math.min(slot.qty, orderRes.executedQty);
-          if (orderRes.cummulativeQuoteQty && orderRes.cummulativeQuoteQty > 0) {
-            execPrice = orderRes.cummulativeQuoteQty / sellQty;
-          }
+        if (!orderRes.executedQty || orderRes.executedQty <= 0) {
+          this.log(`⚠️ [Slot ${slot.slotIndex + 1} ${slot.symbol}] Exit (${reason}) limit order unfilled — keeping slot open.`);
+          return false;
+        }
+        sellQty = Math.min(slot.qty, orderRes.executedQty);
+        if (orderRes.cummulativeQuoteQty && orderRes.cummulativeQuoteQty > 0) {
+          execPrice = orderRes.cummulativeQuoteQty / sellQty;
+        } else if (orderRes.price && orderRes.price > 0) {
+          execPrice = orderRes.price;
         }
       }
     } catch (err) {

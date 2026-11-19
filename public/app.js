@@ -240,6 +240,7 @@
 
   let pendingTick = null;
   let activeSymbol = "";
+  let activeStrategyType = "";
   let activeBaseAsset = "BASE";
   let activeQuoteAsset = "USDT";
   let activePricePrecision = 2;
@@ -3903,10 +3904,14 @@
 
     // 0. Binance Account Balance Updates
     const incomingSym = data.symbol || data.binanceSymbol;
-    if (incomingSym && incomingSym !== activeSymbol) {
-      activeSymbol = incomingSym;
+    const prevStrat = activeStrategyType;
+    const nextStrat = data.strategyType || data.strategyMode || prevStrat;
+    if (nextStrat) activeStrategyType = nextStrat;
+    const flippedToPortfolio = !isPortfolioType(prevStrat, prevStrat) && isPortfolioType(nextStrat, data.strategyMode);
+    if ((incomingSym && incomingSym !== activeSymbol) || flippedToPortfolio) {
+      if (incomingSym) activeSymbol = incomingSym;
       const elBtnOpenBacktestStudio = document.getElementById("btnOpenBacktestStudio");
-      if (elBtnOpenBacktestStudio) {
+      if (elBtnOpenBacktestStudio && activeSymbol) {
         elBtnOpenBacktestStudio.href = `/backtest.html?symbol=${encodeURIComponent(activeSymbol)}`;
       }
       rebuildOrderMarkers();
@@ -6327,6 +6332,7 @@
         : (currentExchange === "alpaca" ? "AAPL" : "BTCFDUSD");
       const resolvedSym = data.symbol || defaultSym;
       activeSymbol = resolvedSym;
+      activeStrategyType = data.strategyType || data.strategyMode || activeStrategyType;
       const elBtnOpenBacktestStudio = document.getElementById("btnOpenBacktestStudio");
       if (elBtnOpenBacktestStudio) {
         elBtnOpenBacktestStudio.href = `/backtest.html?symbol=${encodeURIComponent(activeSymbol)}`;
@@ -7639,7 +7645,7 @@
       if (elTmTradesTbody) {
         elTmTradesTbody.innerHTML = '<tr><td colspan="8" class="tm-empty-row">🔄 กำลังโหลดข้อมูลล่าสุดจากฐานข้อมูล...</td></tr>';
       }
-      const isPfActive = isPortfolioType(latestGridData?.strategyType, latestGridData?.strategyMode);
+      const isPfActive = isPortfolioType(latestGridData?.strategyType || activeStrategyType, latestGridData?.strategyMode);
       const effectiveSym = isPfActive && portfolioTradeScopeAll ? "ALL" : activeSymbol;
       const symParam = effectiveSym ? encodeURIComponent(effectiveSym) : "";
       const res = await fetch(`${API_BASE}/api/db/trade-manager${symParam ? `?symbol=${symParam}` : ""}`);
@@ -7696,11 +7702,12 @@
       if (filter === "CANCELLED" && order.status !== "CANCELLED" && !order.action?.startsWith("CANCEL_")) return false;
 
       if (query) {
+        const symMatch = (order.symbol || "").toLowerCase().includes(query);
         const idMatch = (order.id || "").toLowerCase().includes(query);
         const orderIdMatch = (order.orderId || "").toLowerCase().includes(query);
         const txMatch = (order.txHash || "").toLowerCase().includes(query);
         const noteMatch = (order.reason || order.levelDesc || "").toLowerCase().includes(query);
-        return idMatch || orderIdMatch || txMatch || noteMatch;
+        return symMatch || idMatch || orderIdMatch || txMatch || noteMatch;
       }
       return true;
     });
@@ -7717,6 +7724,7 @@
 
     if (filtered.length === 0) {
       elTmTradesTbody.innerHTML = '<tr><td colspan="8" class="tm-empty-row">🔍 ไม่พบรายการตามเงื่อนไขที่ค้นหา</td></tr>';
+      renderLiveTradesTable();
       return;
     }
 
@@ -7755,9 +7763,13 @@
         const timeStr = `${timeDate.toLocaleDateString()} ${timeDate.toLocaleTimeString()}`;
 
         const baseSymbol = o.baseAsset || (o.symbol ? o.symbol.split(/[:\-_]/)[0] : activeBaseAsset) || "BASE";
-        const priceStr = `$${Number(o.price || 0).toFixed(5)}`;
+        const execPrice = Number(o.fillPrice || o.price || 0);
+        const priceStr = `$${execPrice.toFixed(5)}`;
         const qtyStr = `${Number(o.quantity || o.qty || 0).toFixed(4)} ${baseSymbol}`;
-        const notionalStr = `$${(Number(o.notionalUsdso) || Number(o.price || 0) * Number(o.quantity || o.qty || 0)).toFixed(2)}`;
+        const notionalStr = `$${(Number(o.notionalQuote || o.notionalUsdso) || execPrice * Number(o.quantity || o.qty || 0)).toFixed(2)}`;
+        const symTag = o.symbol
+          ? `<span style="font-size:10px; font-weight:700; padding:1px 5px; border-radius:4px; background:rgba(56,189,248,0.14); color:#7dd3fc; margin-right:4px;">${o.symbol}</span>`
+          : "";
 
         const hasIoc = Boolean(o.isIoc || o.targetPrice !== undefined || o.limitPrice !== undefined);
         const iocSubText = (o.targetPrice !== undefined || o.limitPrice !== undefined)
@@ -7780,7 +7792,7 @@
         return `
         <tr data-trade-id="${rowId}">
           <td style="color: #94a3b8; font-size: 11px;">${timeStr}</td>
-          <td><span class="tm-badge ${badgeClass}">${actionLabel}</span></td>
+          <td>${symTag}<span class="tm-badge ${badgeClass}">${actionLabel}</span></td>
           <td style="text-align: right; color: #fff; font-weight: 600;">${priceStr}${iocSubText}</td>
           <td style="text-align: right; color: #bae6fd;">${qtyStr}</td>
           <td style="text-align: right; color: #cbd5e1;">${notionalStr}</td>
@@ -7895,7 +7907,7 @@
       if (elTmRoundsTbody && (!tmRounds || tmRounds.length === 0)) {
         elTmRoundsTbody.innerHTML = '<tr><td colspan="9" class="tm-empty-row">🔄 กำลังคำนวณและโหลดสรุปรอบการซื้อขาย...</td></tr>';
       }
-      const isPfActive = isPortfolioType(latestGridData?.strategyType, latestGridData?.strategyMode);
+      const isPfActive = isPortfolioType(latestGridData?.strategyType || activeStrategyType, latestGridData?.strategyMode);
       const effectiveSym = isPfActive && portfolioTradeScopeAll ? "ALL" : activeSymbol;
       const symParam = effectiveSym ? encodeURIComponent(effectiveSym) : "";
       const res = await fetch(`${API_BASE}/api/db/rounds${symParam ? `?symbol=${symParam}` : ""}`);
@@ -7917,6 +7929,9 @@
 
   function renderTmRounds() {
     // 1. Update KPI Summary Cards
+    const uniqueRoundSyms = Array.from(new Set((tmRounds || []).map((r) => r.symbol).filter(Boolean)));
+    const isPfRounds = isPortfolioType(latestGridData?.strategyType || activeStrategyType, latestGridData?.strategyMode);
+    const kpiUnit = uniqueRoundSyms.length === 1 ? uniqueRoundSyms[0] : (isPfRounds ? "หุ้น/เหรียญ" : activeBaseAsset);
     if (tmRoundsSummary) {
       const s = tmRoundsSummary;
       if (elRoundsKpiTotal) elRoundsKpiTotal.innerHTML = `${s.totalRounds} <span class="round-kpi-sub" id="roundsKpiClosed">(${s.closedRounds} จบแล้ว)</span>`;
@@ -7926,10 +7941,10 @@
         elRoundsKpiWinRate.innerHTML = `${s.winRatePct.toFixed(1)}% <span class="round-kpi-sub" id="roundsKpiWinLoss">(${s.winRounds} ชนะ / ${s.lossRounds} แพ้)</span>`;
       }
       if (elRoundsKpiBought) {
-        elRoundsKpiBought.innerHTML = `$${(s.totalBoughtQuote !== undefined ? s.totalBoughtQuote : s.totalBoughtUsdso || 0).toFixed(2)} <span class="round-kpi-sub" id="roundsKpiBoughtQty">(${(s.totalBoughtBase !== undefined ? s.totalBoughtBase : s.totalBoughtSomi || 0).toFixed(2)} ${activeBaseAsset})</span>`;
+        elRoundsKpiBought.innerHTML = `$${(s.totalBoughtQuote !== undefined ? s.totalBoughtQuote : s.totalBoughtUsdso || 0).toFixed(2)} <span class="round-kpi-sub" id="roundsKpiBoughtQty">(${(s.totalBoughtBase !== undefined ? s.totalBoughtBase : s.totalBoughtSomi || 0).toFixed(2)} ${kpiUnit})</span>`;
       }
       if (elRoundsKpiSold) {
-        elRoundsKpiSold.innerHTML = `$${(s.totalSoldQuote !== undefined ? s.totalSoldQuote : s.totalSoldUsdso || 0).toFixed(2)} <span class="round-kpi-sub" id="roundsKpiSoldQty">(${(s.totalSoldBase !== undefined ? s.totalSoldBase : s.totalSoldSomi || 0).toFixed(2)} ${activeBaseAsset})</span>`;
+        elRoundsKpiSold.innerHTML = `$${(s.totalSoldQuote !== undefined ? s.totalSoldQuote : s.totalSoldUsdso || 0).toFixed(2)} <span class="round-kpi-sub" id="roundsKpiSoldQty">(${(s.totalSoldBase !== undefined ? s.totalSoldBase : s.totalSoldSomi || 0).toFixed(2)} ${kpiUnit})</span>`;
       }
       if (elRoundsKpiPnl) {
         const netPnlVal = s.totalNetPnlQuote !== undefined ? s.totalNetPnlQuote : (s.totalNetPnlUsdso || 0);
@@ -7940,10 +7955,14 @@
       }
     }
 
-    if (!elTmRoundsTbody) return;
+    if (!elTmRoundsTbody) {
+      renderLiveRoundsTable();
+      return;
+    }
 
     if (!tmRounds || tmRounds.length === 0) {
       elTmRoundsTbody.innerHTML = '<tr><td colspan="9" class="tm-empty-row">ยังไม่มีประวัติรอบการซื้อขาย</td></tr>';
+      renderLiveRoundsTable();
       return;
     }
 
@@ -7962,7 +7981,7 @@
 
       // Search filter
       if (searchQuery) {
-        const str = `รอบ ${r.roundNumber} #${r.roundNumber} ${r.status} ${formatShortDate(r.startTime)} ${formatShortDate(r.endTime)}`.toLowerCase();
+        const str = `รอบ ${r.roundNumber} #${r.roundNumber} ${r.symbol || ""} ${r.status} ${formatShortDate(r.startTime)} ${formatShortDate(r.endTime)}`.toLowerCase();
         if (!str.includes(searchQuery)) return false;
       }
       return true;
@@ -7982,12 +8001,14 @@
 
     if (list.length === 0) {
       elTmRoundsTbody.innerHTML = '<tr><td colspan="9" class="tm-empty-row">ไม่พบรายการรอบที่ตรงกับเงื่อนไขการค้นหา</td></tr>';
+      renderLiveRoundsTable();
       return;
     }
 
     // 4. Render Table Rows with Expandable sub-rows
     let html = "";
     for (const r of list) {
+      const roundSym = r.symbol || r.buyTrades?.[0]?.symbol || r.sellTrades?.[0]?.symbol || activeBaseAsset || "BASE";
       const isExpanded = expandedRoundNumbers.has(r.roundNumber);
       const grossPnl = r.grossPnlQuote !== undefined ? r.grossPnlQuote : (r.grossPnlUsdso || 0);
       const netPnl = r.netPnlQuote !== undefined ? r.netPnlQuote : (r.netPnlUsdso !== undefined ? r.netPnlUsdso : grossPnl);
@@ -8014,6 +8035,7 @@
         <tr class="round-row ${isExpanded ? "expanded" : ""}" data-round-id="${r.roundNumber}">
           <td style="text-align: center;">
             <span class="round-num-badge">#${r.roundNumber}</span>
+            ${r.symbol ? `<div style="font-size:10px; font-weight:700; color:#7dd3fc; margin-top:2px;">${r.symbol}</div>` : ""}
           </td>
           <td>
             <div style="font-size: 11.5px; font-weight: 600; color: #f1f5f9;">${formatShortDate(r.startTime)} ➔ ${formatShortDate(r.endTime)}</div>
@@ -8023,16 +8045,16 @@
             ${statusBadge}
           </td>
           <td style="text-align: right;">
-            <div class="round-buy-val">${fmtQty(r.buyQty)} ${activeBaseAsset}</div>
+            <div class="round-buy-val">${fmtQty(r.buyQty)} ${roundSym}</div>
             <span class="round-dim-info">$${buyCost.toFixed(2)} @ $${fmtPrice(r.avgBuyPrice)} (${r.buyCount} ไม้)</span>
           </td>
           <td style="text-align: right;">
-            <div class="round-sell-val">${fmtQty(r.sellQty)} ${activeBaseAsset}</div>
+            <div class="round-sell-val">${fmtQty(r.sellQty)} ${roundSym}</div>
             <span class="round-dim-info">$${sellProceeds.toFixed(2)} @ $${fmtPrice(r.avgSellPrice)} (${r.sellCount} ไม้)</span>
           </td>
           <td style="text-align: right;">
             <span style="font-weight: 600; ${r.holdingQty > 0.0001 ? "color: #38bdf8;" : "color: #64748b;"}">
-              ${fmtQty(r.holdingQty)} ${activeBaseAsset}
+              ${fmtQty(r.holdingQty)} ${roundSym}
             </span>
           </td>
           <td style="text-align: right;">
@@ -8063,7 +8085,7 @@
                 <div class="round-sub-card">
                   <div class="round-sub-header header-buy">
                     <span>🟢 ไม้เข้าซื้อ (Buys Accumulation - ${r.buyTrades.length} ไม้)</span>
-                    <span>รวม: $${buyCost.toFixed(2)} ${activeQuoteAsset} (${fmtQty(r.buyQty)} ${activeBaseAsset})</span>
+                    <span>รวม: $${buyCost.toFixed(2)} ${activeQuoteAsset} (${fmtQty(r.buyQty)} ${roundSym})</span>
                   </div>
                   <table class="round-subtable">
                     <thead>
@@ -8105,7 +8127,7 @@
                 <div class="round-sub-card">
                   <div class="round-sub-header header-sell">
                     <span>🔴 ไม้ขายออก (Sells Distribution - ${r.sellTrades.length} ไม้)</span>
-                    <span>รวม: $${sellProceeds.toFixed(2)} ${activeQuoteAsset} (${fmtQty(r.sellQty)} ${activeBaseAsset})</span>
+                    <span>รวม: $${sellProceeds.toFixed(2)} ${activeQuoteAsset} (${fmtQty(r.sellQty)} ${roundSym})</span>
                   </div>
                   <table class="round-subtable">
                     <thead>
@@ -8857,7 +8879,8 @@
 
         let actBadge = `<span class="badge-exit" style="background:rgba(255,255,255,0.08);">${o.action || o.type || "TRADE"}</span>`;
         if (o.type === "TP1_EMA25" || o.action === "TAKE_PROFIT") {
-          actBadge = `<span class="badge-exit badge-act-tp1">🔵 TP1 (EMA 25)</span>`;
+          const isEma200 = `${o.reason || ""} ${o.levelDesc || ""}`.includes("EMA200");
+          actBadge = `<span class="badge-exit badge-act-tp1">${isEma200 ? "🔵 TP1 (EMA 200)" : "🔵 TP1 (EMA 25)"}</span>`;
         } else if (o.type === "TP2_RUNNER" || o.action === "SNIPE_SELL") {
           actBadge = `<span class="badge-exit badge-act-tp2">🟣 TP2 (Runner)</span>`;
         } else if (o.type === "BUY_HOOK" || o.action === "SNIPE_BUY") {
@@ -8943,7 +8966,7 @@
         const durRemSec = durSec % 60;
         const durStr = durMin > 0 ? `${durMin}m ${durRemSec}s` : `${durSec}s`;
 
-        const pnl = Number(r.grossPnlQuote || r.grossPnlUsdso || 0);
+        const pnl = Number(r.netPnlQuote !== undefined ? r.netPnlQuote : (r.grossPnlQuote || r.grossPnlUsdso || 0));
         const pnlPct = Number(r.grossPnlPct || 0);
         const pColor = pnl >= 0 ? "#4ade80" : "#f87171";
         const rSymBadge = r.symbol
@@ -8959,7 +8982,7 @@
             <td style="color:#94a3b8;">${durStr}</td>
             <td>$${fmtPrice(r.avgBuyPrice)}</td>
             <td>${r.avgSellPrice > 0 ? `$${fmtPrice(r.avgSellPrice)}` : "--"}</td>
-            <td>${Number(r.buyQty || 0).toLocaleString(undefined, { maximumFractionDigits: 4 })}</td>
+            <td>${Number(r.buyQty || 0).toLocaleString(undefined, { maximumFractionDigits: 4 })}${r.symbol ? ` <span style="font-size:10px; color:#64748b;">${r.symbol}</span>` : ""}</td>
             <td style="color:${pColor}; font-weight:700;">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}</td>
             <td style="color:${pColor}; font-weight:700;">${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%</td>
           </tr>
@@ -9499,6 +9522,14 @@
       chartInitialized = true;
     }
     rawOrders = [];
+    latestGridData = null;
+    activeSymbol = "";
+    activeStrategyType = "";
+    tmTrades = [];
+    tmRounds = [];
+    tmRoundsSummary = null;
+    renderLiveTradesTable();
+    renderLiveRoundsTable();
     tradesCount = 0;
     onchainCount = 0;
     allCount = 0;

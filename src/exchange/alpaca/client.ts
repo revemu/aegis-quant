@@ -325,7 +325,8 @@ export class AlpacaClient implements IExchangeClient {
   public async placeOrder(params: PlaceOrderParams): Promise<ExchangeOrderResult> {
     const cleanSym = normalizeStockSymbol(params.symbol);
     const side = params.side.toLowerCase();
-    const type = params.type.toLowerCase().includes("limit") ? "limit" : "market";
+    const isProtectiveIoc = params.type.toUpperCase() === "IOC";
+    const type = isProtectiveIoc || params.type.toLowerCase().includes("limit") ? "limit" : "market";
 
     // Alpaca supports fractional shares for BOTH market & limit only with time_in_force: "day"
     const body: Record<string, any> = {
@@ -355,8 +356,8 @@ export class AlpacaClient implements IExchangeClient {
     }
 
     let o = await res.json();
-    if (type === "market" && o?.id) {
-      const delays = [250, 350, 500, 700, 1000, 1200];
+    if ((type === "market" || isProtectiveIoc) && o?.id) {
+      const delays = [250, 350, 500, 700, 1000, 1000];
       for (const waitMs of delays) {
         const curStatus = mapAlpacaOrderStatus(o.status);
         const curFilledQty = parseFloat(o.filled_qty || 0);
@@ -373,9 +374,35 @@ export class AlpacaClient implements IExchangeClient {
           // ignore transient poll failure and retry
         }
       }
-      const finalStatus = mapAlpacaOrderStatus(o.status);
+      let finalStatus = mapAlpacaOrderStatus(o.status);
+      if (
+        isProtectiveIoc &&
+        finalStatus !== "FILLED" &&
+        finalStatus !== "CANCELED" &&
+        finalStatus !== "REJECTED" &&
+        finalStatus !== "EXPIRED"
+      ) {
+        await this.cancelOrder(cleanSym, o.id).catch(() => {});
+        await new Promise((r) => setTimeout(r, 200));
+        try {
+          const afterCancelRes = await fetch(`${this.baseUrl}/v2/orders/${o.id}`, { headers: this.getHeaders() });
+          if (afterCancelRes.ok) {
+            o = await afterCancelRes.json();
+          }
+        } catch {
+          // ignore
+        }
+        finalStatus = mapAlpacaOrderStatus(o.status);
+      }
       const finalFilledQty = parseFloat(o.filled_qty || 0);
-      if ((finalStatus === "CANCELED" || finalStatus === "REJECTED" || finalStatus === "EXPIRED") && finalFilledQty <= 0) {
+      if (isProtectiveIoc && finalFilledQty <= 0) {
+        throw new Error(`Alpaca protective limit ${cleanSym} @ $${body.limit_price} unfilled within timeout (canceled)`);
+      }
+      if (
+        type === "market" &&
+        (finalStatus === "CANCELED" || finalStatus === "REJECTED" || finalStatus === "EXPIRED") &&
+        finalFilledQty <= 0
+      ) {
         throw new Error(`Alpaca market order ${o.id} ${o.status} without fill`);
       }
     }

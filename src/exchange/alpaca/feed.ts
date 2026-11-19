@@ -150,8 +150,8 @@ export function parseAlpacaSnapshotToBook(snap: {
   const isTightQuote =
     hasTwoSidedQuote &&
     quoteMid > 0 &&
-    (qAsk - qBid) / quoteMid <= 0.005 &&
-    (tradePrice <= 0 || Math.abs(quoteMid - tradePrice) / tradePrice <= 0.005);
+    (qAsk - qBid) / quoteMid <= 0.0025 &&
+    (tradePrice <= 0 || Math.abs(quoteMid - tradePrice) / tradePrice <= 0.0035);
 
   let bestBid: number;
   let bestAsk: number;
@@ -545,7 +545,7 @@ export async function fetchAlpacaMultiSnapshots(params: {
     for (const [sym, snap] of Object.entries(payload)) {
       const book = parseAlpacaSnapshotToBook(snap);
       if (book) {
-        result.set(normalizeStockSymbol(sym), { ...book, time: Date.now() });
+        result.set(normalizeStockSymbol(sym), book);
       }
     }
   }

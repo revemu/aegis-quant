@@ -9970,3 +9970,21 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - ใน `recalculateAllRealizedPnl`: ยกเว้นคู่เทรด `quoteAsset === "USD"` จาก fallback ค่าธรรมเนียม CEX `0.075%` ให้สอดคล้องกับ `calculateTradeRounds`
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.93`** ใน `package.json`, `src/version.ts` และ `public/index.html` (`style.css?v=0.3.0.93`, `app.js?v=0.3.0.93`)
+
+---
+
+## 338. v0.3.0.94 — Trade-First Alpaca IEX Feed, Protective Limit Orders, PG Exchange-Filtered Orders & Portfolio Trade Table Fixes (`src/exchange/alpaca/*`, `src/strategy/ma-fan-portfolio/index.ts`, `src/pg-store.ts`, `src/server.ts`, `public/app.js`)
+
+- **Trade-First Alpaca IEX Feed & Snapshot Timestamp Fix (`src/exchange/alpaca/ws.ts`, `src/exchange/alpaca/feed.ts`)**:
+  - ใน `AlpacaPortfolioWsClient.handleMessage`: ป้องกัน Quote ลอยก่อนมีเทรดจริง (`state.lastTrade > 0`) และบีบเกณฑ์ Quote mid ให้แคบลงเหลือสเปรด `<= 0.25%` และห่างจาก `lastTrade` ไม่เกิน `0.35%` เพื่อไม่ให้ Quote ปลอมบน IEX มาดึงกราฟแท่งเทียนสดหรือทริกเกอร์ TP1/SL
+  - ใน `parseAlpacaSnapshotToBook` ใช้เกณฑ์ `<= 0.25%` / `<= 0.35%` แบบเดียวกัน และแก้ `fetchAlpacaMultiSnapshots` ให้คืน `book.time` เป็นวินาที (ไม่เขียนทับ `Date.now()` ที่ทำให้ strategy คูณ `1000` ซ้ำ)
+- **Protective Limit Orders with Auto-Cancel on Alpaca (`src/exchange/alpaca/client.ts`, `src/strategy/ma-fan-portfolio/index.ts`)**:
+  - รองรับคำสั่ง `IOC` บน Alpaca เป็น `LIMIT` (`time_in_force: "day"`) ล็อกเพดานซื้อ `+0.3%` และพื้นขาย TP `-0.3%` พร้อม poll รอจับคู่ (~3–4 วินาที) และสั่งยกเลิกอัตโนมัติหากไม่แมตช์ (คง `MARKET` เฉพาะ SL / Emergency / Manual Close) และไม่อนุญาตให้สร้าง/ปิด Slot หาก `executedQty <= 0`
+- **Load & Serve Orders Strictly for Active Exchange (`src/pg-store.ts`, `src/server.ts`)**:
+  - เพิ่ม `inferOrderExchange()` ใน `PgStore.loadStateAndOrders` เพื่อกรองโหลดเฉพาะออเดอร์ของ `exchange` ปัจจุบัน (โดยไม่ลบออเดอร์ของ exchange อื่นใน PG `bot_orders`) และระบุคอลัมน์ `exchange` ทุกครั้งที่ `syncData`
+  - แก้ `/api/db/trade-manager?symbol=ALL` ใน `src/server.ts` ให้ใช้ `this.db.getOrderActivity(5000, "ALL")`
+- **Portfolio Bottom Trade Log & History Symbol Fixes (`public/app.js`)**:
+  - เก็บ `activeStrategyType` ตั้งแต่ `loadSettings()` และรีเซ็ต state ใน `refreshWorkerDashboard()` เพื่อให้ `loadTradeManagerData()` และ `loadTradeRoundsData()` ดึง `?symbol=ALL` ตั้งแต่โหลดหน้าแรก (ไม่ค้างที่ `NVDA`), เอา early return ที่ข้าม `renderLiveTradesTable()` / `renderLiveRoundsTable()` ออก
+  - แก้ `renderTmRounds()` และ `renderTmTrades()` ให้ใช้ `r.symbol` / `o.symbol` จริง (`PG`), แสดง `fillPrice`, รองรับค้นหาด้วยชื่อหุ้น, และแก้ป้าย `TP1` ให้แสดง `EMA 200` เมื่ออยู่ในโหมด Portfolio
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.94`** ใน `package.json`, `src/version.ts` และ `public/index.html` (`style.css?v=0.3.0.94`, `app.js?v=0.3.0.94`)

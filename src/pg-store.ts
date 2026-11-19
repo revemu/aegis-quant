@@ -129,6 +129,34 @@ function buildOrderUid(o: UnifiedOrderRecord, fallbackIndex: number): string {
   return `legacy_${ts}_${o.side || "BUY"}_${fallbackIndex}`;
 }
 
+function inferOrderExchange(o: UnifiedOrderRecord): "dreamdex" | "binance" | "alpaca" {
+  const explicit = String((o as any)?.exchange || "").toLowerCase().trim();
+  if (explicit === "dreamdex" || explicit === "binance" || explicit === "alpaca") {
+    return explicit;
+  }
+  const sym = String(o.symbol || "").toUpperCase();
+  const quote = String(o.quoteAsset || "").toUpperCase();
+  const reason = String(o.reason || "");
+  const feeAsset = String(o.feeAsset || "").toUpperCase();
+  const isDex =
+    sym.includes(":") ||
+    quote === "USDSO" ||
+    Boolean(o.explorerUrl?.includes("somnia")) ||
+    Boolean(o.txHash?.startsWith("0x"));
+  if (isDex) return "dreamdex";
+  const isBinance =
+    quote === "FDUSD" ||
+    quote === "USDT" ||
+    quote === "USDC" ||
+    sym.endsWith("FDUSD") ||
+    sym.endsWith("USDT") ||
+    sym.endsWith("USDC") ||
+    feeAsset === "BNB" ||
+    reason.includes("Binance");
+  if (isBinance) return "binance";
+  return "alpaca";
+}
+
 export class PgStore {
   private readonly sql: Sql;
   public readonly instanceKey: string;
@@ -354,11 +382,14 @@ export class PgStore {
       }
     }
 
+    const activeExchange = String(settings.exchange || "binance").toLowerCase();
     const orders: UnifiedOrderRecord[] = [];
     this.lastOrderHashes.clear();
     for (const r of orderRows) {
       if (r.raw_json && typeof r.raw_json === "object") {
-        orders.push(r.raw_json as UnifiedOrderRecord);
+        const ord = r.raw_json as UnifiedOrderRecord;
+        if (inferOrderExchange(ord) !== activeExchange) continue;
+        orders.push(ord);
         this.lastOrderHashes.set(r.order_uid, JSON.stringify(r.raw_json));
       }
     }
@@ -552,7 +583,7 @@ export class PgStore {
       changedOrderRows.push({
         instance_key: this.instanceKey,
         order_uid: uid,
-        exchange: (o as any).exchange ? String((o as any).exchange) : null,
+        exchange: (o as any).exchange ? String((o as any).exchange).toLowerCase() : inferOrderExchange(o),
         symbol: o.symbol ? String(o.symbol) : null,
         side: o.side ? String(o.side) : null,
         status: o.status ? String(o.status) : null,

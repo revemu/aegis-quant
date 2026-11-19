@@ -415,7 +415,7 @@ export class DashboardServer {
       }
       const trades = this.db.getTrades(5000, symbolParam);
       const allOrders = symbolParam === "ALL"
-        ? this.db.getOrders(5000)
+        ? this.db.getOrderActivity(5000, "ALL")
         : this.db.getOrders(5000, { symbol: symbolParam });
       const state = this.db.getState(isPortfolioMode ? "__PORTFOLIO__" : symbolParam);
       res.writeHead(200, { "Content-Type": "application/json" });
