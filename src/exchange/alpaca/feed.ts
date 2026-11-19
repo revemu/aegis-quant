@@ -23,6 +23,7 @@ export interface FetchAlpacaBarsParams {
   interval: string;
   limit?: number;
   startTimeSec?: number;
+  rthOnly?: boolean;
   apiKey: string;
   apiSecret: string;
   dataUrl?: string;
@@ -43,6 +44,63 @@ export function normalizeStockSymbol(symbol: string): string {
   if (s.length > 4 && s.endsWith("USDT")) return s.slice(0, -4);
   if (s.length > 4 && s.endsWith("USD")) return s.slice(0, -3);
   return s;
+}
+
+const NY_WEEKDAY_MAP: Record<string, number> = {
+  Sun: 0,
+  Mon: 1,
+  Tue: 2,
+  Wed: 3,
+  Thu: 4,
+  Fri: 5,
+  Sat: 6,
+};
+
+const nyHourFormat = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  weekday: "short",
+  hour: "numeric",
+  minute: "numeric",
+  hourCycle: "h23",
+});
+
+const nyHourBucketCache = new Map<number, { weekday: number; baseMin: number }>();
+
+/**
+ * Returns true if the given Alpaca bar timestamp falls inside US Regular Trading Hours
+ * (09:30–16:00 ET for 1m/5m/15m, 09:00–16:00 ET for 1h). Multi-hour (4h) and daily (1d) bars pass through.
+ */
+export function isUsRegularTradingHoursBar(timeSec: number, interval: string): boolean {
+  if (!Number.isFinite(timeSec) || timeSec <= 0) return false;
+  const iv = (interval || "").toLowerCase();
+  if (iv === "1d" || iv === "4h" || iv === "1day" || iv === "4hour") return true;
+
+  const hourBucket = Math.floor(timeSec / 3600);
+  let cached = nyHourBucketCache.get(hourBucket);
+  if (!cached) {
+    const parts = nyHourFormat.formatToParts(new Date(hourBucket * 3600 * 1000));
+    let wd = 0;
+    let hr = 0;
+    let mn = 0;
+    for (const p of parts) {
+      if (p.type === "weekday") wd = NY_WEEKDAY_MAP[p.value] ?? 0;
+      else if (p.type === "hour") {
+        const parsedHr = Number(p.value);
+        hr = parsedHr === 24 ? 0 : parsedHr;
+      } else if (p.type === "minute") mn = Number(p.value) || 0;
+    }
+    cached = { weekday: wd, baseMin: hr * 60 + mn };
+    if (nyHourBucketCache.size > 20_000) nyHourBucketCache.clear();
+    nyHourBucketCache.set(hourBucket, cached);
+  }
+
+  if (cached.weekday === 0 || cached.weekday === 6) return false;
+  const minInHour = Math.floor((timeSec - hourBucket * 3600) / 60);
+  const mins = cached.baseMin + minInHour;
+  if (iv === "1h" || iv === "1hour") {
+    return mins >= 540 && mins < 960; // 09:00 - 15:59 ET
+  }
+  return mins >= 570 && mins < 960; // 09:30 - 15:59 ET
 }
 
 export function intervalToSeconds(interval: string): number {
@@ -195,7 +253,11 @@ export async function fetchAlpacaBars(params: FetchAlpacaBarsParams): Promise<Ca
 
   const { timeframe, aggregateHours } = mapIntervalToAlpacaTimeframe(params.interval);
   const requestedLimit = Math.max(1, Math.min(params.limit ?? 300, 10_000));
-  const rawLimit = Math.min(10_000, requestedLimit * aggregateHours);
+  const useRthFilter = params.rthOnly !== false && aggregateHours === 1;
+  const rawLimit = Math.min(
+    10_000,
+    requestedLimit * aggregateHours + (useRthFilter ? Math.min(200, Math.ceil(requestedLimit * 0.25) + 10) : 0),
+  );
   const dataUrl = (params.dataUrl || "https://data.alpaca.markets").replace(/\/+$/, "");
 
   const intervalSec = intervalToSeconds(params.interval);
@@ -260,6 +322,8 @@ export async function fetchAlpacaBars(params: FetchAlpacaBarsParams): Promise<Ca
 
   if (aggregateHours > 1) {
     candles = aggregateFourHourBars(candles);
+  } else if (useRthFilter) {
+    candles = candles.filter((c) => isUsRegularTradingHoursBar(c.time, params.interval));
   }
 
   if (candles.length > 0) {
@@ -560,6 +624,7 @@ export async function fetchAlpacaMultiBars(params: {
   interval: string;
   limit?: number;
   startTimeSec?: number;
+  rthOnly?: boolean;
   apiKey: string;
   apiSecret: string;
   dataUrl?: string;
@@ -570,13 +635,15 @@ export async function fetchAlpacaMultiBars(params: {
 
   const { timeframe, aggregateHours } = mapIntervalToAlpacaTimeframe(params.interval);
   const perSymLimit = Math.max(1, Math.min(params.limit ?? 280, 1000));
+  const useRthFilter = params.rthOnly !== false && aggregateHours === 1;
+  const fetchPerSymLimit = useRthFilter ? Math.min(1000, Math.ceil(perSymLimit * 1.25) + 10) : perSymLimit;
   const intervalSec = intervalToSeconds(params.interval);
   const nowSec = Math.floor(Date.now() / 1000);
   const alignSec = aggregateHours > 1 ? 14_400 : intervalSec;
   const startIso =
     params.startTimeSec && params.startTimeSec > 0
       ? new Date(Math.floor(params.startTimeSec / alignSec) * alignSec * 1000).toISOString().split(".")[0] + "Z"
-      : new Date(Date.now() - estimateDaysBack(params.interval, Math.max(perSymLimit, 10) * aggregateHours) * 86_400_000)
+      : new Date(Date.now() - estimateDaysBack(params.interval, Math.max(fetchPerSymLimit, 10) * aggregateHours) * 86_400_000)
           .toISOString()
           .split(".")[0] + "Z";
 
@@ -587,11 +654,11 @@ export async function fetchAlpacaMultiBars(params: {
     headers["APCA-API-SECRET-KEY"] = params.apiSecret;
   }
 
-  // Batch 8 symbols at a time so total bar limit (8 * 300 = 2400) fits cleanly within Alpaca 10,000 multi-bar cap
+  // Batch 8 symbols at a time so total bar limit fits cleanly within Alpaca 10,000 multi-bar cap
   const batchSize = 8;
   for (let i = 0; i < cleanSyms.length; i += batchSize) {
     const chunk = cleanSyms.slice(i, i + batchSize);
-    const totalLimit = Math.min(10_000, chunk.length * perSymLimit * aggregateHours + 200);
+    const totalLimit = Math.min(10_000, chunk.length * fetchPerSymLimit * aggregateHours + 200);
     const rawBySym = new Map<string, Array<{ t: string; o: number; h: number; l: number; c: number; v?: number }>>();
     let pageToken: string | undefined;
     let attempts = 0;
@@ -636,6 +703,9 @@ export async function fetchAlpacaMultiBars(params: {
         .filter((c) => Number.isFinite(c.time) && Number.isFinite(c.close) && c.close > 0);
 
       if (aggregateHours > 1) candles = aggregateFourHourBars(candles);
+      else if (useRthFilter) {
+        candles = candles.filter((c) => isUsRegularTradingHoursBar(c.time, params.interval));
+      }
       if (candles.length > 0) {
         const last = candles[candles.length - 1]!;
         if (last.time + intervalSec > nowSec) last.isClosed = false;

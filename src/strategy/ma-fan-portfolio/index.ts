@@ -11,7 +11,7 @@ import { AlpacaPortfolioWsClient } from "../../exchange/alpaca/ws.js";
 import type { Candle } from "../../market-structure.js";
 import type { AtrSource } from "../../types.js";
 import { BotDatabase, getDatabase, type PortfolioSlotRecord, type UnifiedOrderRecord } from "../../db.js";
-import { LearningEngine } from "../../learning-engine.js";
+import { LearningEngine, type SurvivalGuardDecision } from "../../learning-engine.js";
 import type { IStrategy, Lot, MarketClockInfo, StrategyContext, StrategyEvent, StrategyType } from "../types.js";
 import type {
   CoinSetupState,
@@ -30,6 +30,27 @@ const PORTFOLIO_DB_KEY = "__PORTFOLIO__";
 
 interface ActivePortfolioSlot extends PortfolioSlotRecord {
   tp1TargetPrice?: number;
+}
+
+/**
+ * Counts how many closed 15m bars exist strictly after `refBarTime` up to `lastClosedIdx`.
+ * Used instead of wall-clock timestamps so US equity overnight (17.5h) and weekend (65.5h) gaps
+ * never falsely expire valid active MA-Fan setups.
+ */
+export function countClosedBarsSince(c15: Candle[], lastClosedIdx: number, refBarTime: number): number {
+  if (!refBarTime || refBarTime <= 0 || lastClosedIdx < 0 || c15.length === 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+  const bound = Math.min(lastClosedIdx, c15.length - 1);
+  let count = 0;
+  for (let i = bound; i >= 0; i--) {
+    if (c15[i]!.time > refBarTime) {
+      count++;
+    } else {
+      break;
+    }
+  }
+  return count;
 }
 
 export class MaFanPortfolioStrategy implements IStrategy {
@@ -88,6 +109,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
   private lastBalanceSyncTs: number = 0;
   private lastTelemetryEmitTs: number = 0;
   private universeFetchPromise: Promise<void> | null = null;
+  private latestSurvival: SurvivalGuardDecision | null = null;
+  private initialLearningBootstrapDone: boolean = false;
 
   // Real-time Alpaca WebSocket hybrid stream (<= 30 symbols) & live chart sync
   private alpacaWs?: AlpacaPortfolioWsClient;
@@ -612,6 +635,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
   public getPortfolioRadarSnapshot() {
     return {
       macro: this.macroState,
+      survival: this.latestSurvival,
       slots: this.buildSlotTelemetryList(),
       radar: this.radarList.slice(0, 20),
       inspectedSymbol: this.inspectedSymbol,
@@ -626,6 +650,31 @@ export class MaFanPortfolioStrategy implements IStrategy {
     const res = await this.learning.clearSymbolCooldown(symbol);
     this.emitTelemetryTick();
     return res;
+  }
+
+  public async runLearningShadowScan(force = true) {
+    const summary = await this.learning.runShadowWalkForward({
+      exchange: this.exchange.exchangeName,
+      symbols: Array.from(this.snapshots.keys()),
+      benchmarkSymbol: this.benchmarkSymbol,
+      slPct: Number(this.cfg.portfolioDisasterSlPct ?? 3.5),
+      fallbackSnapshots: this.snapshots,
+      benchmarkFallback15m: this.benchmark15m,
+      force,
+    });
+    this.emitTelemetryTick();
+    return summary;
+  }
+
+  public async reconcileLearningJournal() {
+    const res = await this.learning.reconcileJournalFromOrders(this.exchange.exchangeName);
+    this.emitTelemetryTick();
+    return res;
+  }
+
+  private async reconcileAndRunInitialShadow(): Promise<void> {
+    await this.learning.reconcileJournalFromOrders(this.exchange.exchangeName).catch(() => {});
+    await this.runLearningShadowScan(false).catch(() => {});
   }
 
   // ── Wallet & Position Sync ─────────────────────────────────────────────────
@@ -890,6 +939,11 @@ export class MaFanPortfolioStrategy implements IStrategy {
     this.lastUniverseFetchTs = Date.now();
     this.syncAlpacaWsSubscriptions();
     this.emitInspectedChartCandles({ force: true, includeNewlyClosed: true });
+
+    if (!this.initialLearningBootstrapDone && this.snapshots.size > 0) {
+      this.initialLearningBootstrapDone = true;
+      void this.reconcileAndRunInitialShadow();
+    }
   }
 
   private async refreshLiveQuotes(creds: { apiKey: string; apiSecret: string; dataUrl: string }): Promise<void> {
@@ -1078,9 +1132,29 @@ export class MaFanPortfolioStrategy implements IStrategy {
       }
     }
 
-    // 2. Scan Universe & Update Setup States + Live Radar
+    // 2. Evaluate Survival Guard & Scan Universe + Live Radar
+    const openHeldValue = this.slots.reduce(
+      (sum, slot) => sum + slot.qty * (this.snapshots.get(slot.symbol)?.livePrice || slot.lastKnownPrice || slot.entryPrice),
+      0,
+    );
+    const currentEquity = this.getAvailableBuyCash() + openHeldValue;
+    const configuredMaxSlots = this.getMaxSlots();
+    const survival = this.learning.evaluateSurvivalPosture({
+      cfg: this.cfg,
+      macro: this.macroState,
+      configuredMaxSlots,
+      currentEquity,
+    });
+    this.latestSurvival = survival;
+
+    const effMinRsi1h = survival.enforced ? survival.minRsi1h : 40;
+    const effMinVolR = survival.enforced ? survival.minBuyVolRatio12 : 1.3;
+    const effMinRs = survival.enforced ? survival.minRelStrength24h : -1.0;
+
     const newRadar: PortfolioRadarCandidate[] = [];
     const entryCandidates: Array<{ sym: string; price: number; score: number; cand: PortfolioRadarCandidate }> = [];
+    const extraBlocked: Array<{ candidate: PortfolioRadarCandidate; blockReason: string; barTimeSec?: number }> = [];
+    let maxClosedBarSec = 0;
 
     for (const [sym, ind] of this.snapshots.entries()) {
       const idx = ind.lastClosedIdx;
@@ -1094,6 +1168,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       }
 
       const barTime = ind.lastClosedTime;
+      if (barTime > maxClosedBarSec) maxClosedBarSec = barTime;
       const c = ind.c15[idx]!;
       const isHeld = this.slots.some((s) => s.symbol === sym);
 
@@ -1109,19 +1184,22 @@ export class MaFanPortfolioStrategy implements IStrategy {
       const isBottomFan = m4 < m8 && m8 < m16 && m16 < m25 && m25 < m75 && m75 < m200;
       if (isBottomFan) {
         st.hadBottomFan = true;
+        st.fanBarTime = barTime;
         st.fanExpiryBarTime = barTime + 20 * 900;
         st.bottomLow = Math.min(st.bottomLow, c.low);
       }
-      if (barTime > st.fanExpiryBarTime && !st.waitingPullback && !isHeld) {
+      const fanRefTime = st.fanBarTime ?? (st.fanExpiryBarTime > 0 ? st.fanExpiryBarTime - 20 * 900 : 0);
+      if (st.hadBottomFan && countClosedBarsSince(ind.c15, idx, fanRefTime) > 20 && !st.waitingPullback && !isHeld) {
         st.hadBottomFan = false;
         st.bottomLow = Infinity;
       }
 
-      if (st.waitingPullback && (barTime >= st.pullbackExpiryBarTime || m8 < m16)) {
+      if (st.waitingPullback && (countClosedBarsSince(ind.c15, idx, st.waitFromBarTime) >= 12 || m8 < m16)) {
         st.waitingPullback = false;
       }
 
       const is8Cross16Up = prevM8 <= prevM16 && m8 > m16;
+      let isWeakCrossThisBar = false;
       if (!isHeld && !st.waitingPullback && st.hadBottomFan && is8Cross16Up) {
         const rsiOk = (ind.rsi15[idx] ?? 0) >= 35 && (ind.rsi15[idx] ?? 0) > (ind.rsi15[idx - 1] ?? 0);
         const macdOk = (ind.macdHist15[idx] ?? 0) > (ind.macdHist15[idx - 1] ?? 0);
@@ -1129,6 +1207,9 @@ export class MaFanPortfolioStrategy implements IStrategy {
           st.waitingPullback = true;
           st.waitFromBarTime = barTime;
           st.pullbackExpiryBarTime = barTime + 12 * 900;
+        } else if (st.lastCrossWeakBarTime !== barTime) {
+          st.lastCrossWeakBarTime = barTime;
+          isWeakCrossThisBar = true;
         }
       }
 
@@ -1155,8 +1236,11 @@ export class MaFanPortfolioStrategy implements IStrategy {
         this.cfg.portfolioRankBy === "RSI15"
           ? rsi15
           : Math.min(3, buyVolRatio12) * 20 + Math.max(-5, Math.min(10, relStrength24h)) * 3 - upperSpreadPct * 10;
-      const score = baseScore + this.learning.getSymbolScorePenalty(sym, this.cfg);
+      const scoreAdj = this.learning.getSymbolScoreAdjustment(sym, this.cfg);
+      const score = baseScore + scoreAdj;
       const onLearningCooldown = this.learning.isSymbolOnCooldown(sym, this.cfg);
+      const shadowRiskyBlocked =
+        survival.enforced && survival.blockRiskySymbols && this.learning.isSymbolShadowRisky(sym, this.cfg);
 
       const livePx = ind.livePrice || c.close;
       const distanceToEma4Pct = m4 > 0 ? ((livePx - m4) / m4) * 100 : 0;
@@ -1164,7 +1248,18 @@ export class MaFanPortfolioStrategy implements IStrategy {
 
       let stage: PortfolioRadarCandidate["stage"] = "SCANNING";
       let filterNote = "";
-      const passesFilters = rsi1h >= 40 && buyVolRatio12 >= 1.3 && relStrength24h >= -1.0;
+      const passesBaseFilters = rsi1h >= 40 && buyVolRatio12 >= 1.3 && relStrength24h >= -1.0;
+      const passesSurvivalFilters =
+        rsi1h >= effMinRsi1h && buyVolRatio12 >= effMinVolR && relStrength24h >= effMinRs && !shadowRiskyBlocked;
+
+      const buildFailDetails = (minRsi: number, minVol: number, minRs: number, risky: boolean): string[] => {
+        const fails: string[] = [];
+        if (risky) fails.push("RiskyShadow");
+        if (rsi1h < minRsi) fails.push(`1hRSI ${rsi1h.toFixed(0)}<${minRsi}`);
+        if (buyVolRatio12 < minVol) fails.push(`VolR ${buyVolRatio12.toFixed(2)}<${minVol}`);
+        if (relStrength24h < minRs) fails.push(`RS ${relStrength24h.toFixed(1)}%<${minRs}%`);
+        return fails;
+      };
 
       if (isHeld) {
         stage = "HOLDING";
@@ -1173,14 +1268,11 @@ export class MaFanPortfolioStrategy implements IStrategy {
           if (onLearningCooldown) {
             stage = "CROSS_8X16_FAIL_FILTERS";
             filterNote = "Learning Cooldown";
-          } else if (passesFilters) {
+          } else if (passesSurvivalFilters) {
             stage = "PULLBACK_READY";
           } else {
             stage = "CROSS_8X16_FAIL_FILTERS";
-            const fails: string[] = [];
-            if (rsi1h < 40) fails.push(`1hRSI ${rsi1h.toFixed(0)}<40`);
-            if (buyVolRatio12 < 1.3) fails.push(`VolR ${buyVolRatio12.toFixed(2)}<1.3`);
-            if (relStrength24h < -1.0) fails.push(`RS ${relStrength24h.toFixed(1)}%`);
+            const fails = buildFailDetails(effMinRsi1h, effMinVolR, effMinRs, shadowRiskyBlocked);
             filterNote = fails.join(", ");
           }
         } else {
@@ -1209,8 +1301,34 @@ export class MaFanPortfolioStrategy implements IStrategy {
         distanceToEma4Pct,
         distanceToEma200Pct,
         filterNote,
+        barTimeSec: barTime,
+        shadowScoreAdj: scoreAdj,
       };
       newRadar.push(cand);
+
+      if (isWeakCrossThisBar) {
+        extraBlocked.push({ candidate: cand, blockReason: "FILTER:8x16_WeakMom", barTimeSec: barTime });
+      } else if (stage === "WAITING_PULLBACK" && !passesSurvivalFilters && distanceToEma4Pct <= 0.6) {
+        const nearFails = buildFailDetails(effMinRsi1h, effMinVolR, effMinRs, shadowRiskyBlocked);
+        extraBlocked.push({
+          candidate: cand,
+          blockReason:
+            passesBaseFilters && shadowRiskyBlocked
+              ? "SURVIVAL_GUARD:RISKY_SYMBOL"
+              : passesBaseFilters
+                ? `SURVIVAL_GUARD:${survival.posture}`
+                : `FILTER:${nearFails.join(", ")}`,
+          barTimeSec: barTime,
+        });
+      } else if (stage === "CROSS_8X16_FAIL_FILTERS" && !onLearningCooldown && passesBaseFilters && !passesSurvivalFilters) {
+        extraBlocked.push({
+          candidate: cand,
+          blockReason: shadowRiskyBlocked ? "SURVIVAL_GUARD:RISKY_SYMBOL" : `SURVIVAL_GUARD:${survival.posture}`,
+          barTimeSec: barTime,
+        });
+      } else if (stage === "PULLBACK_READY" && !onLearningCooldown && !sitOutEval.isSitOut && !sitOutEval.pass4h && !sitOutEval.pass1d) {
+        extraBlocked.push({ candidate: cand, blockReason: "SHADOW_BEAR_MACRO", barTimeSec: barTime });
+      }
 
       if (!isHeld && stage === "PULLBACK_READY" && !onLearningCooldown) {
         entryCandidates.push({ sym, price: livePx, score, cand });
@@ -1230,28 +1348,50 @@ export class MaFanPortfolioStrategy implements IStrategy {
     this.radarList = newRadar;
     this.syncAlpacaWsSubscriptions();
 
-    // Learning Level 1 & 3: Record near-miss blocked signals only when active & market open, and run periodic bounded learning cycle
-    const latestClosedBarSec = this.snapshots.get(this.inspectedSymbol)?.lastClosedTime || 0;
-    if (canExecute && latestClosedBarSec > 0) {
+    // 3. Allocate Free Slots (applying Survival Guard slot/size limits cleanly without inflating bet size)
+    entryCandidates.sort((a, b) => b.score - a.score);
+    const effectiveMaxSlots = survival.enforced ? survival.effectiveMaxSlots : configuredMaxSlots;
+    const sizeScale = survival.enforced ? survival.positionSizeScale : 1.0;
+    const freeSlots = Math.max(0, effectiveMaxSlots - this.slots.length);
+    const configuredFreeSlots = Math.max(1, configuredMaxSlots - this.slots.length);
+
+    if (canExecute && !sitOutEval.isSitOut && survival.enforced && effectiveMaxSlots < configuredMaxSlots && entryCandidates.length > freeSlots) {
+      for (const skipped of entryCandidates.slice(freeSlots)) {
+        extraBlocked.push({
+          candidate: skipped.cand,
+          blockReason: `SURVIVAL_GUARD:${survival.posture}`,
+          barTimeSec: skipped.cand.barTimeSec,
+        });
+      }
+    }
+
+    // Learning Level 1, 2 & 3: Record blocked/shadow signals (using each ticker's closed bar time) & run periodic learning cycle
+    const fallbackClosedBarSec = this.snapshots.get(this.inspectedSymbol)?.lastClosedTime || maxClosedBarSec;
+    if (canExecute && fallbackClosedBarSec > 0) {
       void this.learning.recordBlockedSignals({
         exchange: this.exchange.exchangeName,
-        barTimeSec: latestClosedBarSec,
+        barTimeSec: fallbackClosedBarSec,
         macro: this.macroState,
         candidates: newRadar,
+        extraBlocked,
       });
     }
-    void this.learning.runPeriodicCycle(this.cfg, (patch) => this.updateRuntimeSettings(patch));
+    void this.learning.runPeriodicCycle(this.cfg, (patch) => this.updateRuntimeSettings(patch), {
+      exchange: this.exchange.exchangeName,
+      symbols: Array.from(this.snapshots.keys()),
+      benchmarkSymbol: this.benchmarkSymbol,
+      slPct: disasterSlPct,
+      fallbackSnapshots: this.snapshots,
+      benchmarkFallback15m: this.benchmark15m,
+    });
 
-    // 3. Allocate Free Slots if Entries Ready & Allowed
-    const maxSlots = this.getMaxSlots();
-    const freeSlots = maxSlots - this.slots.length;
-    if (canExecute && freeSlots > 0 && !sitOutEval.isSitOut && entryCandidates.length > 0) {
-      entryCandidates.sort((a, b) => b.score - a.score);
+    if (canExecute && freeSlots > 0 && sizeScale > 0 && !sitOutEval.isSitOut && entryCandidates.length > 0) {
       for (const ch of entryCandidates.slice(0, freeSlots)) {
-        const currentFree = maxSlots - this.slots.length;
-        if (currentFree <= 0) break;
+        const currentEffFree = effectiveMaxSlots - this.slots.length;
+        if (currentEffFree <= 0) break;
         const availCash = this.getAvailableBuyCash();
-        const alloc = availCash / currentFree;
+        // Divide by configuredFreeSlots (not effectiveMaxSlots) so shrinking slots never enlarges per-slot bet size
+        const alloc = (availCash / Math.max(1, configuredMaxSlots - this.slots.length, configuredFreeSlots - entryCandidates.indexOf(ch))) * sizeScale;
         if (alloc < 5) break;
         await this.executeEntrySlot(ch.sym, ch.price, alloc, ch.score, ch.cand);
       }
@@ -1263,12 +1403,15 @@ export class MaFanPortfolioStrategy implements IStrategy {
     const start = Math.max(200, end - 30);
     const st: CoinSetupState = {
       hadBottomFan: false,
+      fanBarTime: 0,
       fanExpiryBarTime: 0,
       waitingPullback: false,
       pullbackExpiryBarTime: 0,
       waitFromBarTime: 0,
       bottomLow: Infinity,
     };
+    let fanStartIdx = -1;
+    let waitFromIdx = -1;
     for (let idx = start; idx <= end; idx++) {
       const barTime = ind.c15[idx]!.time;
       const m4 = ind.m4[idx]!;
@@ -1280,14 +1423,16 @@ export class MaFanPortfolioStrategy implements IStrategy {
       const isBottomFan = m4 < m8 && m8 < m16 && m16 < m25 && m25 < m75 && m75 < m200;
       if (isBottomFan) {
         st.hadBottomFan = true;
+        st.fanBarTime = barTime;
         st.fanExpiryBarTime = barTime + 20 * 900;
+        fanStartIdx = idx;
         st.bottomLow = Math.min(st.bottomLow, ind.c15[idx]!.low);
       }
-      if (barTime > st.fanExpiryBarTime && !st.waitingPullback) {
+      if (st.hadBottomFan && idx - fanStartIdx > 20 && !st.waitingPullback) {
         st.hadBottomFan = false;
         st.bottomLow = Infinity;
       }
-      if (st.waitingPullback && (barTime >= st.pullbackExpiryBarTime || m8 < m16)) {
+      if (st.waitingPullback && (idx - waitFromIdx >= 12 || m8 < m16)) {
         st.waitingPullback = false;
       }
       if (idx > 0 && !st.waitingPullback && st.hadBottomFan && ind.m8[idx - 1]! <= ind.m16[idx - 1]! && m8 > m16) {
@@ -1295,6 +1440,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
         const macdOk = (ind.macdHist15[idx] ?? 0) > (ind.macdHist15[idx - 1] ?? 0);
         if (rsiOk && macdOk) {
           st.waitingPullback = true;
+          waitFromIdx = idx;
           st.waitFromBarTime = barTime;
           st.pullbackExpiryBarTime = barTime + 12 * 900;
         }
@@ -1680,8 +1826,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
     const quoteAsset = isAlpaca ? "USD" : (this.symbolInfo.quoteAsset || "USDT");
 
     const maxSlots = this.getMaxSlots();
+    const survival = this.latestSurvival;
+    const effMaxSlots = survival?.enforced ? survival.effectiveMaxSlots : maxSlots;
     let botActionCode = "SCANNING_PORTFOLIO";
-    let botActionTitle = `🔭 สแกนหาจังหวะ MA-Fan (${this.slots.length}/${maxSlots} Slots)`;
+    let botActionTitle = `🔭 สแกนหาจังหวะ MA-Fan (${this.slots.length}/${effMaxSlots} Slots)`;
     let botActionReason = this.macroState.reason;
 
     if (this.isPaused) {
@@ -1692,18 +1840,32 @@ export class MaFanPortfolioStrategy implements IStrategy {
       botActionCode = "MARKET_CLOSED";
       botActionTitle = "🇺🇸 ตลาด US ปิดทำการ (Monitoring)";
       botActionReason = `เฝ้าระวังพอร์ต ${this.slots.length}/${maxSlots} ช่อง | ${this.macroState.reason}`;
+    } else if (survival?.enforced && survival.posture === "CAPITAL_PRESERVATION") {
+      botActionCode = "SURVIVAL_CAPITAL_PRESERVATION";
+      botActionTitle = `🔴 Survival Pause (Capital Preservation)`;
+      botActionReason = `หยุดเปิดไม้ใหม่ชั่วคราว (${survival.reasons.join(", ")}) — เฝ้าจุดขาย Slot ที่ถืออยู่ปกติ`;
     } else if (this.macroState.isSitOut) {
       botActionCode = "MACRO_SIT_OUT";
       botActionTitle = `🛡️ Macro Sit-Out (${this.macroState.benchmarkSymbol})`;
       botActionReason = `งดเข้า Slot ใหม่ชั่วคราว (${this.macroState.reason}) — เฝ้าจุดขาย Slot ที่ถืออยู่ปกติ`;
-    } else if (this.slots.length >= maxSlots) {
+    } else if (this.slots.length >= effMaxSlots) {
       botActionCode = "FULL_ALLOCATION";
-      botActionTitle = `✅ เต็มพอร์ต ${maxSlots}/${maxSlots} Slots`;
-      botActionReason = "ถือครบ 3 ช่องแล้ว กำลังติดตาม TP1 EMA200 / Lock BE / Full Bullish Fan แบบเรียลไทม์";
+      botActionTitle =
+        effMaxSlots < maxSlots
+          ? `🛡️ Survival Cap ${this.slots.length}/${effMaxSlots} (${survival?.posture})`
+          : `✅ เต็มพอร์ต ${maxSlots}/${maxSlots} Slots`;
+      botActionReason =
+        effMaxSlots < maxSlots
+          ? `โหมด ${survival?.posture}: จำกัด ${effMaxSlots}/${maxSlots} ช่อง (${survival?.reasons.join(", ")})`
+          : `ถือครบ ${maxSlots} ช่องแล้ว กำลังติดตาม TP1 EMA200 / Lock BE / Full Bullish Fan แบบเรียลไทม์`;
     } else {
       const readyCount = this.radarList.filter((r) => r.stage === "PULLBACK_READY").length;
       const waitCount = this.radarList.filter((r) => r.stage === "WAITING_PULLBACK").length;
-      botActionReason = `พร้อมเข้า ${readyCount} ตัว • รอย่อ EMA4 ${waitCount} ตัว • Universe ${this.macroState.universeCount} ตัว • ${this.macroState.reason}`;
+      const survPrefix =
+        survival?.enforced && survival.posture !== "NORMAL"
+          ? `🛡️ ${survival.posture} (${effMaxSlots} slots • ${(survival.positionSizeScale * 100).toFixed(0)}% size) • `
+          : "";
+      botActionReason = `${survPrefix}พร้อมเข้า ${readyCount} ตัว • รอย่อ EMA4 ${waitCount} ตัว • Universe ${this.macroState.universeCount} ตัว • ${this.macroState.reason}`;
     }
 
     const tickData = {
@@ -1750,8 +1912,11 @@ export class MaFanPortfolioStrategy implements IStrategy {
         code: botActionCode,
         title: botActionTitle,
         reason: botActionReason,
-        trigger: `${this.slots.length}/${maxSlots} Slots • Cash $${freeCash.toFixed(0)}`,
-        statusType: this.isPaused || this.isMarketClosed ? "warning" : (this.macroState.isSitOut ? "warning" : "success"),
+        trigger: `${this.slots.length}/${effMaxSlots} Slots • Cash $${freeCash.toFixed(0)}`,
+        statusType:
+          this.isPaused || this.isMarketClosed || this.macroState.isSitOut || (survival?.enforced && survival.posture !== "NORMAL")
+            ? "warning"
+            : "success",
       },
       portfolio: {
         maxSlots,
@@ -1764,6 +1929,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
         slots: slotTelemetries,
         radar: this.radarList.slice(0, 15),
         macro: this.macroState,
+        survival: this.latestSurvival,
         inspectedSymbol: inspectedSym,
         inspectedEmas:
           inspectedSlot?.emas ||

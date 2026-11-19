@@ -868,6 +868,14 @@ async function main(): Promise<void> {
       grid.clearLearningCooldown
         ? grid.clearLearningCooldown(sym)
         : Promise.resolve({ success: false, symbol: sym }),
+    onRunLearningShadowScan: () =>
+      grid.runLearningShadowScan
+        ? grid.runLearningShadowScan()
+        : Promise.resolve(null),
+    onReconcileLearningJournal: () =>
+      grid.reconcileLearningJournal
+        ? grid.reconcileLearningJournal()
+        : Promise.resolve({ updatedTrades: 0, updatedSymbols: 0 }),
     onPauseBot: (paused) => grid.setPaused(paused),
     getIsPaused: () => grid.getIsPaused(),
     onCancelAll: () => grid.cancelAllOrdersUser(),
@@ -926,6 +934,7 @@ async function main(): Promise<void> {
       grid.reloadState();
       await grid.refreshWalletBalances();
       await grid.reconcileInventory?.(true);
+      await grid.reconcileLearningJournal?.().catch(() => {});
       grid.saveState(true);
       grid.emitTelemetryTick();
       return res;

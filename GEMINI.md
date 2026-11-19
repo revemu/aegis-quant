@@ -9988,3 +9988,23 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - แก้ `renderTmRounds()` และ `renderTmTrades()` ให้ใช้ `r.symbol` / `o.symbol` จริง (`PG`), แสดง `fillPrice`, รองรับค้นหาด้วยชื่อหุ้น, และแก้ป้าย `TP1` ให้แสดง `EMA 200` เมื่ออยู่ในโหมด Portfolio
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.94`** ใน `package.json`, `src/version.ts` และ `public/index.html` (`style.css?v=0.3.0.94`, `app.js?v=0.3.0.94`)
+
+---
+
+## 339. v0.3.0.95 — Survival-First Learning Engine v2 & Alpaca Learning/Setup Fixes (`src/learning-engine.ts`, `src/strategy/ma-fan-portfolio/*`, `src/exchange/alpaca/feed.ts`, `src/pg-store.ts`, `src/server.ts`, `src/index.ts`, `public/*`)
+
+- **Alpaca Learning & Setup Integrity Fixes (`src/exchange/alpaca/feed.ts`, `src/strategy/ma-fan-portfolio/universe.ts`, `src/strategy/ma-fan-portfolio/index.ts`)**:
+  - **Bar-Index Setup Expiry (`countClosedBarsSince`)**: เปลี่ยนอายุ `hadBottomFan` (20 แท่ง) และ `waitingPullback` (12 แท่ง) จากเวลาจริง (`barTime + 20 * 900`) เป็นจำนวนแท่งปิดจริง ป้องกัน Setup หุ้น US หมดอายุ 100% ทุกครั้งที่ตลาดปิดข้ามคืน (17.5 ชม.) หรือเสาร์-อาทิตย์ (65.5 ชม.)
+  - **Alpaca Regular Trading Hours (RTH) Filter (`isUsRegularTradingHoursBar`)**: กรองแท่ง `1m`/`5m`/`15m` (`09:30–16:00 ET`) และ `1h` (`09:00–16:00 ET`) แบบ DST-aware ทั้งตอนดึงจาก Alpaca API และตอนโหลด/รวมแท่งจาก PostgreSQL `market_candles` เพื่อกันแท่งหลังปิดตลาดวอลุ่มต่ำ (`21:00–21:45 UTC`) ไม่ให้ทำ EMA/RSI/VolR เพี้ยน
+  - **Expanded Blocked/Shadow Signal Recording**: ใช้ `barTimeSec` รายตัว, จับสัญญาณ `FILTER:8x16_WeakMom`, ฟิลเตอร์ใกล้ EMA4 (`distanceToEma4Pct <= 0.6`), `SHADOW_BEAR_MACRO` (แม้ปิด `portfolioSitOutMode="off"`), และ `SURVIVAL_GUARD:*`
+- **Journal Fill Reconciliation (`src/learning-engine.ts`, `src/pg-store.ts`, `src/index.ts`, `src/server.ts`)**:
+  - เพิ่ม `reconcileJournalFromOrders` & `updateLearningJournalTradeFill` และ `POST /api/learning/reconcile` (พร้อมรันอัตโนมัติตอนบูตและใน `onSyncExchangeTrades`) เพื่อซิงค์ `trade_learning_journal` และ `symbol_learning_state` ให้ตรงกับรอบเทรดจริง (แก้ข้อมูลค้าง เช่น `PG` เดิมที่โชว์ `+$312.31` เป็นยอดซิงค์จริง `-$3.17`)
+- **Rolling Shadow Walk-Forward Learner (`LearningEngine.runShadowWalkForward`)**:
+  - สแกนแท่ง `15m`+`1h` ย้อนหลัง (~800 แท่ง/ตัว) จาก `market_candles` (หรือ RAM snapshot) แบบ causal รันได้ทันทีตอนบูต, ทุก 6 ชม., และผ่านปุ่ม/API `POST /api/learning/run-shadow` เพื่อคำนวณคะแนนคุณภาพรายตัว (`topProvenSymbols` +5..+10 / `riskyWhipsawSymbols` -10..-20 & `avoidInDefensive`), Expectancy ช่วง Bear Macro & Low Breadth, และผสม Real (3x) + Shadow Win-MAE P80 เพื่อเร่งจูน `portfolioDisasterSlPct` ในกรอบ `[2.5%, 5.0%]`
+- **4-Tier Adaptive Market-Survival Guard (`LearningEngine.evaluateSurvivalPosture`)**:
+  - ประเมินระดับ **`NORMAL` / `CAUTIOUS` / `DEFENSIVE` / `CAPITAL_PRESERVATION`** จาก Breadth, Benchmark 4H+1D, Consecutive Losses, Rolling Drawdown, Bear Macro Expectancy, และ Counterfactual Trap Rate
+  - บังคับใช้เมื่อ `isAutoTuneAllowed(cfg)` เป็นจริง (`effectiveMaxSlots <= configuredMaxSlots`, ลด `positionSizeScale` สูงสุดถึง Half-Size `0.5x` โดยหารด้วย `configuredFreeSlots` เพื่อไม่ให้เบิ้ลขนาดไม้, บังคับคัดตัวแข็งกว่าตลาด `RS`/`1hRSI`/`VolR`, และหยุดเปิดไม้ใหม่เมื่อเข้า `CAPITAL_PRESERVATION`)
+- **Learning Dashboard UI Upgrades (`public/index.html`, `public/style.css`, `public/app.js`)**:
+  - เพิ่ม Survival Mode Banner (`#lrSurvivalBanner`), ส่วน Shadow Walk-Forward & Proven/Risky Chips (`#lrShadowSection`), ปุ่ม `🔬 รัน Shadow Scan` / `🧹 ซิงค์ Journal` และอัปเดต Sidebar Learning Pulse Card (`#pfLearningCard`)
+- **Version Bump**:
+  - อัปเดตเวอร์ชันเป็น **`0.3.0.95`** ใน `package.json`, `src/version.ts` และ `public/index.html` (`style.css?v=0.3.0.95`, `app.js?v=0.3.0.95`)

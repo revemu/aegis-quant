@@ -1000,6 +1000,31 @@ export class PgStore {
     `;
   }
 
+  public async updateLearningJournalTradeFill(params: {
+    journalUid: string;
+    entryPrice: number;
+    exitPrice: number;
+    pnlQuote: number;
+    pnlPct: number;
+    holdMinutes: number;
+    exitReason?: string | null;
+  }): Promise<void> {
+    if (this.closed || !params.journalUid) return;
+    await this.sql`
+      UPDATE trade_learning_journal
+      SET
+        entry_price = ${Number(params.entryPrice)},
+        exit_price = ${Number(params.exitPrice)},
+        pnl_quote = ${Number(params.pnlQuote)},
+        pnl_pct = ${Number(params.pnlPct)},
+        hold_minutes = ${Number(params.holdMinutes)},
+        exit_reason = COALESCE(${params.exitReason ?? null}, exit_reason),
+        updated_at = ${Date.now()}
+      WHERE instance_key = ${this.instanceKey}
+        AND journal_uid = ${params.journalUid}
+    `;
+  }
+
   public async loadLearningJournal(
     recordType: "TRADE" | "BLOCKED_SIGNAL",
     status?: string,

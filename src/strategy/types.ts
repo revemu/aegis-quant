@@ -278,6 +278,8 @@ export interface IStrategy {
   getPortfolioRadarSnapshot?(): any;
   getLearningReport?(): Promise<any>;
   clearLearningCooldown?(symbol: string): Promise<{ success: boolean; symbol: string }>;
+  runLearningShadowScan?(): Promise<any>;
+  reconcileLearningJournal?(): Promise<any>;
 
   // Portfolio & Balances
   lastFlatCashTime?: number;

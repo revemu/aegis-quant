@@ -25,11 +25,13 @@ export interface SymbolIndicatorSnapshot {
 
 export interface CoinSetupState {
   hadBottomFan: boolean;
+  fanBarTime?: number;
   fanExpiryBarTime: number;
   waitingPullback: boolean;
   pullbackExpiryBarTime: number;
   waitFromBarTime: number;
   bottomLow: number;
+  lastCrossWeakBarTime?: number;
 }
 
 export type RadarStage =
@@ -59,6 +61,8 @@ export interface PortfolioRadarCandidate {
   distanceToEma4Pct: number;
   distanceToEma200Pct: number;
   filterNote?: string;
+  barTimeSec?: number;
+  shadowScoreAdj?: number;
 }
 
 export interface PortfolioSlotTelemetry {

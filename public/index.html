@@ -13,7 +13,7 @@
   <link
     href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap"
     rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=0.3.0.94" />
+  <link rel="stylesheet" href="style.css?v=0.3.0.95" />
   <!-- TradingView Lightweight Charts -->
   <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 </head>
@@ -3058,14 +3058,35 @@
             <p class="modal-sub" id="lrModalSubtitle">กำลังโหลดข้อมูลการเรียนรู้จาก PostgreSQL...</p>
           </div>
         </div>
-        <div style="display: flex; align-items: center; gap: 8px;">
+        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+          <button class="btn btn-secondary" id="lrBtnRunShadow" style="padding: 6px 12px; font-size: 12px;">🔬 รัน Shadow Scan</button>
+          <button class="btn btn-secondary" id="lrBtnReconcile" style="padding: 6px 12px; font-size: 12px;">🧹 ซิงค์ Journal</button>
           <button class="btn btn-secondary" id="lrBtnRefresh" style="padding: 6px 12px; font-size: 12px;">🔄 รีเฟรช</button>
           <button class="modal-close-btn" id="closeLearningModalBtn" title="Close modal">&times;</button>
         </div>
       </div>
 
       <div class="modal-body tm-modal-body" id="lrModalBody">
+        <div id="lrSurvivalBanner" class="lr-survival-banner" style="display: none;"></div>
         <div class="lr-kpi-grid" id="lrKpiGrid"></div>
+
+        <div class="lr-section" id="lrShadowSection">
+          <div class="lr-section-head">
+            <h3>🔬 Rolling Shadow Walk-Forward Learning (เรียนรู้ทันทีจากประวัติแท่ง 15m)</h3>
+            <span class="lr-meta-pill" id="lrShadowMetaBadge">ยังไม่มีข้อมูล Shadow</span>
+          </div>
+          <div class="lr-shadow-grid" id="lrShadowSummaryGrid"></div>
+          <div class="lr-two-col">
+            <div class="lr-list-box">
+              <div style="font-weight:700; color:#4ade80; font-size:12px;">🏆 Top Proven Symbols (สถิติดี ได้โบนัสคะแนน)</div>
+              <div id="lrShadowProvenBox" class="lr-chip-row"><span style="color:#64748b;">รอผลการสแกน...</span></div>
+            </div>
+            <div class="lr-list-box">
+              <div style="font-weight:700; color:#f87171; font-size:12px;">⚠️ High-Risk / Whipsaw Symbols (หลบเมื่อ Defensive)</div>
+              <div id="lrShadowRiskyBox" class="lr-chip-row"><span style="color:#64748b;">รอผลการสแกน...</span></div>
+            </div>
+          </div>
+        </div>
 
         <div class="lr-section">
           <div class="lr-section-head">
@@ -3353,7 +3374,7 @@
     </div>
   </div>
 
-  <script src="app.js?v=0.3.0.94"></script>
+  <script src="app.js?v=0.3.0.95"></script>
 </body>
 
 </html>

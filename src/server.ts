@@ -40,6 +40,8 @@ export interface DashboardServerOptions {
   getPortfolioRadar?: () => any;
   onGetLearningReport?: () => Promise<any>;
   onClearLearningCooldown?: (symbol: string) => Promise<{ success: boolean; symbol: string }>;
+  onRunLearningShadowScan?: () => Promise<any>;
+  onReconcileLearningJournal?: () => Promise<any>;
   maxCandles?: number;
 }
 
@@ -842,6 +844,44 @@ export class DashboardServer {
           res.end(JSON.stringify({ success: false, error: (e as Error).message }));
         }
       });
+      return;
+    }
+
+    if (pathname === "/api/learning/run-shadow" && req.method === "POST") {
+      if (!this.opts.onRunLearningShadowScan) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, message: "Shadow learning scan is available in Portfolio mode." }));
+        return;
+      }
+      this.opts
+        .onRunLearningShadowScan()
+        .then((summary) => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: Boolean(summary), summary }));
+        })
+        .catch((err: any) => {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, error: (err as Error).message }));
+        });
+      return;
+    }
+
+    if (pathname === "/api/learning/reconcile" && req.method === "POST") {
+      if (!this.opts.onReconcileLearningJournal) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, message: "Journal reconcile is available in Portfolio mode." }));
+        return;
+      }
+      this.opts
+        .onReconcileLearningJournal()
+        .then((result) => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: true, ...result }));
+        })
+        .catch((err: any) => {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, error: (err as Error).message }));
+        });
       return;
     }
 

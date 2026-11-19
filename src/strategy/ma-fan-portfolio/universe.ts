@@ -2,7 +2,7 @@ import type { Candle } from "../../market-structure.js";
 import type { Config } from "../../config.js";
 import { calcEMA } from "../ma-fan/ribbon.js";
 import { calcMACD, calcRSI } from "../ma-fan/exhaustion.js";
-import { fetchAlpacaBars, fetchAlpacaMultiBars, fetchAlpacaMultiSnapshots, intervalToSeconds, normalizeStockSymbol } from "../../exchange/alpaca/feed.js";
+import { fetchAlpacaBars, fetchAlpacaMultiBars, fetchAlpacaMultiSnapshots, intervalToSeconds, isUsRegularTradingHoursBar, normalizeStockSymbol } from "../../exchange/alpaca/feed.js";
 import { getActiveBinanceTradingSymbols } from "../../exchange/binance/client.js";
 import { STABLE_TOKENS } from "../../backtest-service.js";
 import { isSyntheticOrStock } from "../../pair-rotator.js";
@@ -208,9 +208,10 @@ export async function fetchPortfolioUniverseAndBenchmark(opts: {
 
       if (pg && missingInRam.length > 0) {
         try {
-          const dbBatch = await pg.loadMarketCandlesBatch("alpaca", missingInRam, interval, targetLimit);
+          const dbBatch = await pg.loadMarketCandlesBatch("alpaca", missingInRam, interval, Math.ceil(targetLimit * 1.25));
           for (const [sym, bars] of dbBatch.entries()) {
-            if (bars.length > 0) cachedMap.set(sym, bars);
+            const rthBars = bars.filter((c) => isUsRegularTradingHoursBar(c.time, interval)).slice(-targetLimit);
+            if (rthBars.length > 0) cachedMap.set(sym, rthBars);
           }
         } catch (err) {
           opts.log?.(`⚠️ PG candle batch read (${interval}) failed: ${(err as Error).message}`);
@@ -264,7 +265,9 @@ export async function fetchPortfolioUniverseAndBenchmark(opts: {
       for (const sym of allSyms) {
         const prev = cachedMap.get(sym) || [];
         const incoming = warmFetched.get(sym) || coldFetched.get(sym) || [];
-        const merged = mergeCandles(prev, incoming, targetLimit);
+        const merged = mergeCandles(prev, incoming)
+          .filter((c) => isUsRegularTradingHoursBar(c.time, interval))
+          .slice(-targetLimit);
         mergedOut.set(sym, merged);
         queueCandleChanges("alpaca", sym, interval, prev, incoming);
       }

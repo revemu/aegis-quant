@@ -1465,6 +1465,8 @@
 
       const s = rep.summary || {};
       const bs = rep.blockedSignals || {};
+      const surv = rep.survival || null;
+      const shad = rep.shadowLearning || null;
       const evalTotal = Number(bs.evaluatedTotal || 0);
       const pendingEval = Number(bs.pendingEvaluation || 0);
       const cds = Array.isArray(rep.activeCooldowns) ? rep.activeCooldowns.length : 0;
@@ -1473,27 +1475,45 @@
       const breakdown = Array.isArray(bs.breakdown) ? bs.breakdown : [];
       const topSaved = breakdown.slice().sort((a, b) => (b.savedPct || 0) - (a.savedPct || 0))[0];
 
+      const postureIconMap = {
+        NORMAL: "🟢",
+        CAUTIOUS: "🟡",
+        DEFENSIVE: "🟠",
+        CAPITAL_PRESERVATION: "🔴",
+      };
+      const posture = surv?.posture || "NORMAL";
+      const postureIcon = postureIconMap[posture] || "🟢";
+
       if (elPill) {
-        elPill.textContent = rep.autoTuneEffective ? `🟢 Auto-Tune (${rep.autoTuneMode || "on"})` : "🟡 Observer";
+        if (surv && posture !== "NORMAL") {
+          elPill.textContent = `${postureIcon} ${posture}${surv.enforced ? "" : " (Obs)"}`;
+        } else {
+          elPill.textContent = rep.autoTuneEffective ? `🟢 Auto-Tune (${rep.autoTuneMode || "on"})` : "🟡 Observer";
+        }
       }
       if (elGrid) {
-        const closedTxt = closed > 0 ? `${closed} ไม้ (WR ${Number(s.winRatePct || 0).toFixed(0)}%)` : `0/20 ไม้ (รอเก็บครบ)`;
-        const blockedTxt = evalTotal > 0 ? `${evalTotal} เฉลย (รอ ${pendingEval})` : `รอตรวจ ${pendingEval} รายการ`;
+        const survTxt = surv
+          ? `${postureIcon} ${posture} (${surv.effectiveMaxSlots}/${surv.configuredMaxSlots} • ${Math.round((surv.positionSizeScale ?? 1) * 100)}%)`
+          : (rep.autoTuneEffective ? "🟢 Active" : "🟡 Observer");
+        const shadowTxt = shad && shad.totalSetups > 0
+          ? `${shad.totalSetups} setups (${Number(shad.winRatePct || 0).toFixed(0)}% WR)`
+          : "กำลังสแกนแท่ง 15m";
+        const blockedTxt = evalTotal > 0 ? `${evalTotal} เฉลย (รอ ${pendingEval})` : `รอตรวจ ${pendingEval}`;
         const filterTxt = topSaved
-          ? `${topSaved.reason.replace("FILTER:", "")} (${Number(topSaved.savedPct || 0).toFixed(0)}% กันพลาด)`
-          : "ยังไม่มีสถิติ";
+          ? ` • ${topSaved.reason.replace("FILTER:", "")} ${Number(topSaved.savedPct || 0).toFixed(0)}%`
+          : "";
         const slTxt = s.recommendedDisasterSlPct != null
-          ? `แนะนำ ${s.recommendedDisasterSlPct}%`
+          ? `แนะนำ ${s.recommendedDisasterSlPct}% (${closed}t)`
           : `${Number(s.currentDisasterSlPct || 3.5).toFixed(1)}% (จูน ${adjs} • พัก ${cds})`;
         elGrid.innerHTML = `
-          <div class="pf-learning-stat">สัญญาณบล็อก (4h)<strong>${blockedTxt}</strong></div>
-          <div class="pf-learning-stat">ฟิลเตอร์เด่น<strong>${filterTxt}</strong></div>
-          <div class="pf-learning-stat">เทรดปิด / SL Tune<strong>${closedTxt}</strong></div>
+          <div class="pf-learning-stat">โหมดเอาตัวรอด<strong>${survTxt}</strong></div>
+          <div class="pf-learning-stat">Shadow Walk-Fwd<strong>${shadowTxt}</strong></div>
+          <div class="pf-learning-stat">สัญญาณบล็อก (4h)<strong>${blockedTxt}${filterTxt}</strong></div>
           <div class="pf-learning-stat">SL / Cooldown<strong>${slTxt}</strong></div>
         `;
       }
       if (elFoot) {
-        elFoot.textContent = evalTotal > 0 || closed > 0
+        elFoot.textContent = evalTotal > 0 || closed > 0 || (shad && shad.totalSetups > 0)
           ? "🟢 กำลังเรียนรู้ต่อเนื่อง • คลิกดูตารางวิเคราะห์เต็ม ➔"
           : "⏳ กำลังสะสมข้อมูล 4 ชม. แรก • คลิกดูรายละเอียด ➔";
       }
@@ -9235,6 +9255,8 @@
   const elLearningModal = document.getElementById("learningModal");
   const elCloseLearningBtn = document.getElementById("closeLearningModalBtn");
   const elLrBtnRefresh = document.getElementById("lrBtnRefresh");
+  const elLrBtnRunShadow = document.getElementById("lrBtnRunShadow");
+  const elLrBtnReconcile = document.getElementById("lrBtnReconcile");
 
   function renderCounterfactualRows(rows, labelField, emptyText) {
     if (!Array.isArray(rows) || rows.length === 0) {
@@ -9260,7 +9282,12 @@
 
   async function loadLearningReportUI() {
     const elSub = document.getElementById("lrModalSubtitle");
+    const elSurv = document.getElementById("lrSurvivalBanner");
     const elKpis = document.getElementById("lrKpiGrid");
+    const elShadBadge = document.getElementById("lrShadowMetaBadge");
+    const elShadGrid = document.getElementById("lrShadowSummaryGrid");
+    const elShadProven = document.getElementById("lrShadowProvenBox");
+    const elShadRisky = document.getElementById("lrShadowRiskyBox");
     const elBlockedBody = document.getElementById("lrBlockedTbody");
     const elBreadthBody = document.getElementById("lrBreadthTbody");
     const elPendingBadge = document.getElementById("lrBlockedPendingBadge");
@@ -9274,7 +9301,9 @@
       const rep = await res.json();
       if (!rep.supported || !rep.postgresActive) {
         if (elSub) elSub.textContent = rep.message || "ต้องเปิดใช้งานโหมด MA-Fan Portfolio + PostgreSQL เพื่อดูรายงานนี้";
+        if (elSurv) elSurv.style.display = "none";
         if (elKpis) elKpis.innerHTML = "";
+        if (elShadGrid) elShadGrid.innerHTML = "";
         if (elBlockedBody) elBlockedBody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:#64748b;">ยังไม่รองรับในโหมดปัจจุบัน</td></tr>';
         if (elBreadthBody) elBreadthBody.innerHTML = "";
         return;
@@ -9285,11 +9314,48 @@
         elSub.textContent = `Instance: ${rep.instanceKey || "--"} • Mode: ${rep.autoTuneMode || "dry_run_only"} • ${tuneBadge}`;
       }
 
+      const surv = rep.survival || null;
+      if (elSurv) {
+        if (!surv) {
+          elSurv.style.display = "none";
+        } else {
+          const pClassMap = {
+            NORMAL: "posture-normal",
+            CAUTIOUS: "posture-cautious",
+            DEFENSIVE: "posture-defensive",
+            CAPITAL_PRESERVATION: "posture-critical",
+          };
+          const pIconMap = { NORMAL: "🟢", CAUTIOUS: "🟡", DEFENSIVE: "🟠", CAPITAL_PRESERVATION: "🔴" };
+          elSurv.className = `lr-survival-banner ${pClassMap[surv.posture] || "posture-normal"}`;
+          elSurv.style.display = "flex";
+          const modeLabel = surv.enforced ? "🛡️ ENFORCED (ป้องกันพอร์ตจริง)" : "👁️ OBSERVER (แนะนำเท่านั้น)";
+          const m = surv.metrics || {};
+          elSurv.innerHTML = `
+            <div class="lr-survival-top">
+              <strong style="font-size:13px; color:#f8fafc;">${pIconMap[surv.posture] || "🟢"} Survival Mode: ${surv.posture}</strong>
+              <span class="lr-meta-pill">${modeLabel}</span>
+            </div>
+            <div class="lr-survival-meta">
+              <span><strong>Slots:</strong> ${surv.effectiveMaxSlots}/${surv.configuredMaxSlots}</span>
+              <span><strong>Size Scale:</strong> ${Math.round((surv.positionSizeScale ?? 1) * 100)}%</span>
+              <span><strong>Min RS:</strong> ${Number(surv.minRelStrength24h ?? -1).toFixed(1)}%</span>
+              <span><strong>Min 1hRSI:</strong> ${surv.minRsi1h ?? 40}</span>
+              <span><strong>Min VolR:</strong> ${Number(surv.minBuyVolRatio12 ?? 1.3).toFixed(1)}</span>
+              <span><strong>Risky Avoid:</strong> ${surv.blockRiskySymbols ? "ON" : "OFF"}</span>
+              <span><strong>Breadth:</strong> ${m.breadthPct ?? "--"}%</span>
+              <span><strong>Streak/DD:</strong> ${m.recentConsecutiveLosses ?? 0}L / ${m.rollingDrawdownPct ?? 0}% DD</span>
+            </div>
+            <div style="color:#94a3b8; font-size:11.5px;">สาเหตุ: ${(Array.isArray(surv.reasons) ? surv.reasons : []).join(" • ") || "--"}</div>
+          `;
+        }
+      }
+
       const s = rep.summary || {};
       const winCol = Number(s.winRatePct || 0) >= 50 ? "#4ade80" : "#fbbf24";
       const pnlVal = Number(s.totalPnlQuote || 0);
+      const combMaeTxt = s.combinedWinMaeP80Pct != null ? `Combined P80: ${s.combinedWinMaeP80Pct}%` : `WinMAE P80: ${s.winMaeP80Pct != null ? `${s.winMaeP80Pct}%` : "รอข้อมูล"}`;
       const recSlTxt = s.recommendedDisasterSlPct != null
-        ? `${s.recommendedDisasterSlPct}% (WinMAE P80: ${s.winMaeP80Pct ?? "--"}%)`
+        ? `แนะนำ ${s.recommendedDisasterSlPct}% (${combMaeTxt})`
         : `ต้องการอีก ${s.samplesNeededForSlTune ?? 20} ไม้`;
       if (elKpis) {
         elKpis.innerHTML = `
@@ -9306,7 +9372,7 @@
           <div class="lr-kpi-card">
             <div class="lr-kpi-label">📉 Avg MAE / 📈 Avg MFE</div>
             <div class="lr-kpi-val" style="font-size:15px;"><span style="color:#f87171;">${Number(s.avgMaePct || 0).toFixed(2)}%</span> / <span style="color:#4ade80;">+${Number(s.avgMfePct || 0).toFixed(2)}%</span></div>
-            <div class="lr-kpi-sub">WinMAE P80: ${s.winMaeP80Pct != null ? `${s.winMaeP80Pct}%` : "รอข้อมูลเพิ่ม"}</div>
+            <div class="lr-kpi-sub">${combMaeTxt}</div>
           </div>
           <div class="lr-kpi-card">
             <div class="lr-kpi-label">🛡️ Disaster SL ปัจจุบัน</div>
@@ -9314,6 +9380,57 @@
             <div class="lr-kpi-sub">${recSlTxt}</div>
           </div>
         `;
+      }
+
+      const shad = rep.shadowLearning || null;
+      if (elShadBadge) {
+        elShadBadge.textContent = shad
+          ? `${shad.symbolsAnalyzed || 0} ตัว • ~${shad.barsPerSymbolAvg || 0} แท่ง 15m • ${new Date(shad.updatedAt).toLocaleTimeString()}`
+          : "รอสแกนแท่งประวัติศาสตร์";
+      }
+      if (elShadGrid) {
+        if (!shad) {
+          elShadGrid.innerHTML = '<div class="lr-kpi-card" style="grid-column:1/-1; color:#94a3b8; font-size:12px;">ยังไม่มีผล Shadow Walk-Forward — คลิก "🔬 รัน Shadow Scan" ด้านบนเพื่อวิเคราะห์จากแท่งเทียนย้อนหลังทันที</div>';
+        } else {
+          const sWrCol = Number(shad.winRatePct || 0) >= 50 ? "#4ade80" : "#fbbf24";
+          const sAvgCol = Number(shad.avgPnlPct || 0) >= 0 ? "#4ade80" : "#f87171";
+          const bearCol = Number(shad.bearMacroAvgPnlPct || 0) >= 0 ? "#4ade80" : "#f87171";
+          const brCol = Number(shad.lowBreadthAvgPnlPct || 0) >= 0 ? "#4ade80" : "#f87171";
+          elShadGrid.innerHTML = `
+            <div class="lr-kpi-card">
+              <div class="lr-kpi-label">🔬 Shadow Setups / WR</div>
+              <div class="lr-kpi-val" style="color:${sWrCol};">${Number(shad.winRatePct || 0).toFixed(1)}%</div>
+              <div class="lr-kpi-sub">${shad.wins || 0}W / ${shad.losses || 0}L (${shad.totalSetups || 0} • PF ${shad.profitFactor ?? "--"})</div>
+            </div>
+            <div class="lr-kpi-card">
+              <div class="lr-kpi-label">📊 Avg Shadow PnL</div>
+              <div class="lr-kpi-val" style="color:${sAvgCol};">${Number(shad.avgPnlPct || 0) >= 0 ? "+" : ""}${Number(shad.avgPnlPct || 0).toFixed(2)}%</div>
+              <div class="lr-kpi-sub">WinMAE P80: ${shad.winMaeP80Pct != null ? `${shad.winMaeP80Pct}%` : "--"}</div>
+            </div>
+            <div class="lr-kpi-card">
+              <div class="lr-kpi-label">🐻 Bear Macro Expectancy</div>
+              <div class="lr-kpi-val" style="color:${bearCol};">${Number(shad.bearMacroAvgPnlPct || 0) >= 0 ? "+" : ""}${Number(shad.bearMacroAvgPnlPct || 0).toFixed(2)}%</div>
+              <div class="lr-kpi-sub">${shad.bearMacroSetups || 0} setups (WR ${Number(shad.bearMacroWinRatePct || 0).toFixed(0)}%)</div>
+            </div>
+            <div class="lr-kpi-card">
+              <div class="lr-kpi-label">📉 Breadth &lt;30% Expectancy</div>
+              <div class="lr-kpi-val" style="color:${brCol};">${Number(shad.lowBreadthAvgPnlPct || 0) >= 0 ? "+" : ""}${Number(shad.lowBreadthAvgPnlPct || 0).toFixed(2)}%</div>
+              <div class="lr-kpi-sub">${shad.lowBreadthSetups || 0} setups (WR ${Number(shad.lowBreadthWinRatePct || 0).toFixed(0)}%)</div>
+            </div>
+          `;
+        }
+      }
+      if (elShadProven) {
+        const list = Array.isArray(shad?.topProvenSymbols) ? shad.topProvenSymbols : [];
+        elShadProven.innerHTML = list.length === 0
+          ? '<span style="color:#64748b;">ยังไม่พบตัวเด่น (>= 3 setups & Avg PnL > 0)</span>'
+          : list.map((p) => `<span class="lr-chip-good">${p.symbol} • ${p.winRatePct}% (${p.avgPnlPct >= 0 ? "+" : ""}${p.avgPnlPct}%) ${p.scoreAdj > 0 ? `+${p.scoreAdj}` : ""}</span>`).join("");
+      }
+      if (elShadRisky) {
+        const list = Array.isArray(shad?.riskyWhipsawSymbols) ? shad.riskyWhipsawSymbols : [];
+        elShadRisky.innerHTML = list.length === 0
+          ? '<span style="color:#64748b;">ยังไม่พบหุ้น/เหรียญเสี่ยงสูง</span>'
+          : list.map((p) => `<span class="lr-chip-bad">${p.symbol} • ${p.winRatePct}% (${p.avgPnlPct}%) ${p.scoreAdj || 0}${p.avoidInDefensive ? " 🚫" : ""}</span>`).join("");
       }
 
       const bs = rep.blockedSignals || {};
@@ -9406,6 +9523,36 @@
   if (elBtnOpenLearning) elBtnOpenLearning.addEventListener("click", openLearningModal);
   if (elCloseLearningBtn) elCloseLearningBtn.addEventListener("click", closeLearningModal);
   if (elLrBtnRefresh) elLrBtnRefresh.addEventListener("click", loadLearningReportUI);
+  if (elLrBtnRunShadow) {
+    elLrBtnRunShadow.addEventListener("click", async () => {
+      const origTxt = elLrBtnRunShadow.textContent;
+      elLrBtnRunShadow.disabled = true;
+      elLrBtnRunShadow.textContent = "⏳ กำลังสแกน...";
+      try {
+        await fetch(`${API_BASE}/api/learning/run-shadow`, { method: "POST" });
+        await loadLearningReportUI();
+        await refreshPortfolioLearningCard(true);
+      } finally {
+        elLrBtnRunShadow.disabled = false;
+        elLrBtnRunShadow.textContent = origTxt;
+      }
+    });
+  }
+  if (elLrBtnReconcile) {
+    elLrBtnReconcile.addEventListener("click", async () => {
+      const origTxt = elLrBtnReconcile.textContent;
+      elLrBtnReconcile.disabled = true;
+      elLrBtnReconcile.textContent = "⏳ กำลังซิงค์...";
+      try {
+        await fetch(`${API_BASE}/api/learning/reconcile`, { method: "POST" });
+        await loadLearningReportUI();
+        await refreshPortfolioLearningCard(true);
+      } finally {
+        elLrBtnReconcile.disabled = false;
+        elLrBtnReconcile.textContent = origTxt;
+      }
+    });
+  }
   if (elLearningModal) {
     elLearningModal.addEventListener("click", (e) => {
       if (e.target === elLearningModal) closeLearningModal();
