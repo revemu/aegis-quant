@@ -6540,6 +6540,8 @@
         "cfg_portfolioBlacklist",
         Array.isArray(data.portfolioBlacklist) ? data.portfolioBlacklist.join(", ") : "",
       );
+      setVal("cfg_portfolioCapitalUsagePct", data.portfolioCapitalUsagePct ?? 50);
+      setVal("cfg_portfolioPullbackMode", data.portfolioPullbackMode || "EMA8_HOLD");
       setVal("cfg_portfolioTp1TargetMode", data.portfolioTp1TargetMode || "EMA200");
       setVal("cfg_portfolioDisasterSlPct", data.portfolioDisasterSlPct ?? 3.5);
       setVal("cfg_portfolioSitOutMode", data.portfolioSitOutMode || "dual");
@@ -6875,6 +6877,8 @@
       portfolioMaxSlots: parseInt(document.getElementById("cfg_portfolioMaxSlots")?.value || "3", 10) || 3,
       portfolioUniversePreset: document.getElementById("cfg_portfolioUniversePreset")?.value || "us_top49",
       portfolioMaxBudgetUsd: parseFloat(document.getElementById("cfg_portfolioMaxBudgetUsd")?.value || "0") || 0,
+      portfolioCapitalUsagePct: Math.min(100, Math.max(10, parseFloat(document.getElementById("cfg_portfolioCapitalUsagePct")?.value || "50") || 50)),
+      portfolioPullbackMode: document.getElementById("cfg_portfolioPullbackMode")?.value || "EMA8_HOLD",
       portfolioRankBy: document.getElementById("cfg_portfolioRankBy")?.value || "COMPOSITE_QUALITY",
       portfolioCustomWhitelist: (document.getElementById("cfg_portfolioCustomWhitelist")?.value || "")
         .split(/[,\s]+/)
@@ -9316,6 +9320,8 @@
 
   function buildActiveTechParamChipsHtml(p) {
     if (!p || typeof p !== "object") return "";
+    const mmPct = Number.isFinite(Number(p.portfolioCapitalUsagePct)) ? Number(p.portfolioCapitalUsagePct) : 50;
+    const pb = p.portfolioPullbackMode || "EMA8_HOLD";
     const tp = p.portfolioTp1TargetMode || "EMA200";
     const sl = Number(p.portfolioDisasterSlPct ?? 3.5);
     const slTxt = Number.isFinite(sl) ? Number(sl.toFixed(2)) : 3.5;
@@ -9325,6 +9331,8 @@
     const macro = String(p.portfolioSitOutMode || "dual").toUpperCase();
     const chipStyle = "padding:2px 8px; border-radius:999px; background:rgba(15,23,42,0.75); border:1px solid rgba(148,163,184,0.25); color:#e2e8f0;";
     return [
+      `MM: <b>${mmPct}%</b>`,
+      `Entry: <b>${pb}</b>`,
       `TP1: <b>${tp}</b>`,
       `Disaster SL: <b>${slTxt}%</b>`,
       `Buy VolRatio: <b>&ge;${volR}x</b>`,
@@ -9337,6 +9345,7 @@
   function formatLearningAdjustment(a) {
     const labelMap = {
       portfolioTp1TargetMode: "TP1 Target Mode",
+      portfolioPullbackMode: "Pullback Entry Timing",
       portfolioDisasterSlPct: "Disaster SL %",
       portfolioMinBuyVolRatio: "Min Buy VolRatio",
       portfolioMinRelStrength24h: "Min RS 24h (%)",
@@ -9344,10 +9353,12 @@
       survival_posture: "Survival Posture",
     };
     const tpMap = { 25: "EMA25", 75: "EMA75", 200: "EMA200" };
+    const pbMap = { 4: "EMA4_TOUCH", 8: "EMA8_HOLD" };
     const postureMap = { 0: "NORMAL", 1: "CAUTIOUS", 2: "DEFENSIVE", 3: "CAPITAL_PRESERVATION" };
     const fmtVal = (v) => {
       const n = Math.round(Number(v));
       if (a.paramName === "portfolioTp1TargetMode") return tpMap[n] || String(v);
+      if (a.paramName === "portfolioPullbackMode") return pbMap[n] || String(v);
       if (a.paramName === "survival_posture") return postureMap[n] || String(v);
       return String(v);
     };

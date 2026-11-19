@@ -101,6 +101,7 @@ export interface SurvivalGuardDecision {
 
 export interface ShadowWalkForwardContext {
   tpMode?: string;
+  pullbackMode?: "EMA8_HOLD" | "EMA4_TOUCH";
   minVolRatio?: number;
   minRelStrength?: number;
   minRsi1h?: number;
@@ -143,6 +144,19 @@ function normalizeTsMs(ts: number): number {
   return ts < 1e12 ? Math.floor(ts * 1000) : Math.floor(ts);
 }
 
+/**
+ * Detects whether `curBar` opened or jumped on an abnormal gap relative to `prevBar`
+ * (overnight/session market opens > 1h apart or sharp intraday opening spikes).
+ */
+export function isGapInducedBar(prevBar: Candle | undefined, curBar: Candle): boolean {
+  if (!prevBar || prevBar.close <= 0) return false;
+  const gapOpenPct = ((curBar.open - prevBar.close) / prevBar.close) * 100;
+  const jumpClosePct = ((curBar.close - prevBar.close) / prevBar.close) * 100;
+  const isOvernightSession = curBar.time - prevBar.time > 3600;
+  if (isOvernightSession && (gapOpenPct >= 0.35 || jumpClosePct >= 0.65)) return true;
+  return gapOpenPct >= 0.5 || jumpClosePct >= 0.9;
+}
+
 function normalizeBlockReasonKey(rawReason: string | null | undefined): string {
   const first = (rawReason || "OTHER").split(",")[0]?.trim() || "OTHER";
   if (first === "MACRO_SIT_OUT" || first === "SHADOW_BEAR_MACRO" || first === "FILTER_FAIL") {
@@ -158,6 +172,7 @@ function normalizeBlockReasonKey(rawReason: string | null | undefined): string {
     if (detail.startsWith("RS")) return "FILTER:RS<-1%";
     if (detail.includes("Cooldown")) return "FILTER:Cooldown";
     if (detail.includes("8x16_WeakMom")) return "FILTER:8x16_WeakMom";
+    if (detail.startsWith("GAP_TRAP")) return "FILTER:GAP_TRAP";
     if (detail.includes("Survival")) return `FILTER:${detail}`;
   }
   return first;
@@ -287,6 +302,20 @@ export function decodeTpModeNumeric(num: number): TpModeName {
   return "EMA200";
 }
 
+export type PullbackModeName = "EMA8_HOLD" | "EMA4_TOUCH";
+
+function normalizePullbackMode(m?: string): PullbackModeName {
+  return m === "EMA4_TOUCH" ? "EMA4_TOUCH" : "EMA8_HOLD";
+}
+
+export function encodePullbackModeNumeric(m: string | undefined): number {
+  return m === "EMA4_TOUCH" ? 4 : 8;
+}
+
+export function decodePullbackModeNumeric(n: number): PullbackModeName {
+  return Math.round(Number(n)) === 4 ? "EMA4_TOUCH" : "EMA8_HOLD";
+}
+
 function tuneCfgFromConfig(cfg: Config): TuneCfg {
   return {
     sl: Math.max(1.5, Math.min(5.0, Number(cfg.portfolioDisasterSlPct || 3.5))),
@@ -294,11 +323,12 @@ function tuneCfgFromConfig(cfg: Config): TuneCfg {
     minRs: Number.isFinite(Number(cfg.portfolioMinRelStrength24h)) ? Number(cfg.portfolioMinRelStrength24h) : -1.0,
     minRsi1h: Number.isFinite(Number(cfg.portfolioMinRsi1h)) ? Number(cfg.portfolioMinRsi1h) : 40,
     tpMode: normalizeTpMode(cfg.portfolioTp1TargetMode),
+    pullbackMode: normalizePullbackMode(cfg.portfolioPullbackMode),
   };
 }
 
 function tuneCfgKey(t: TuneCfg): string {
-  return `${t.sl}|${t.minVolR}|${t.minRs}|${t.minRsi1h}|${t.tpMode}`;
+  return `${t.sl}|${t.minVolR}|${t.minRs}|${t.minRsi1h}|${t.tpMode}|${t.pullbackMode}`;
 }
 
 interface TuningEvent {
@@ -307,12 +337,17 @@ interface TuningEvent {
   barIdx: number;
   timeSec: number;
   entryPrice: number;
+  entryPriceEma8?: number;
+  ema8HoldOk?: boolean;
   rsi1h: number;
   volR: number;
   rs24: number;
   dist25: number;
   dist75: number;
   dist200: number;
+  dist25Ema8?: number;
+  dist75Ema8?: number;
+  dist200Ema8?: number;
   futureBars: Candle[];
 }
 
@@ -331,7 +366,8 @@ export interface TuningRecommendation {
     | "portfolioMinBuyVolRatio"
     | "portfolioMinRelStrength24h"
     | "portfolioMinRsi1h"
-    | "portfolioTp1TargetMode";
+    | "portfolioTp1TargetMode"
+    | "portfolioPullbackMode";
   label: string;
   current: number | string;
   suggested: number | string;
@@ -371,6 +407,7 @@ interface TuneCfg {
   minRs: number;
   minRsi1h: number;
   tpMode: TpModeName;
+  pullbackMode: PullbackModeName;
 }
 
 interface MetricAcc {
@@ -405,11 +442,13 @@ function evalTuneConfig(groups: TuningEvent[][], cfg: TuneCfg, splitTime: number
   const train = newAcc();
   const test = newAcc();
   const lastBarBySym = new Map<string, number>();
+  const useEma8 = cfg.pullbackMode === "EMA8_HOLD";
 
   for (const g of groups) {
     const e = g.find(
       (ev) =>
         ev.barIdx - (lastBarBySym.get(ev.symbol) ?? -999) >= 8 &&
+        (!useEma8 || ev.ema8HoldOk !== false) &&
         ev.rsi1h >= cfg.minRsi1h &&
         ev.volR >= cfg.minVolR &&
         ev.rs24 >= cfg.minRs,
@@ -417,8 +456,20 @@ function evalTuneConfig(groups: TuningEvent[][], cfg: TuneCfg, splitTime: number
     if (!e) continue;
     lastBarBySym.set(e.symbol, e.barIdx);
 
-    const dist = cfg.tpMode === "EMA25" ? e.dist25 : cfg.tpMode === "EMA75" ? e.dist75 : e.dist200;
-    const sim = simulateMaFanCounterfactual(e.entryPrice, dist, -cfg.sl, e.futureBars, costPct);
+    const hasEma8 = useEma8 && e.entryPriceEma8 !== undefined && e.entryPriceEma8 > 0;
+    const px = hasEma8 ? e.entryPriceEma8! : e.entryPrice;
+    const dist = hasEma8
+      ? cfg.tpMode === "EMA25"
+        ? (e.dist25Ema8 ?? e.dist25)
+        : cfg.tpMode === "EMA75"
+          ? (e.dist75Ema8 ?? e.dist75)
+          : (e.dist200Ema8 ?? e.dist200)
+      : cfg.tpMode === "EMA25"
+        ? e.dist25
+        : cfg.tpMode === "EMA75"
+          ? e.dist75
+          : e.dist200;
+    const sim = simulateMaFanCounterfactual(px, dist, -cfg.sl, e.futureBars, costPct);
     const acc = e.timeSec < splitTime ? train : test;
     acc.n++;
     acc.sum += sim.finalRet;
@@ -483,6 +534,7 @@ function analyzeTuning(events: TuningEvent[], cur: TuneCfg, costPct = 0): Tuning
     { param: "portfolioMinRelStrength24h", label: "Min RS 24h vs Benchmark (%)", values: [-3, -2, -1, 0, 1], apply: (c, v) => ({ ...c, minRs: v }), curVal: cur.minRs },
     { param: "portfolioMinRsi1h", label: "Min 1h RSI", values: [35, 40, 45, 50], apply: (c, v) => ({ ...c, minRsi1h: v }), curVal: cur.minRsi1h },
     { param: "portfolioTp1TargetMode", label: "TP1 Target Mode", values: ["EMA25", "EMA75", "EMA200"], apply: (c, v) => ({ ...c, tpMode: v }), curVal: cur.tpMode },
+    { param: "portfolioPullbackMode", label: "Pullback Entry Timing", values: ["EMA8_HOLD", "EMA4_TOUCH"], apply: (c, v) => ({ ...c, pullbackMode: v }), curVal: cur.pullbackMode },
   ];
 
   const recs: TuningRecommendation[] = [];
@@ -587,6 +639,7 @@ type AutoTunableParam = TuningRecommendation["param"];
 
 const AUTO_TUNABLE_PARAMS: readonly AutoTunableParam[] = [
   "portfolioTp1TargetMode",
+  "portfolioPullbackMode",
   "portfolioDisasterSlPct",
   "portfolioMinBuyVolRatio",
   "portfolioMinRelStrength24h",
@@ -597,6 +650,8 @@ function matchesRecordedAdjustment(param: AutoTunableParam, cfg: Config, recorde
   switch (param) {
     case "portfolioTp1TargetMode":
       return encodeTpModeNumeric(cfg.portfolioTp1TargetMode) === Math.round(recordedNum);
+    case "portfolioPullbackMode":
+      return encodePullbackModeNumeric(cfg.portfolioPullbackMode) === Math.round(recordedNum);
     case "portfolioDisasterSlPct":
       return Math.abs(Number(cfg.portfolioDisasterSlPct || 3.5) - recordedNum) < 0.05;
     case "portfolioMinBuyVolRatio": {
@@ -618,7 +673,7 @@ function buildTunableCandidatePatch(
   param: AutoTunableParam,
   cfg: Config,
   suggested: number | string,
-): { patchVal: number | TpModeName; oldNum: number; newNum: number; displayChange: string } | null {
+): { patchVal: number | TpModeName | PullbackModeName; oldNum: number; newNum: number; displayChange: string } | null {
   switch (param) {
     case "portfolioTp1TargetMode": {
       const curMode = cfg.portfolioTp1TargetMode || "EMA200";
@@ -628,6 +683,17 @@ function buildTunableCandidatePatch(
         patchVal: nextMode,
         oldNum: encodeTpModeNumeric(curMode),
         newNum: encodeTpModeNumeric(nextMode),
+        displayChange: `${curMode} -> ${nextMode}`,
+      };
+    }
+    case "portfolioPullbackMode": {
+      const curMode = normalizePullbackMode(cfg.portfolioPullbackMode);
+      const nextMode = String(suggested) as PullbackModeName;
+      if (!["EMA8_HOLD", "EMA4_TOUCH"].includes(nextMode) || nextMode === curMode) return null;
+      return {
+        patchVal: nextMode,
+        oldNum: encodePullbackModeNumeric(curMode),
+        newNum: encodePullbackModeNumeric(nextMode),
         displayChange: `${curMode} -> ${nextMode}`,
       };
     }
@@ -1338,6 +1404,7 @@ export class LearningEngine {
       const baseMinRs = Number.isFinite(Number(opts.minRelStrength)) ? Number(opts.minRelStrength) : -1.0;
       const baseMinRsi1h = Number.isFinite(Number(opts.minRsi1h)) ? Number(opts.minRsi1h) : 40;
       const baseTpMode = normalizeTpMode(opts.tpMode);
+      const basePullbackMode = normalizePullbackMode(opts.pullbackMode);
 
       const bySymbol: Record<string, ShadowSymbolProfile> = {};
       const tuningEvents: TuningEvent[] = [];
@@ -1364,6 +1431,7 @@ export class LearningEngine {
         let fanStartIdx = -1;
         let waitingPullback = false;
         let waitFromIdx = -1;
+        let crossWasGap = false;
         let lastEntryIdx = -999;
 
         // Independent raw setup state machine strictly for filter what-if analysis
@@ -1371,6 +1439,7 @@ export class LearningEngine {
         let rawFanStartIdx = -1;
         let rawWaitingPullback = false;
         let rawWaitFromIdx = -1;
+        let rawCrossWasGap = false;
 
         let p1 = -1;
 
@@ -1390,19 +1459,39 @@ export class LearningEngine {
 
           if (waitingPullback && (idx - waitFromIdx >= 12 || coin.m8[idx]! < coin.m16[idx]!)) {
             waitingPullback = false;
+            crossWasGap = false;
           }
           if (rawWaitingPullback && (idx - rawWaitFromIdx >= 12 || coin.m8[idx]! < coin.m16[idx]!)) {
             rawWaitingPullback = false;
+            rawCrossWasGap = false;
           }
 
           const prev = idx - 1;
           const prevBar = coin.c15[prev]!;
           const limitP = coin.m4[prev]!;
+          const limitP8 = coin.m8[prev]!;
           const touchedEma4 = limitP > 0 && coin.m8[prev]! >= coin.m16[prev]! && c.low <= limitP * 1.001;
-          const activePrimary = waitingPullback && idx > waitFromIdx && idx - lastEntryIdx >= 8;
-          const activeRaw = rawWaitingPullback && idx > rawWaitFromIdx;
+          const curBarGap = isGapInducedBar(prevBar, c);
+          const ema8HoldOk =
+            limitP8 > 0 &&
+            coin.m8[prev]! >= coin.m16[prev]! &&
+            !rawCrossWasGap &&
+            !curBarGap &&
+            c.low <= limitP8 * 1.0015 &&
+            c.close >= coin.m8[idx]! * 0.999;
+          const primaryTriggered =
+            basePullbackMode === "EMA8_HOLD"
+              ? limitP8 > 0 &&
+                coin.m8[prev]! >= coin.m16[prev]! &&
+                !crossWasGap &&
+                !curBarGap &&
+                c.low <= limitP8 * 1.0015 &&
+                c.close >= coin.m8[idx]! * 0.999
+              : touchedEma4;
+          const activePrimary = waitingPullback && idx > waitFromIdx && idx - lastEntryIdx >= 8 && primaryTriggered;
+          const activeRaw = rawWaitingPullback && idx > rawWaitFromIdx && (touchedEma4 || ema8HoldOk);
 
-          if (touchedEma4 && (activePrimary || activeRaw)) {
+          if (activePrimary || activeRaw) {
             const rsi1hVal = coin.rsi1h.length >= 20 && p1 >= 14 ? (coin.rsi1h[p1] ?? 50) : 50;
             let upV = 0;
             let dnV = 0;
@@ -1418,13 +1507,17 @@ export class LearningEngine {
             const coinRet24 = ref24.open > 0 ? ((prevBar.close - ref24.open) / ref24.open) * 100 : 0;
             const benchInfo = benchStateByTime.get(prevBar.time);
             const rs24 = coinRet24 - (benchInfo?.ret24h ?? 0);
-            const entryPrice = Math.min(c.open, limitP);
+            const entryPrice = limitP > 0 ? Math.min(c.open, limitP) : c.close;
+            const entryPriceEma8 = limitP8 > 0 ? Math.min(c.open, limitP8 * 1.001) : entryPrice;
             const futureBars = coin.c15.slice(idx + 1, Math.min(n, idx + 33));
 
             if (entryPrice > 0 && futureBars.length >= 8) {
               const dist25 = ((coin.m25[prev]! - entryPrice) / entryPrice) * 100;
               const dist75 = ((coin.m75[prev]! - entryPrice) / entryPrice) * 100;
               const dist200 = ((coin.m200[prev]! - entryPrice) / entryPrice) * 100;
+              const dist25Ema8 = ((coin.m25[prev]! - entryPriceEma8) / entryPriceEma8) * 100;
+              const dist75Ema8 = ((coin.m75[prev]! - entryPriceEma8) / entryPriceEma8) * 100;
+              const dist200Ema8 = ((coin.m200[prev]! - entryPriceEma8) / entryPriceEma8) * 100;
 
               if (activeRaw) {
                 tuningEvents.push({
@@ -1433,22 +1526,33 @@ export class LearningEngine {
                   barIdx: idx,
                   timeSec: c.time,
                   entryPrice,
+                  entryPriceEma8,
+                  ema8HoldOk,
                   rsi1h: rsi1hVal,
                   volR,
                   rs24,
                   dist25,
                   dist75,
                   dist200,
+                  dist25Ema8,
+                  dist75Ema8,
+                  dist200Ema8,
                   futureBars,
                 });
               }
 
               if (activePrimary && rsi1hVal >= baseMinRsi1h && volR >= baseMinVolR && rs24 >= baseMinRs) {
-                const distTarget = baseTpMode === "EMA25" ? dist25 : baseTpMode === "EMA75" ? dist75 : dist200;
-                const sim = simulateMaFanCounterfactual(entryPrice, distTarget, slTriggerPct, futureBars, costPct);
+                const useEma8Primary = basePullbackMode === "EMA8_HOLD" && entryPriceEma8 > 0;
+                const simEntryPrice = useEma8Primary ? entryPriceEma8 : entryPrice;
+                const d25 = useEma8Primary ? dist25Ema8 : dist25;
+                const d75 = useEma8Primary ? dist75Ema8 : dist75;
+                const d200 = useEma8Primary ? dist200Ema8 : dist200;
+                const distTarget = baseTpMode === "EMA25" ? d25 : baseTpMode === "EMA75" ? d75 : d200;
+                const sim = simulateMaFanCounterfactual(simEntryPrice, distTarget, slTriggerPct, futureBars, costPct);
 
                 lastEntryIdx = idx;
                 waitingPullback = false;
+                crossWasGap = false;
                 hadBottomFan = false;
 
                 totalSetups++;
@@ -1510,13 +1614,20 @@ export class LearningEngine {
             const rsiOk = (coin.rsi15[idx] ?? 0) >= 35 && (coin.rsi15[idx] ?? 0) > (coin.rsi15[idx - 1] ?? 0);
             const macdOk = (coin.macdHist15[idx] ?? 0) > (coin.macdHist15[idx - 1] ?? 0);
             if (rsiOk && macdOk) {
+              const prevPrevBar = idx >= 2 ? coin.c15[idx - 2] : undefined;
+              const postOpenBarGap = Boolean(
+                prevBar && prevPrevBar && prevBar.time - prevPrevBar.time > 3600 && isGapInducedBar(prevPrevBar, prevBar),
+              );
+              const crossGap = isGapInducedBar(prevBar, c) || postOpenBarGap;
               if (!waitingPullback && hadBottomFan) {
                 waitingPullback = true;
                 waitFromIdx = idx;
+                crossWasGap = crossGap;
               }
               if (!rawWaitingPullback && rawHadBottomFan) {
                 rawWaitingPullback = true;
                 rawWaitFromIdx = idx;
+                rawCrossWasGap = crossGap;
               }
             }
           }
@@ -1577,6 +1688,7 @@ export class LearningEngine {
         portfolioMinRelStrength24h: baseMinRs,
         portfolioMinRsi1h: baseMinRsi1h,
         portfolioTp1TargetMode: baseTpMode,
+        portfolioPullbackMode: basePullbackMode,
       } as Config);
       const summary: ShadowLearningSummary = {
         updatedAt: now,
@@ -1902,7 +2014,9 @@ export class LearningEngine {
           oosReversal =
             param === "portfolioTp1TargetMode"
               ? encodeTpModeNumeric(String(rec.suggested)) === Math.round(lastAdj.oldValue)
-              : (Number(rec.suggested) - lastAdj.newValue) * (lastAdj.oldValue - lastAdj.newValue) > 0;
+              : param === "portfolioPullbackMode"
+                ? encodePullbackModeNumeric(String(rec.suggested)) === Math.round(lastAdj.oldValue)
+                : (Number(rec.suggested) - lastAdj.newValue) * (lastAdj.oldValue - lastAdj.newValue) > 0;
         }
 
         const postTrades = closed.filter((t) => Number(t.entryTimeMs || 0) >= lastAdj.createdAt);
@@ -1911,7 +2025,12 @@ export class LearningEngine {
         const liveDegraded = postTrades.length >= 4 && postWins / postTrades.length < 0.25 && postPnl < 0;
 
         if (oosReversal || liveDegraded) {
-          const rollbackVal = param === "portfolioTp1TargetMode" ? decodeTpModeNumeric(lastAdj.oldValue) : lastAdj.oldValue;
+          const rollbackVal =
+            param === "portfolioTp1TargetMode"
+              ? decodeTpModeNumeric(lastAdj.oldValue)
+              : param === "portfolioPullbackMode"
+                ? decodePullbackModeNumeric(lastAdj.oldValue)
+                : lastAdj.oldValue;
           const reasonTag = oosReversal && liveDegraded ? "OOS+Live" : oosReversal ? "OOS" : "Live";
           const rationale = `Auto-Rollback: ถอยกลับค่าเดิมเนื่องจากผลทดสอบ OOS/ผลเทรดจริงหลังจูนอ่อนตัวลง (${reasonTag})`;
           onApplySetting({ [param]: rollbackVal });
@@ -2054,6 +2173,8 @@ export class LearningEngine {
   public async buildReport(cfg: Config) {
     this.refreshShadowTuningFromConfig(cfg);
     const activeTechnicalParams = {
+      portfolioCapitalUsagePct: Number(cfg.portfolioCapitalUsagePct || 50),
+      portfolioPullbackMode: normalizePullbackMode(cfg.portfolioPullbackMode),
       portfolioTp1TargetMode: cfg.portfolioTp1TargetMode || "EMA200",
       portfolioDisasterSlPct: Number(cfg.portfolioDisasterSlPct || 3.5),
       portfolioMinBuyVolRatio: Number.isFinite(Number(cfg.portfolioMinBuyVolRatio))

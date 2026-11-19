@@ -10055,3 +10055,20 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - ย้าย `cfg_portfolioSitOutMode` และ `cfg_portfolioDisasterSlPct` ลงไปไว้ในส่วนพับด้านล่าง `#portfolioAdvancedDetails` ("ตั้งค่าเทคนิคสำหรับผู้เชี่ยวชาญ / Expert Manual Override")
   - อัปเดต Learning Report: แสดงแถบค่าเทคนิคที่ Auto-Pilot ใช้งานอยู่บน `#lrTuningBox`, ป้าย `🤖 Auto-Pilot พร้อมจูน` / `🛡️ บล็อก Overfit (LOW)`, และแปลง `25/75/200 -> EMA25/EMA75/EMA200` + `0/1/2/3 -> NORMAL/...` ใน `#lrAdjustmentsBox` (`formatLearningAdjustment`)
 - **Version Bump**: **`0.3.0.98`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 343. 50% MM Capital Usage Cap, Equal-Unit Reserve Sizing & EMA8_HOLD Anti-Gap Entry Timing (v0.3.0.99)
+- **ปัญหาที่พบจาก Live Production (`alpaca_kyne`) และผล Backtest**:
+  1. หุ้น US เปิด Gap ขึ้นแรง (เช่น `META` กระโดด `+$1.45%` ดึง `EMA4` ขึ้นยอด Gap) ทำให้เมื่อเกิด `EMA4` touch ทันทีหลังเปิดตลาด บอทเข้าซื้อกลางจังหวะย่อทุบ (Gap Trap) แทนที่จะรอสร้างฐานแนวรับ
+  2. `executeEntrySlot()` หักเฉพาะ `this.cashBalance` แต่ไม่หัก `this.walletQuoteBalance` ทันที ส่งผลให้ Slot ถัดไป (เช่น `VOO` ห่าง `META` 8 วินาที) ยังเห็นเงินสดเต็มก้อนและออกขนาดไม้ใหญ่เกินสัดส่วน (`$64,877.47`, ใช้ Margin) อีกทั้งพอร์ตที่ไม่มี Reserve Buffer เมื่อโดน Cut Loss เงินตั้งต้นจะลดลงทันทีทำให้ไม้แก้คืนเล็กลง
+- **การแก้ไขและสถาปัตยกรรมใหม่**:
+  1. **Configurable Money Management (`portfolioCapitalUsagePct`) & Fixed Equal-Unit Sizing** (`src/config.ts`, `src/strategy/ma-fan-portfolio/index.ts`, `public/index.html`, `public/app.js`):
+     - เพิ่ม `portfolioCapitalUsagePct` ค่าเริ่มต้น **`50%`** (กำหนดได้ `10–100%` ผ่าน Dashboard `#cfg_portfolioCapitalUsagePct` และ `updateRuntimeSettings`)
+     - ใช้ `getCapitalUsageRatio()`, equity-anchored `getEffectiveBudgetCap()`, `getMaxActiveBudget()`, `getStandardSlotUnit()` และ bounded `getAvailableBuyCash()` ล็อกขนาดต่อไม้ไม่ให้เกิน `getStandardSlotUnit()` (เท่ากันทุกไม้) โดยใช้ทุนสำรองส่วนที่เหลือเป็นกันชนดูดซับการขาดทุนก่อนกระทบขนาดไม้
+     - หัก/คืน `this.walletQuoteBalance` แบบ Synchronous ใน `executeEntrySlot()` และ `executeExitSlot()` พร้อมส่ง Full Equity เข้า `evaluateSurvivalPosture()` และอัปเดต `readyBudget` / `botActionReason` (`MM %`)
+  2. **Two-Stage Anti-Gap `EMA8_HOLD` Entry Timing & OOS Learning Integration** (`src/config.ts`, `src/strategy/ma-fan-portfolio/types.ts`, `src/strategy/ma-fan-portfolio/index.ts`, `src/learning-engine.ts`, `public/index.html`, `public/app.js`):
+     - เพิ่ม `portfolioPullbackMode` ค่าเริ่มต้น **`"EMA8_HOLD"`** (รองรับ `"EMA8_HOLD" | "EMA4_TOUCH"` ผ่าน `#cfg_portfolioPullbackMode`) และฟิลด์ใน `CoinSetupState` (`crossWasGap`, `pullbackTouched`, `pullbackLow`)
+     - แยกจังหวะสัญญาณเข้าซื้อ (`CROSS_UP`) ออกจากจังหวะย่อหาฐาน (`PULLBACK_READY`): ใช้ `isGapInducedBar` ตรวจจับแท่งกระโดดข้ามเซสชัน/เปิดตลาด (`FILTER:GAP_TRAP` ใน `normalizeBlockReasonKey`) และรอราคา Pullback ลงมาแตะ/ยืนฐาน `EMA8` โดยไม่ทำลายแนวรับก่อนเข้าซื้อ
+     - ผสาน `portfolioPullbackMode` (`8 <-> EMA8_HOLD`, `4 <-> EMA4_TOUCH`) เข้ากับ `LearningEngine` (`ShadowWalkForwardContext`, `runShadowWalkForward`, `evalTuneConfig`, `analyzeTuning`, `AUTO_TUNABLE_PARAMS`, `applyAutonomousTuning` Step B rollback, `buildReport().summary.activeTechnicalParams`) และ Dashboard (`buildActiveTechParamChipsHtml`, `formatLearningAdjustment`)
+- **Version Bump**: **`0.3.0.99`** (`package.json`, `src/version.ts`, `public/index.html`)

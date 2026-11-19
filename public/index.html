@@ -13,7 +13,7 @@
   <link
     href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap"
     rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=0.3.0.98" />
+  <link rel="stylesheet" href="style.css?v=0.3.0.99" />
   <!-- TradingView Lightweight Charts -->
   <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 </head>
@@ -2459,6 +2459,14 @@
               </div>
 
               <div class="form-group">
+                <label for="cfg_portfolioCapitalUsagePct">🛡️ สัดส่วนเงินทุนที่ใช้เทรด (MM Capital Usage % | แนะนำ 50% สำรอง 50%)</label>
+                <div class="input-with-unit">
+                  <input type="number" id="cfg_portfolioCapitalUsagePct" min="10" max="100" step="5" />
+                  <span class="unit">%</span>
+                </div>
+              </div>
+
+              <div class="form-group">
                 <label for="cfg_portfolioMaxSlots">🎰 จำนวน Slot ถือพร้อมกัน (Max Concurrent Slots)</label>
                 <input type="number" id="cfg_portfolioMaxSlots" min="1" max="5" step="1" />
               </div>
@@ -2497,6 +2505,14 @@
             </summary>
             <div class="cfg-advanced-body">
               <div class="settings-grid">
+                <div class="form-group">
+                  <label for="cfg_portfolioPullbackMode">🎯 จังหวะรอเข้าซื้อหลังเกิดสัญญาณ (Pullback Timing Mode)</label>
+                  <select id="cfg_portfolioPullbackMode" class="form-select">
+                    <option value="EMA8_HOLD">🛡️ รอย่อถึงฐาน EMA8 + ยืนแนวรับได้ + กัน Gap (แนะนำ)</option>
+                    <option value="EMA4_TOUCH">⚡ แตะ EMA4 เข้าทันที (พร้อมกัน Gap)</option>
+                  </select>
+                </div>
+
                 <div class="form-group">
                   <label for="cfg_portfolioSitOutMode">🛡️ ตัวกรองตลาดใหญ่ (Macro Sit-Out Filter)</label>
                   <select id="cfg_portfolioSitOutMode" class="form-select">
@@ -3418,7 +3434,7 @@
     </div>
   </div>
 
-  <script src="app.js?v=0.3.0.98"></script>
+  <script src="app.js?v=0.3.0.99"></script>
 </body>
 
 </html>

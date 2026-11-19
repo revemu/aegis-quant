@@ -434,6 +434,10 @@ export const defaultStrategyConfig = {
   portfolioMaxHoldHours: 0,
   /** Max total capital allocated across all portfolio slots in USD/Quote (0 = use full free wallet cash). */
   portfolioMaxBudgetUsd: 0,
+  /** Percentage of total portfolio capital allowed to be deployed across all slots (MM cap, default 50%). */
+  portfolioCapitalUsagePct: 50,
+  /** Pullback entry timing mode: "EMA8_HOLD" (wait for EMA8 support pullback & hold + anti-gap) or "EMA4_TOUCH". */
+  portfolioPullbackMode: "EMA8_HOLD" as "EMA8_HOLD" | "EMA4_TOUCH",
   /** Minimum 12-bar buy volume ratio required before entering a pullback (default 1.3). */
   portfolioMinBuyVolRatio: 1.3,
   /** Minimum 24h relative strength vs benchmark in % required before entering (default -1.0). */
@@ -658,6 +662,12 @@ export function loadConfigFromDatabase(): typeof defaultStrategyConfig {
       }
       if (saved.portfolioMaxHoldHours !== undefined) merged.portfolioMaxHoldHours = Math.max(0, Number(saved.portfolioMaxHoldHours) || 0);
       if (saved.portfolioMaxBudgetUsd !== undefined) merged.portfolioMaxBudgetUsd = Math.max(0, Number(saved.portfolioMaxBudgetUsd) || 0);
+      if (saved.portfolioCapitalUsagePct !== undefined && Number.isFinite(Number(saved.portfolioCapitalUsagePct))) {
+        merged.portfolioCapitalUsagePct = Math.min(100, Math.max(10, Number(saved.portfolioCapitalUsagePct)));
+      }
+      if (saved.portfolioPullbackMode === "EMA8_HOLD" || saved.portfolioPullbackMode === "EMA4_TOUCH") {
+        merged.portfolioPullbackMode = saved.portfolioPullbackMode;
+      }
       if (saved.portfolioMinBuyVolRatio !== undefined && Number.isFinite(Number(saved.portfolioMinBuyVolRatio))) {
         merged.portfolioMinBuyVolRatio = Math.min(5.0, Math.max(0.5, Number(saved.portfolioMinBuyVolRatio)));
       }

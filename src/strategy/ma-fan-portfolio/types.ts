@@ -32,6 +32,9 @@ export interface CoinSetupState {
   waitFromBarTime: number;
   bottomLow: number;
   lastCrossWeakBarTime?: number;
+  crossWasGap?: boolean;
+  pullbackTouched?: boolean;
+  pullbackLow?: number;
 }
 
 export type RadarStage =
