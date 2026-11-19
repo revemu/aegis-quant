@@ -10008,3 +10008,13 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - เพิ่ม Survival Mode Banner (`#lrSurvivalBanner`), ส่วน Shadow Walk-Forward & Proven/Risky Chips (`#lrShadowSection`), ปุ่ม `🔬 รัน Shadow Scan` / `🧹 ซิงค์ Journal` และอัปเดต Sidebar Learning Pulse Card (`#pfLearningCard`)
 - **Version Bump**:
   - อัปเดตเวอร์ชันเป็น **`0.3.0.95`** ใน `package.json`, `src/version.ts` และ `public/index.html` (`style.css?v=0.3.0.95`, `app.js?v=0.3.0.95`)
+
+
+---
+
+## 340. v0.3.0.96 — Advisory Tuning Recommendations (SL / Filters / TP1) from Shadow Walk-Forward (`src/learning-engine.ts`, `public/*`)
+
+- **Advisory-only (ไม่ปรับค่าอัตโนมัติ)**: `runShadowWalkForward` เก็บ raw pullback-touch events (ไม่ผ่านฟิลเตอร์) แล้ว `analyzeTuning` ทำ one-at-a-time sensitivity ของ Disaster SL (2.5–5.0), VolR (1.0–2.0), RS24h (-3..+1), 1hRSI (35–50), TP1 Mode (EMA25/75/200) พร้อมแบ่งข้อมูลตามเวลา Train 70% / Test 30% ให้ `confidence` HIGH/MEDIUM/LOW (LOW = อาจ Overfit ไม่แนะนำ) และผลรวมคำแนะนำที่ผ่านการยืนยัน
+- เก็บใน `shadowLearning.tuning` ของ `/api/learning/report` และแสดงใน Learning Modal (`#lrTuningSection`) ผู้ใช้ตัดสินใจปรับเองผ่าน Settings
+- `enteredSetup` flag ใน shadow scan: setup เดียวนับ entry ได้ครั้งเดียวแต่ยังเก็บ event ที่เหลือในหน้าต่าง 12 แท่ง
+- **Version Bump**: **`0.3.0.96`** (`package.json`, `src/version.ts`, `public/index.html`)

@@ -658,6 +658,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       symbols: Array.from(this.snapshots.keys()),
       benchmarkSymbol: this.benchmarkSymbol,
       slPct: Number(this.cfg.portfolioDisasterSlPct ?? 3.5),
+      tpMode: this.cfg.portfolioTp1TargetMode,
       fallbackSnapshots: this.snapshots,
       benchmarkFallback15m: this.benchmark15m,
       force,
@@ -1381,6 +1382,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       symbols: Array.from(this.snapshots.keys()),
       benchmarkSymbol: this.benchmarkSymbol,
       slPct: disasterSlPct,
+      tpMode: this.cfg.portfolioTp1TargetMode,
       fallbackSnapshots: this.snapshots,
       benchmarkFallback15m: this.benchmark15m,
     });

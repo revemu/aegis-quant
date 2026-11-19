@@ -71,6 +71,7 @@ export interface ShadowLearningSummary {
   topProvenSymbols: ShadowSymbolProfile[];
   riskyWhipsawSymbols: ShadowSymbolProfile[];
   bySymbol: Record<string, ShadowSymbolProfile>;
+  tuning?: TuningAnalysis | null;
 }
 
 export type SurvivalPostureLevel = "NORMAL" | "CAUTIOUS" | "DEFENSIVE" | "CAPITAL_PRESERVATION";
@@ -99,6 +100,10 @@ export interface SurvivalGuardDecision {
 }
 
 export interface ShadowWalkForwardContext {
+  tpMode?: string;
+  minVolRatio?: number;
+  minRelStrength?: number;
+  minRsi1h?: number;
   exchange: string;
   symbols: string[];
   benchmarkSymbol: string;
@@ -250,6 +255,230 @@ function simulateMaFanCounterfactual(
   const verdict: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL" =
     finalRet >= 0.35 ? "WOULD_WIN" : finalRet <= -0.35 ? "WOULD_LOSE" : "NEUTRAL";
   return { finalRet, maePct, mfePct, verdict };
+}
+
+type TpModeName = "EMA25" | "EMA75" | "EMA200";
+
+function normalizeTpMode(m?: string): TpModeName {
+  return m === "EMA25" || m === "EMA75" ? m : "EMA200";
+}
+
+interface TuningEvent {
+  setupId: string;
+  symbol: string;
+  timeSec: number;
+  entryPrice: number;
+  rsi1h: number;
+  volR: number;
+  rs24: number;
+  dist25: number;
+  dist75: number;
+  dist200: number;
+  futureBars: Candle[];
+}
+
+export interface TuningMetrics {
+  trades: number;
+  wins: number;
+  winRatePct: number;
+  avgPnlPct: number;
+  profitFactor: number;
+}
+
+export interface TuningRecommendation {
+  param: "portfolioDisasterSlPct" | "minBuyVolRatio" | "minRelStrength24h" | "minRsi1h" | "portfolioTp1TargetMode";
+  label: string;
+  current: number | string;
+  suggested: number | string;
+  trainAvgDeltaPct: number;
+  testAvgDeltaPct: number;
+  baselineTest: TuningMetrics;
+  suggestedTest: TuningMetrics;
+  confidence: "HIGH" | "MEDIUM" | "LOW";
+  verdict: string;
+  advisoryOnly: true;
+}
+
+export interface TuningAnalysis {
+  generatedAt: number;
+  events: number;
+  setups: number;
+  trainSetups: number;
+  testSetups: number;
+  splitTimeSec: number;
+  baselineTrain: TuningMetrics;
+  baselineTest: TuningMetrics;
+  recommendations: TuningRecommendation[];
+  combined: { train: TuningMetrics; test: TuningMetrics; params: Record<string, number | string> } | null;
+  note: string;
+}
+
+interface TuneCfg {
+  sl: number;
+  minVolR: number;
+  minRs: number;
+  minRsi1h: number;
+  tpMode: TpModeName;
+}
+
+interface MetricAcc {
+  n: number;
+  wins: number;
+  sum: number;
+  winSum: number;
+  lossAbs: number;
+}
+
+function newAcc(): MetricAcc {
+  return { n: 0, wins: 0, sum: 0, winSum: 0, lossAbs: 0 };
+}
+
+function finalizeAcc(a: MetricAcc): TuningMetrics {
+  return {
+    trades: a.n,
+    wins: a.wins,
+    winRatePct: a.n > 0 ? Number(((a.wins / a.n) * 100).toFixed(1)) : 0,
+    avgPnlPct: a.n > 0 ? Number((a.sum / a.n).toFixed(3)) : 0,
+    profitFactor: Number((a.lossAbs > 0 ? a.winSum / a.lossAbs : a.winSum > 0 ? 99 : 0).toFixed(2)),
+  };
+}
+
+function evalTuneConfig(groups: TuningEvent[][], cfg: TuneCfg, splitTime: number) {
+  const train = newAcc();
+  const test = newAcc();
+  for (const g of groups) {
+    const e = g.find((ev) => ev.rsi1h >= cfg.minRsi1h && ev.volR >= cfg.minVolR && ev.rs24 >= cfg.minRs);
+    if (!e) continue;
+    const dist = cfg.tpMode === "EMA25" ? e.dist25 : cfg.tpMode === "EMA75" ? e.dist75 : e.dist200;
+    const sim = simulateMaFanCounterfactual(e.entryPrice, dist, -cfg.sl, e.futureBars);
+    const acc = e.timeSec < splitTime ? train : test;
+    acc.n++;
+    acc.sum += sim.finalRet;
+    if (sim.finalRet > 0) {
+      acc.wins++;
+      acc.winSum += sim.finalRet;
+    } else {
+      acc.lossAbs += Math.abs(sim.finalRet);
+    }
+  }
+  return { train: finalizeAcc(train), test: finalizeAcc(test) };
+}
+
+/**
+ * Advisory-only what-if analysis: one-at-a-time sensitivity of SL / filters / TP1 mode on raw shadow
+ * pullback events with a chronological 70/30 train-test split. Never applies anything automatically.
+ */
+function analyzeTuning(events: TuningEvent[], cur: TuneCfg): TuningAnalysis | null {
+  const groupsMap = new Map<string, TuningEvent[]>();
+  for (const e of events) {
+    const g = groupsMap.get(e.setupId) || [];
+    g.push(e);
+    groupsMap.set(e.setupId, g);
+  }
+  const groups = Array.from(groupsMap.values());
+  for (const g of groups) g.sort((a, b) => a.timeSec - b.timeSec);
+  groups.sort((a, b) => a[0]!.timeSec - b[0]!.timeSec);
+
+  const emptyM: TuningMetrics = { trades: 0, wins: 0, winRatePct: 0, avgPnlPct: 0, profitFactor: 0 };
+  if (groups.length < 20) {
+    return {
+      generatedAt: Date.now(),
+      events: events.length,
+      setups: groups.length,
+      trainSetups: 0,
+      testSetups: 0,
+      splitTimeSec: 0,
+      baselineTrain: emptyM,
+      baselineTest: emptyM,
+      recommendations: [],
+      combined: null,
+      note: `ข้อมูลยังน้อย (${groups.length} setups < 20) — ยังไม่ให้คำแนะนำ`,
+    };
+  }
+
+  const splitTime = groups[Math.floor(groups.length * 0.7)]![0]!.timeSec;
+  const base = evalTuneConfig(groups, cur, splitTime);
+  const minTrainN = Math.max(10, Math.floor(base.train.trades * 0.4));
+
+  const candidates: Array<{
+    param: TuningRecommendation["param"];
+    label: string;
+    values: Array<number | string>;
+    apply: (c: TuneCfg, v: any) => TuneCfg;
+    curVal: number | string;
+  }> = [
+    { param: "portfolioDisasterSlPct", label: "Disaster SL %", values: [2.5, 3, 3.5, 4, 4.5, 5], apply: (c, v) => ({ ...c, sl: v }), curVal: cur.sl },
+    { param: "minBuyVolRatio", label: "Min Buy VolRatio (12 bars)", values: [1.0, 1.15, 1.3, 1.6, 2.0], apply: (c, v) => ({ ...c, minVolR: v }), curVal: cur.minVolR },
+    { param: "minRelStrength24h", label: "Min RS 24h vs Benchmark (%)", values: [-3, -2, -1, 0, 1], apply: (c, v) => ({ ...c, minRs: v }), curVal: cur.minRs },
+    { param: "minRsi1h", label: "Min 1h RSI", values: [35, 40, 45, 50], apply: (c, v) => ({ ...c, minRsi1h: v }), curVal: cur.minRsi1h },
+    { param: "portfolioTp1TargetMode", label: "TP1 Target Mode", values: ["EMA25", "EMA75", "EMA200"], apply: (c, v) => ({ ...c, tpMode: v }), curVal: cur.tpMode },
+  ];
+
+  const recs: TuningRecommendation[] = [];
+  const winners: Array<{ cand: (typeof candidates)[number]; value: number | string; testDelta: number }> = [];
+
+  for (const cand of candidates) {
+    let best: { v: number | string; res: ReturnType<typeof evalTuneConfig> } | null = null;
+    for (const v of cand.values) {
+      if (v === cand.curVal) continue;
+      const res = evalTuneConfig(groups, cand.apply(cur, v), splitTime);
+      if (res.train.trades < minTrainN) continue;
+      if (!best || res.train.avgPnlPct > best.res.train.avgPnlPct) best = { v, res };
+    }
+    if (!best) continue;
+    const trainDelta = best.res.train.avgPnlPct - base.train.avgPnlPct;
+    if (trainDelta <= 0.02) continue;
+    const testDelta = best.res.test.avgPnlPct - base.test.avgPnlPct;
+    const testN = best.res.test.trades;
+    const confidence: TuningRecommendation["confidence"] =
+      trainDelta >= 0.15 && testDelta >= 0.15 && testN >= 15 ? "HIGH" : testDelta > 0 && testN >= 8 ? "MEDIUM" : "LOW";
+    const verdict =
+      confidence === "LOW"
+        ? "ไม่ผ่านการยืนยันช่วงทดสอบ (อาจ Overfit) — ยังไม่แนะนำให้เปลี่ยน"
+        : `เฉลี่ย/ไม้ในช่วงทดสอบดีขึ้น ${testDelta >= 0 ? "+" : ""}${testDelta.toFixed(2)}pp (${cur.sl === best.v ? "" : ""}ความเชื่อมั่น ${confidence})`;
+    recs.push({
+      param: cand.param,
+      label: cand.label,
+      current: cand.curVal,
+      suggested: best.v,
+      trainAvgDeltaPct: Number(trainDelta.toFixed(3)),
+      testAvgDeltaPct: Number(testDelta.toFixed(3)),
+      baselineTest: base.test,
+      suggestedTest: best.res.test,
+      confidence,
+      verdict,
+      advisoryOnly: true,
+    });
+    if (confidence !== "LOW") winners.push({ cand, value: best.v, testDelta });
+  }
+
+  let combined: TuningAnalysis["combined"] = null;
+  if (winners.length > 0) {
+    let cfg2: TuneCfg = { ...cur };
+    const params: Record<string, number | string> = {};
+    for (const w of winners) {
+      cfg2 = w.cand.apply(cfg2, w.value);
+      params[w.cand.param] = w.value;
+    }
+    const res = evalTuneConfig(groups, cfg2, splitTime);
+    combined = { train: res.train, test: res.test, params };
+  }
+
+  const trainSetups = groups.filter((g) => g[0]!.timeSec < splitTime).length;
+  recs.sort((a, b) => b.testAvgDeltaPct - a.testAvgDeltaPct);
+  return {
+    generatedAt: Date.now(),
+    events: events.length,
+    setups: groups.length,
+    trainSetups,
+    testSetups: groups.length - trainSetups,
+    splitTimeSec: splitTime,
+    baselineTrain: base.train,
+    baselineTest: base.test,
+    recommendations: recs,
+    combined,
+    note: "คำแนะนำเท่านั้น (Advisory) — ไม่มีการปรับค่าอัตโนมัติ; เทียบทีละพารามิเตอร์บนข้อมูล Train 70% ยืนยันบน Test 30%",
+  };
 }
 
 export type LearningAutoTuneConfig = Pick<Config, "learningAutoTuneMode" | "dryRun" | "exchange" | "alpacaBaseUrl">;
@@ -921,6 +1150,7 @@ export class LearningEngine {
 
       const slTriggerPct = -Math.max(1.5, Math.min(5.0, opts.slPct || 3.5));
       const bySymbol: Record<string, ShadowSymbolProfile> = {};
+      const tuningEvents: TuningEvent[] = [];
       const winMaeAbs: number[] = [];
 
       let totalSetups = 0;
@@ -942,6 +1172,7 @@ export class LearningEngine {
         let hadBottomFan = false;
         let fanStartIdx = -1;
         let waitingPullback = false;
+        let enteredSetup = false;
         let waitFromIdx = -1;
         let lastEntryIdx = -999;
         let p1 = -1;
@@ -962,13 +1193,15 @@ export class LearningEngine {
 
           if (waitingPullback && (idx - waitFromIdx >= 12 || coin.m8[idx]! < coin.m16[idx]!)) {
             waitingPullback = false;
+            enteredSetup = false;
           }
 
           const prev = idx - 1;
-          if (waitingPullback && idx > waitFromIdx && idx - lastEntryIdx >= 8 && coin.m8[prev]! >= coin.m16[prev]!) {
+          if (waitingPullback && idx > waitFromIdx && coin.m8[prev]! >= coin.m16[prev]!) {
             const limitP = coin.m4[prev]!;
             if (limitP > 0 && c.low <= limitP * 1.001) {
-              const rsi1hOk = !(coin.rsi1h.length >= 20 && p1 >= 14 && (coin.rsi1h[p1] ?? 50) < 40);
+              const rsi1hVal = coin.rsi1h.length >= 20 && p1 >= 14 ? (coin.rsi1h[p1] ?? 50) : 50;
+              const rsi1hOk = rsi1hVal >= 40;
               let upV = 0;
               let dnV = 0;
               for (let k = Math.max(0, prev - 11); k <= prev; k++) {
@@ -985,7 +1218,28 @@ export class LearningEngine {
               const benchInfo = benchStateByTime.get(prevBar.time);
               const rs24 = coinRet24 - (benchInfo?.ret24h ?? 0);
 
-              if (rsi1hOk && volR >= 1.3 && rs24 >= -1.0) {
+              // Raw pullback-touch event (no filters) for offline tuning/what-if analysis
+              {
+                const rawEntry = Math.min(c.open, limitP);
+                const rawFuture = coin.c15.slice(idx + 1, Math.min(n, idx + 33));
+                if (rawEntry > 0 && rawFuture.length >= 8) {
+                  tuningEvents.push({
+                    setupId: `${coin.symbol}|${waitFromIdx}`,
+                    symbol: coin.symbol,
+                    timeSec: c.time,
+                    entryPrice: rawEntry,
+                    rsi1h: rsi1hVal,
+                    volR,
+                    rs24,
+                    dist25: ((coin.m25[prev]! - rawEntry) / rawEntry) * 100,
+                    dist75: ((coin.m75[prev]! - rawEntry) / rawEntry) * 100,
+                    dist200: ((coin.m200[prev]! - rawEntry) / rawEntry) * 100,
+                    futureBars: rawFuture,
+                  });
+                }
+              }
+
+              if (!enteredSetup && idx - lastEntryIdx >= 8 && rsi1hOk && volR >= 1.3 && rs24 >= -1.0) {
                 const entryPrice = Math.min(c.open, limitP);
                 const futureBars = coin.c15.slice(idx + 1, Math.min(n, idx + 33));
                 if (entryPrice > 0 && futureBars.length >= 8) {
@@ -993,7 +1247,7 @@ export class LearningEngine {
                   const sim = simulateMaFanCounterfactual(entryPrice, dist200, slTriggerPct, futureBars);
 
                   lastEntryIdx = idx;
-                  waitingPullback = false;
+                  enteredSetup = true;
                   hadBottomFan = false;
 
                   totalSetups++;
@@ -1052,6 +1306,7 @@ export class LearningEngine {
             const macdOk = (coin.macdHist15[idx] ?? 0) > (coin.macdHist15[idx - 1] ?? 0);
             if (rsiOk && macdOk) {
               waitingPullback = true;
+              enteredSetup = false;
               waitFromIdx = idx;
             }
           }
@@ -1128,6 +1383,13 @@ export class LearningEngine {
         topProvenSymbols,
         riskyWhipsawSymbols,
         bySymbol,
+        tuning: analyzeTuning(tuningEvents, {
+          sl: Math.max(1.5, Math.min(5.0, opts.slPct || 3.5)),
+          minVolR: opts.minVolRatio ?? 1.3,
+          minRs: opts.minRelStrength ?? -1.0,
+          minRsi1h: opts.minRsi1h ?? 40,
+          tpMode: normalizeTpMode(opts.tpMode),
+        }),
       };
 
       this.shadowSummary = summary;

@@ -9433,6 +9433,41 @@
           : list.map((p) => `<span class="lr-chip-bad">${p.symbol} • ${p.winRatePct}% (${p.avgPnlPct}%) ${p.scoreAdj || 0}${p.avoidInDefensive ? " 🚫" : ""}</span>`).join("");
       }
 
+      const elTuneBox = document.getElementById("lrTuningBox");
+      const elTuneBadge = document.getElementById("lrTuningMetaBadge");
+      const tun = shad?.tuning || null;
+      if (elTuneBadge) {
+        elTuneBadge.textContent = tun ? `${tun.setups || 0} setups (Train ${tun.trainSetups || 0} / Test ${tun.testSetups || 0})` : "รอสแกน";
+      }
+      if (elTuneBox) {
+        if (!tun) {
+          elTuneBox.innerHTML = '<span style="color:#64748b;">ยังไม่มีผลวิเคราะห์ — กด "🔬 รัน Shadow Scan"</span>';
+        } else {
+          const fmtM = (m) => `${m.trades} ไม้ • WR ${m.winRatePct}% • เฉลี่ย ${m.avgPnlPct >= 0 ? "+" : ""}${m.avgPnlPct}% • PF ${m.profitFactor}`;
+          const confCol = { HIGH: "#4ade80", MEDIUM: "#fbbf24", LOW: "#94a3b8" };
+          const recs = Array.isArray(tun.recommendations) ? tun.recommendations : [];
+          const recHtml = recs.length === 0
+            ? `<div style="color:#94a3b8;">${tun.note || "ยังไม่มีค่าที่ดีกว่าค่าปัจจุบันอย่างมีนัยสำคัญ"}</div>`
+            : recs.map((r) => `
+                <div class="lr-list-item" style="flex-direction:column; align-items:flex-start; gap:4px;">
+                  <div style="width:100%; display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap;">
+                    <strong style="color:#f8fafc;">${r.label}: ${r.current} ➔ ${r.suggested}</strong>
+                    <span style="color:${confCol[r.confidence] || "#94a3b8"}; font-weight:700;">${r.confidence} • Test ${r.testAvgDeltaPct >= 0 ? "+" : ""}${r.testAvgDeltaPct}pp/ไม้</span>
+                  </div>
+                  <div style="font-size:11px; color:#94a3b8;">ปัจจุบัน (Test): ${fmtM(r.baselineTest)}</div>
+                  <div style="font-size:11px; color:#cbd5e1;">ถ้าเปลี่ยน (Test): ${fmtM(r.suggestedTest)}</div>
+                  <div style="font-size:11px; color:#94a3b8;">${r.verdict}</div>
+                </div>`).join("");
+          const comb = tun.combined
+            ? `<div class="lr-list-item" style="flex-direction:column; align-items:flex-start; gap:3px; border-color:rgba(74,222,128,0.35);">
+                 <strong style="color:#86efac;">รวมคำแนะนำที่ผ่านการยืนยัน: ${Object.entries(tun.combined.params).map(([k, v]) => `${k}=${v}`).join(", ")}</strong>
+                 <div style="font-size:11px; color:#cbd5e1;">Test เดิม: ${fmtM(tun.baselineTest)}</div>
+                 <div style="font-size:11px; color:#cbd5e1;">Test หลังรวม: ${fmtM(tun.combined.test)}</div>
+               </div>` : "";
+          elTuneBox.innerHTML = `${recHtml}${comb}<div style="font-size:10.5px; color:#64748b;">${tun.note || ""}</div>`;
+        }
+      }
+
       const bs = rep.blockedSignals || {};
       if (elPendingBadge) elPendingBadge.textContent = `Pending 4h: ${bs.pendingEvaluation || 0} • ตรวจแล้ว: ${bs.evaluatedTotal || 0}`;
       if (elBlockedBody) {

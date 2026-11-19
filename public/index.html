@@ -13,7 +13,7 @@
   <link
     href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap"
     rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=0.3.0.95" />
+  <link rel="stylesheet" href="style.css?v=0.3.0.96" />
   <!-- TradingView Lightweight Charts -->
   <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 </head>
@@ -3088,6 +3088,14 @@
           </div>
         </div>
 
+        <div class="lr-section" id="lrTuningSection">
+          <div class="lr-section-head">
+            <h3>💡 คำแนะนำการจูนค่า (Advisory — ไม่ปรับอัตโนมัติ, ยืนยัน Train 70% / Test 30%)</h3>
+            <span class="lr-meta-pill" id="lrTuningMetaBadge">รอสแกน</span>
+          </div>
+          <div id="lrTuningBox" class="lr-list-box"><span style="color:#64748b;">รอผลการสแกน...</span></div>
+        </div>
+
         <div class="lr-section">
           <div class="lr-section-head">
             <h3>🛡️ ประสิทธิภาพตัวกรอง (Counterfactual Blocked Signals — จำลอง TP1 EMA200 + Lock BE)</h3>
@@ -3374,7 +3382,7 @@
     </div>
   </div>
 
-  <script src="app.js?v=0.3.0.95"></script>
+  <script src="app.js?v=0.3.0.96"></script>
 </body>
 
 </html>
