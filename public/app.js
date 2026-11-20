@@ -273,10 +273,20 @@
       minMove: minMove || (1 / Math.pow(10, precision)),
     };
     try {
-      if (candleSeries) candleSeries.applyOptions({ priceFormat: pFormat });
-      if (downtrendLineSeries) downtrendLineSeries.applyOptions({ priceFormat: pFormat });
-      if (uptrendLineSeries) uptrendLineSeries.applyOptions({ priceFormat: pFormat });
-      if (waveCycleLineSeries) waveCycleLineSeries.applyOptions({ priceFormat: pFormat });
+      for (const s of [
+        candleSeries,
+        downtrendLineSeries,
+        uptrendLineSeries,
+        waveCycleLineSeries,
+        ema4Series,
+        ema8Series,
+        ema16Series,
+        ema25Series,
+        ema75Series,
+        ema200Series,
+      ]) {
+        if (s) s.applyOptions({ priceFormat: pFormat });
+      }
       chart.applyOptions({
         localization: {
           priceFormatter: (price) =>
@@ -760,6 +770,120 @@
   let currentActiveTimeframe = "15m";
   let cachedPrimaryCandles = [];
   let cachedHtfCandles = [];
+  let lastScaledChartKey = "";
+  let lastScaledPriceRef = 0;
+
+  function resetRightPriceScaleAutoScale() {
+    if (!chart) return;
+    try {
+      chart.priceScale("right").applyOptions({ autoScale: true });
+    } catch (_) {}
+  }
+
+  function clearChartOverlaysAndSeries() {
+    cachedPrimaryCandles = [];
+    cachedHtfCandles = [];
+    pendingCandles = null;
+    pendingTick = null;
+    latestCandleTime = 0;
+    latestCandle = null;
+    lastScaledChartKey = "";
+    lastScaledPriceRef = 0;
+    cachedCandlesMap.clear();
+    maFanCandleDataMap.clear();
+    orderMarkers = [];
+    structureMarkers = [];
+    orderBadgesData = [];
+    swingBadgesData = [];
+    badgeDomPool.clear();
+    swingBadgeDomPool.clear();
+    if (elChartOrderBadgesLayer) elChartOrderBadgesLayer.innerHTML = "";
+    if (elChartSwingBadgesLayer) elChartSwingBadgesLayer.innerHTML = "";
+    if (typeof closeCandleInspector === "function") closeCandleInspector();
+
+    if (candleSeries) {
+      for (const l of [
+        lineUpperBound,
+        lineLiveCalculatedUpperBound,
+        lineBottomBound,
+        lineLiveCalculatedBottomBound,
+        lineCutLossBound,
+        lineCenter,
+        lineBuyTrigger,
+        lineSellTrigger,
+        lineSwingEntry,
+        lineSwingTp1,
+        lineSwingTp2,
+        lineSwingSl,
+        lineSwingNextEntry,
+        lineMfEntry,
+        lineMfPlanEntry,
+        lineMfTp1,
+        lineMfTp2,
+        lineMfSl,
+        lineMfBench4h,
+        lineMfBench1d,
+        lineHtfCeil,
+        lineHtfFloor,
+        linePoc,
+      ]) {
+        if (l) {
+          try { candleSeries.removePriceLine(l); } catch (_) {}
+        }
+      }
+      while (gridZoneLevelLines.length > 0) {
+        const l = gridZoneLevelLines.pop();
+        if (l) try { candleSeries.removePriceLine(l); } catch (_) {}
+      }
+      while (openOrderPriceLines.length > 0) {
+        const l = openOrderPriceLines.pop();
+        if (l) try { candleSeries.removePriceLine(l); } catch (_) {}
+      }
+      try { candleSeries.setMarkers([]); } catch (_) {}
+      try { candleSeries.setData([]); } catch (_) {}
+    }
+
+    lineUpperBound = null;
+    lineLiveCalculatedUpperBound = null;
+    lineBottomBound = null;
+    lineLiveCalculatedBottomBound = null;
+    lineCutLossBound = null;
+    lineCenter = null;
+    lineBuyTrigger = null;
+    lineSellTrigger = null;
+    lineSwingEntry = null;
+    lineSwingTp1 = null;
+    lineSwingTp2 = null;
+    lineSwingSl = null;
+    lineSwingNextEntry = null;
+    lineMfEntry = null;
+    lineMfPlanEntry = null;
+    lineMfTp1 = null;
+    lineMfTp2 = null;
+    lineMfSl = null;
+    lineMfBench4h = null;
+    lineMfBench1d = null;
+    lineHtfCeil = null;
+    lineHtfFloor = null;
+    linePoc = null;
+
+    for (const s of [
+      downtrendLineSeries,
+      uptrendLineSeries,
+      waveCycleLineSeries,
+      ema4Series,
+      ema8Series,
+      ema16Series,
+      ema25Series,
+      ema75Series,
+      ema200Series,
+    ]) {
+      if (s) {
+        try { s.setData([]); } catch (_) {}
+      }
+    }
+    resetRightPriceScaleAutoScale();
+  }
 
   function initChart() {
     if (chart && candleSeries) return;
@@ -1106,6 +1230,7 @@
 
       if (btnFitChart) {
         btnFitChart.addEventListener("click", () => {
+          resetRightPriceScaleAutoScale();
           chart.timeScale().fitContent();
           chart.timeScale().applyOptions({ rightOffset: 20 });
           setTimeout(() => { updateOrderBadgesPositions(); updateSwingBadgesPositions(); }, 50);
@@ -1342,16 +1467,20 @@
 
   async function inspectPortfolioSymbol(symbol) {
     if (!symbol) return;
+    const reqBase = API_BASE;
     lastInspectedPortfolioSymbol = symbol;
+    resetRightPriceScaleAutoScale();
     try {
-      const res = await fetch(`${API_BASE}/api/portfolio/inspect`, {
+      const res = await fetch(`${reqBase}/api/portfolio/inspect`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ symbol }),
       });
       const payload = await res.json();
+      if (reqBase !== API_BASE) return;
       if (payload && payload.success) {
         if (Array.isArray(payload.candles) && payload.candles.length > 0) {
+          resetRightPriceScaleAutoScale();
           updateCandles(payload.candles);
           if (currentActiveTimeframe === "15m") {
             updateMaFanRibbonLines(payload.candles);
@@ -2426,10 +2555,23 @@
     const cleanCandles = formatCandles(targetList);
     if (cleanCandles.length > 0) {
       try {
+        const lastC = cleanCandles[cleanCandles.length - 1];
+        const curPrice = Number(lastC.close || 0);
+        const baseKey = typeof API_BASE !== "undefined" ? API_BASE : "";
+        const symKey = lastInspectedPortfolioSymbol || activeSymbol || "";
+        const scaleKey = `${baseKey}|${symKey}|${currentActiveTimeframe}`;
+        const priceJumped =
+          lastScaledPriceRef > 0 && curPrice > 0 && Math.abs(curPrice - lastScaledPriceRef) / lastScaledPriceRef > 0.25;
+        if (lastScaledChartKey !== scaleKey || priceJumped) {
+          resetRightPriceScaleAutoScale();
+          lastScaledChartKey = scaleKey;
+        }
+        if (curPrice > 0) lastScaledPriceRef = curPrice;
+
         candleSeries.setData(cleanCandles);
         syncCachedCandlesMap(cleanCandles);
         updateMaFanRibbonLines(cleanCandles);
-        latestCandle = cleanCandles[cleanCandles.length - 1];
+        latestCandle = lastC;
         latestCandleTime = latestCandle.time;
         renderOhlc(latestCandle);
         rebuildOrderMarkers();
@@ -5789,10 +5931,12 @@
   }
 
   async function refreshFrontPageState() {
+    const reqBase = API_BASE;
     try {
-      const res = await fetch(`${API_BASE}/api/state`);
-      if (!res.ok) return;
+      const res = await fetch(`${reqBase}/api/state`);
+      if (!res.ok || reqBase !== API_BASE) return;
       const data = await res.json();
+      if (reqBase !== API_BASE) return;
       if (data.latestTick) {
         updateTick(data.latestTick);
       }
@@ -5915,15 +6059,18 @@
   }
 
   function connectSSE() {
+    const reqBase = API_BASE;
     let initialLoaded = false;
 
-    fetch(`${API_BASE}/api/state`)
+    fetch(`${reqBase}/api/state`)
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json();
       })
       .then((data) => {
+        if (reqBase !== API_BASE) return;
         initialLoaded = true;
+        resetRightPriceScaleAutoScale();
         if (data.versionInfo) {
           updateVersionBadge(data.versionInfo);
         }
@@ -5990,7 +6137,8 @@
         }
       })
       .catch((err) => {
-        console.warn(`Could not load initial state from ${API_BASE}/api/state:`, err);
+        if (reqBase !== API_BASE) return;
+        console.warn(`Could not load initial state from ${reqBase}/api/state:`, err);
         loadFallbackCandles();
       });
 
@@ -9926,10 +10074,13 @@
       initChart();
       chartInitialized = true;
     }
+    const reqBase = API_BASE;
     rawOrders = [];
     latestGridData = null;
     activeSymbol = "";
     activeStrategyType = "";
+    lastInspectedPortfolioSymbol = "";
+    clearChartOverlaysAndSeries();
     tmTrades = [];
     tmRounds = [];
     tmRoundsSummary = null;
@@ -9956,6 +10107,7 @@
     }
 
     await loadSettings();
+    if (reqBase !== API_BASE) return;
     connectSSE();
     checkBotPauseStatus();
     loadTradeManagerData();

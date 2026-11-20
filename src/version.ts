@@ -2,7 +2,7 @@ import { execSync } from "child_process";
 import fs from "fs";
 import path from "path";
 
-let cachedVersion = "0.3.1.2";
+let cachedVersion = "0.3.1.3";
 try {
   const pkgPath = path.resolve(process.cwd(), "package.json");
   if (fs.existsSync(pkgPath)) {

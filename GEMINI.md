@@ -10130,3 +10130,14 @@ When investigating live production behavior, debugging issues, or analyzing trad
      - อัปเกรด `isOpeningSession45mBar()` ฝั่ง Crypto ให้คำนวณ `09:30–10:15 ET` จันทร์–ศุกร์แบบ DST-aware (America/New_York EST & EDT อัตโนมัติ) พร้อมรองรับ `requireCryptoSpike` สำหรับ `openingSessionStats`
      - เพิ่มฟิลด์ `snrAtr` / `minSnrAtr` ใน `TuningEvent` และกรองใน `evalTuneConfig()` ให้ `Auto-Pilot` สอดคล้องกับ `Q4` 100%
 - **Version Bump**: **`0.3.1.2`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 347. Multi-Instance Chart Auto-Scale Lock Fix & Overlay Cleanup (`public/app.js`, v0.3.1.3)
+- **สาเหตุที่กราฟฝั่ง Binance (`binance_dry` / `SOLUSDT $72.67`) ว่างเปล่าไม่เห็นแท่งเทียนหลังสลับมาจาก `alpaca_kyne`**:
+  1. แกนราคาแนวตั้ง (`rightPriceScale`) ของ Lightweight Charts ค้างอยู่ที่ช่วงราคาเก่าของ `VTI` (`$362–$380`) เมื่อ `autoScale` ถูกปิดจากการเลื่อน/ซูมก่อนหน้า และการเรียก `candleSeries.setData()`, `chart.timeScale().fitContent()`, ปุ่ม `#btnFitChart`, [`inspectPortfolioSymbol()`](file:///c:/Sites/github/dynamic-grid-bn/public/app.js#L1343) รวมถึง [`refreshWorkerDashboard()`](file:///c:/Sites/github/dynamic-grid-bn/public/app.js#L9924) ไม่ได้สั่งคืนค่า `chart.priceScale("right").applyOptions({ autoScale: true })`
+  2. `refreshWorkerDashboard()` ไม่ได้ล้างแคชแท่งเทียน/ซีรีส์/Price Lines เก่า และยังไม่มี guard ป้องกัน `fetch(${API_BASE}/api/state)` จาก Instance เก่าที่ตอบช้ากว่าเขียนทับ Instance ใหม่
+- **การแก้ไข (`public/app.js`)**:
+  - เพิ่ม `resetRightPriceScaleAutoScale()` และ `clearChartOverlaysAndSeries()` เพื่อล้างข้อมูล/เส้นกราฟ/Price Lines/Badges เก่าและเปิด `autoScale: true` บนแกนขวาทุกครั้งใน `refreshWorkerDashboard()`, ปุ่ม `#btnFitChart`, `inspectPortfolioSymbol()`, และ `applyCurrentTimeframeCandles()` (รีเซ็ตอัตโนมัติเมื่อสลับสัญลักษณ์/Timeframe หรือช่วงราคาเปลี่ยนเกิน ±25%)
+  - อัปเดต `ema4Series..ema200Series` ให้ใช้ `priceFormat` เดียวกับ `candleSeries` ใน `updateChartPrecision()` และเพิ่ม `reqBase === API_BASE` guard ใน `connectSSE()` และ `refreshFrontPageState()`
+- **Version Bump**: **`0.3.1.3`** (`package.json`, `src/version.ts`, `public/index.html`)
