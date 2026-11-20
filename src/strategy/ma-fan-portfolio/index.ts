@@ -1189,21 +1189,12 @@ export class MaFanPortfolioStrategy implements IStrategy {
     let regimeMinRs = -1.0;
     let regimeMinRsi1h = 40;
     if (q2RegimeActive) {
-      if (breadthPct < 38) {
+      if (breadthPct < 55) {
         tp1Mode = configuredTp1Mode === "none" ? "none" : "EMA25";
-        regimeMinVolR = 1.5;
-        regimeMinRs = 0.0;
-        regimeMinRsi1h = 42;
-      } else if (breadthPct >= 58) {
+      } else if (breadthPct < 70) {
         tp1Mode = configuredTp1Mode === "none" ? "none" : "EMA75";
-        regimeMinVolR = 1.3;
-        regimeMinRs = -0.5;
-        regimeMinRsi1h = 40;
       } else {
-        tp1Mode = configuredTp1Mode;
-        regimeMinVolR = 1.4;
-        regimeMinRs = -0.5;
-        regimeMinRsi1h = 41;
+        tp1Mode = configuredTp1Mode === "none" ? "none" : "EMA200";
       }
     }
     const disasterSlPct = Number(this.cfg.portfolioDisasterSlPct ?? 3.5);
@@ -1421,9 +1412,17 @@ export class MaFanPortfolioStrategy implements IStrategy {
         }
       }
 
-      // Compute Confirmation Metrics
+      // Compute Confirmation Metrics (strictly use latest closed 1h bar for zero-lookahead parity)
       const rsi15 = ind.rsi15[idx] ?? 50;
-      const rsi1h = ind.rsi1h.length > 0 ? (ind.rsi1h[ind.rsi1h.length - 1] ?? 50) : 50;
+      let closed1hIdx = ind.c1h.length - 1;
+      while (
+        closed1hIdx > 0 &&
+        (ind.c1h[closed1hIdx]?.isClosed === false ||
+          (ind.c1h[closed1hIdx] && ind.c1h[closed1hIdx]!.time + 3600 > c.time + 900))
+      ) {
+        closed1hIdx--;
+      }
+      const rsi1h = closed1hIdx >= 0 && ind.rsi1h.length > closed1hIdx ? (ind.rsi1h[closed1hIdx] ?? 50) : 50;
 
       let upV = 0;
       let dnV = 0;

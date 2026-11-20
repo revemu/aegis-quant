@@ -10083,20 +10083,31 @@ When investigating live production behavior, debugging issues, or analyzing trad
 - **การแก้ไขและสถาปัตยกรรมใหม่**:
   1. **5 Quant Learning Modules** (`src/config.ts`, `src/learning-engine.ts`, `src/strategy/ma-fan-portfolio/index.ts`, `public/app.js` — เปิดใช้งาน Default ON ทั้ง 5 ข้อ):
      - **Q1 (`portfolioQuantCorrelationGuard`)**: `calcRollingReturnCorrelation` (48-bar 15m rolling Pearson $\rho$) บล็อกตัวที่มี $\rho > 0.75$ กับ Slot ที่ถืออยู่ (รวมถึงเช็กแบบ Dynamic ระหว่างออกหลายไม้ใน Cycle เดียวกัน, `FILTER:HIGH_CORR`)
-     - **Q2 (`portfolioQuantRegimeConditional`)**: สลับ TP1 และ Filter อัตโนมัติตาม Breadth (`<38%`: `EMA25` + `VolR>=1.5, RS>=0%, 1hRSI>=42`; `>=58%`: `EMA75` + `VolR>=1.3, RS>=-0.5%, 1hRSI>=40`; `38–58%`: `VolR>=1.4, RS>=-0.5%, 1hRSI>=41`)
+     - **Q2 (`portfolioQuantRegimeConditional`)**: สลับกรอบ TP1 Horizon อัตโนมัติตาม Breadth ที่ยืนยันแล้ว (`<55%`: `EMA25`, `55–70%`: `EMA75`, `>=70%`: `EMA200`) โดยไม่ Over-throttle เกณฑ์คัดกรองกลางตลาด เพื่อให้ `SurvivalGuard` และ `Q4` กรองคุณภาพจุดเข้าและล็อก 50% TP1 + Break-Even ได้เร็วในช่วงรีบาวด์ตลาดหมี
      - **Q3 (`portfolioQuantSessionGuard`)**: `isOpeningSession45mBar` กรองช่วง 45 นาทีแรกของตลาด US (หรือ US cash open spike บน Crypto) ต้องยืนยัน `VolR >= 1.85` และ `RS >= +0.40%` (`FILTER:OPEN_SESSION_45M`)
      - **Q4 (`portfolioQuantVolTargetedRisk`)**: `calcCandleAtrPct14` กรอง Reward-to-ATR `snrAtr = distanceToEma200Pct / max(0.12, atrPct) >= 1.25` (`FILTER:LOW_SNR_ATR`), โบนัสคะแนน `+8` เมื่อ SNR `3.5–12`, และลดขนาดไม้แบบ Inverse-Vol (`0.70–1.0x`) เมื่อ `atrPct > 1.35 * medianAtrPct`
      - **Q5 (`portfolioQuantEmpiricalEv`)**: `computeFeatureBucketKey` & `getEmpiricalBayesEvAdjustment` คำนวณ Empirical Bayes Expected Value shrinkage จาก `featureBucketEv` ของ Shadow Walk-Forward (`FILTER:NEG_EMPIRICAL_EV`)
-     - **ผล Backtest เปรียบเทียบ (หุ้น US 49-Ticker Universe, 60 วัน / 1,555 แท่ง 15m, `$100k`, 50% MM, ต้นทุน 0.06%)**:
-       - Baseline (`v0.3.0.99`, Quant OFF): `65` ไม้ | WR `83.1%` | Net `+$700.57 (+0.70%)` | PF `1.11` | MaxDD `2.46%` | SL `8`
-       - `+Q1 Only`: `65` ไม้ | WR `83.1%` | Net `+$2,474.15 (+2.47%)` | PF `1.50` | MaxDD `1.79%` | SL `7`
-       - `+Q2 Only`: `54` ไม้ | WR `83.3%` | Net `+$1,088.31 (+1.09%)` | PF `1.22` | MaxDD `1.64%` | SL `7`
-       - `+Q3 Only`: `64` ไม้ | WR `84.4%` | Net `+$1,205.38 (+1.21%)` | PF `1.22` | MaxDD `2.24%` | SL `7`
-       - `+Q4 Only`: `53` ไม้ | WR `84.9%` | Net `+$3,133.86 (+3.13%)` | PF `1.86` | MaxDD `1.85%` | SL `5`
-       - `+Q5 Only`: `60` ไม้ | WR `86.7%` | Net `+$3,806.37 (+3.81%)` | PF `2.17` | MaxDD `1.78%` | SL `5`
-       - **Full Quant Suite (เปิดทั้ง 5 ข้อ)**: `40` ไม้ | WR **`90.0%`** | Net **`+$3,602.33 (+3.60%)`** | PF **`2.75`** | MaxDD **`1.19%`** | SL **`2`**
+     - **ผล Strict Zero-Lookahead Ablation Backtest (`c1h` ปิดแท่ง `c1h[p1].time + 3600 <= c15[i].time` + `Q5` Causal `resolveTime = c15[exitBarIdx].time`, หุ้น US 49-Ticker, 60 วัน / `$100k`, 50% MM, ต้นทุน 0.06% ไป-กลับ, Split Train วันที่ 1–30 vs OOS Test วันที่ 31–60)**:
+       - Baseline (`Quant OFF`, `TP1=EMA200`): Train `23t | WR 78.3% | -$1,742 | PF 0.52 | DD 2.04% | SL:5` || OOS `24t | WR 87.5% | +$2,772 | PF 3.13 | DD 1.22% | SL:2` || Full 60D `47t | WR 83.0% | +$1,012 | PF 1.21 | DD 2.10% | SL:7`
+       - `+Q1 Only`: Train `-$2,509` || OOS `22t | WR 90.9% | +$3,311 | PF 5.78 | DD 0.90% | SL:1` || Full `+$771 (PF 1.16)`
+       - `+Q2 Only (TP1 Horizon Switch)`: Train `-$1,780` || OOS `+$2,156 (PF 2.60)` || Full `+$368 (PF 1.07)`
+       - `+Q3 Only`: Train `-$1,524 (DD 1.92%)` || OOS `+$2,772 (PF 3.13)` || Full `+$1,232 (PF 1.25, DD 1.92%)`
+       - `+Q4 Only`: Train `21t | WR 81.0% | -$483 | PF 0.80 | DD 1.67% | SL:4` || OOS `16t | WR 93.8% | +$3,334 | PF 6.41 | DD 1.23% | SL:1` || Full `37t | WR 86.5% | +$2,838 | PF 1.95 | DD 1.67% | SL:5`
+       - `+Q5 Only`: Train `-$1,700` || OOS `+$2,595` || Full `+$881`
+       - **Full Quant Suite (`Q1..Q5` ON)**: Train `22t | WR 77.3% | -$1,211 | PF 0.59 | DD 2.36% | SL:5` || **OOS Test `16t | WR 93.8% | +$3,547 | PF 112.59 | DD 0.67% | SL:0`** || **Full 60D `38t | WR 84.2% | +$2,308 | PF 1.77 | DD 2.36% | SL:5`**
   2. **Holding Focus Mode & Pre-Signal/Pre-Order Market-Closed Guard** (`src/db.ts`, `src/strategy/ma-fan-portfolio/types.ts`, `src/strategy/ma-fan-portfolio/index.ts`, `public/app.js`):
      - Pre-Signal Guard: เมื่อ `isMarketClosed === true` พักออกสัญญาณเข้าซื้อบน Radar (`SCANNING`) และ `buildSlotTelemetryList()` ซ่อน `nextCandidate` (`readyBudget = 0`) บน Slot ว่างเมื่อตลาดปิด / Paused / Sit-Out / ครบโควตา Survival / ครบเพดาน MM 50%
      - Pre-Order Market-Closed Cut Queue: `closeSlot()` / `sellAllUser()` ตอน `isMarketClosed === true` บน Alpaca จะตั้งค่า `pendingExitOnOpen = true` (`pendingExitReason`) และปิดไม้อัตโนมัติทันทีที่ตลาดเปิดใน `evaluatePortfolioCycle()`, พร้อม `cancelAllOpenOrders()` ก่อน Urgent Market Sell และให้ `syncOnChainOrders()` (ทุก 20s ใน `tick()`) เคลียร์ Slot ที่ Position บน Alpaca เป็น 0 ออกอัตโนมัติ
      - Holding Focus UX: `stageWeight.HOLDING = 1000`, Auto-Focus `inspectedSymbol` ไปยัง Slot ที่ถือ, แสดง Holding Management Checklist บน `#pfChecklistGrid`, และป้าย `SURVIVAL_CAP` / `MM_CAP` + `Quant 5x` chip
 - **Version Bump**: **`0.3.1.0`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 345. Strict Zero-Lookahead Causal 1h RSI Alignment & OOS-Calibrated Q2 Regime TP1 Switching (v0.3.1.1)
+- **สาเหตุที่ต้องปรับเทียบจากผลการตรวจ Zero-Lookahead (`strict_ablation3.mjs`)**:
+  1. ใน `src/strategy/ma-fan-portfolio/index.ts` เดิมอ่าน `ind.rsi1h[ind.rsi1h.length - 1]` ซึ่งอาจดึงแท่ง `1h` ที่ยังไม่ปิดชั่วโมงระหว่างเทรดสด ทำให้อาจไม่ตรงกับ `runShadowWalkForward()` และ Backtest ไร้ Look-Ahead
+  2. เกณฑ์ `Q2` เดิมไปเข้มงวดตัวกรอง `VolR >= 1.4, RS >= -0.5%, 1hRSI >= 41` ในช่วง Mid-Breadth (`38–58%`) ซ้ำซ้อนกับ `SurvivalGuard` และ `Q4` จนบล็อกไม้ชนะใน OOS Test ไปหลายไม้
+- **การแก้ไข (`src/strategy/ma-fan-portfolio/index.ts`)**:
+  1. **Closed-Bar `1h RSI` Causal Lookup**: ถอยดัชนี `closed1hIdx` เพื่อบังคับใช้เฉพาะแท่ง `1h` ที่ `isClosed !== false` และ `c1h.time + 3600 <= c.time + 900` เสมอ (Causal Parity 100% กับ Backtest)
+  2. **OOS-Calibrated `Q2` Regime TP1 Horizon Switching**: ให้ `Q2` ปรับเฉพาะเป้าหมาย `TP1` ตาม Market Breadth (`<55% -> EMA25`, `55–70% -> EMA75`, `>=70% -> EMA200`) โดยคงตัวกรองคุณภาพไว้ที่ `SurvivalGuard` + `Q4` ช่วยดัน **OOS Test Net Profit จาก `+$2,772 (PF 3.13, DD 1.22%, SL: 2)` ➔ `+$3,547 (PF 112.59, DD 0.67%, SL: 0)`**
+- **Version Bump**: **`0.3.1.1`** (`package.json`, `src/version.ts`, `public/index.html`)
