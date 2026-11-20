@@ -31,6 +31,7 @@ This document is the persistent operational and architectural knowledge base for
 > ⚠️ **STRICT INVESTIGATION & CONFIG GUARDRAILS**:
 > 1. **ต้องดึงสถานะสดจาก Orchestrator เสมอ**: เมื่อผู้ใช้ถามสถานะ แจ้งปัญหา หรือส่งรูปภาพ ต้องล็อกอินด้วย `.env` (`ORCH_URL` / `ORCH_USERNAME` / `ORCH_PASSWORD`) แล้วดึงข้อมูลจาก `/api/orch/instances` และ `/i/<instanceKey>/api/*` เสมอ ห้ามสรุปจากไฟล์บนเครื่อง Local เด็ดขาด
 > 2. **Safe Partial Config Patch**: เมื่อปรับค่า Runtime Settings ผ่าน `POST /i/<instanceKey>/api/config` ให้ส่งเฉพาะฟิลด์ที่ต้องการเปลี่ยน ห้ามส่งค่า `"******"` ทับ credentials และห้ามส่ง `strategyType`/`strategyMode` เว้นแต่ตั้งใจสลับโหมดกลยุทธ์
+> 3. **Zero-Lookahead & Anti-Bias Backtesting**: ทุกครั้งที่เขียนสคริปต์จำลองหรือรัน Backtest ห้ามมี Look-Ahead Bias เด็ดขาด: (ก) อินดิเคเตอร์ Timeframe ใหญ่ (`1h RSI`, `4h/1d EMA`) ต้องอ้างอิงเฉพาะแท่งที่ปิดสมบูรณ์แล้วก่อนหรือ ณ เวลาแท่งปัจจุบัน (`c1h.time + 3600 <= c15.time`), (ข) ข้อมูลเรียนรู้ย้อนหลัง (`Shadow EV`, `WinMAE`, `Cooldown`) ต้องรับรู้ผล ณ แท่งที่ไม้นั้นปิดจบจริง (`resolveTime = exitBarTime <= currentBarTime`), (ค) ต้องจำลองเงินทุนจำกัด (`initialCapital` + `portfolioCapitalUsagePct` MM Cap + หัก Cash ทันที + หักค่าธรรมเนียมไป-กลับ), และ (ง) ต้องแยกวัดผล **In-Sample (Train) vs Out-of-Sample (OOS Test)** เสมอ ห้ามปรับจูนเกณฑ์แล้วรายงานเฉพาะผล In-Sample
 
 ---
 
