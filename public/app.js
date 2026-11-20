@@ -1378,7 +1378,11 @@
       });
       const out = await res.json();
       if (out.success) {
-        showToast({ title: `CLOSED SLOT ${slotIndex + 1} (${symbol})`, desc: "ส่งคำสั่งขายปิด Slot เรียบร้อยแล้ว", action: "TAKE_PROFIT" });
+        showToast({
+          title: out.queuedForMarketOpen ? `QUEUED SLOT ${slotIndex + 1} (${symbol})` : `CLOSED SLOT ${slotIndex + 1} (${symbol})`,
+          desc: out.queuedForMarketOpen ? "ตลาดปิดอยู่ — ล็อกคิวขายปิด Slot อัตโนมัติทันทีที่ตลาดเปิด" : "ส่งคำสั่งขายปิด Slot เรียบร้อยแล้ว",
+          action: "TAKE_PROFIT",
+        });
         await refreshFrontPageState();
         loadTradeManagerData();
       } else {
@@ -1409,6 +1413,22 @@
       const detail = parts.length > 0 ? `${macro.benchmarkSymbol || "BTC"} รอ ${parts.join(" & ")}` : (macro.reason || "รอ Macro ผ่านเกณฑ์");
       return { code: "SIT_OUT", shortTag: "SIT-OUT", label: `🛡️ Macro Sit-Out (${macro.benchmarkSymbol || "SPY"})`, detail };
     }
+    if (pf?.survival?.enforced && (pf.usedSlots || 0) >= (pf.survival.effectiveMaxSlots || pf.maxSlots || 3)) {
+      return {
+        code: "SURVIVAL_CAP",
+        shortTag: "FULL-CAP",
+        label: `🔒 โควตาเต็ม (${pf.survival.posture} ${pf.usedSlots}/${pf.survival.effectiveMaxSlots} ช่อง)`,
+        detail: "โฟกัสดูแลไม้ที่ถืออยู่ ไม่เปิดไม้เพิ่ม",
+      };
+    }
+    if ((pf?.usedSlots || 0) > 0 && Number(pf?.freeCash ?? 0) < 5) {
+      return {
+        code: "MM_CAP",
+        shortTag: "MM-FULL",
+        label: "🔒 ใช้งบครบเพดาน MM 50% แล้ว",
+        detail: "โฟกัสดูแลไม้ที่ถืออยู่ ไม่เปิดไม้เพิ่ม",
+      };
+    }
     return null;
   }
 
@@ -1416,8 +1436,9 @@
     if (!cand) return "กำลังสแกนหาเหรียญที่ฟอร์ม Bottom Fan...";
     const stage = cand.stage || "SCANNING";
     const px = Number(cand.price ?? cand.livePrice ?? 0);
+    const ema8 = Number(cand.ema8 || 0);
     const ema4 = Number(cand.ema4 || 0);
-    const dist4 = ema4 > 0 && px > 0 ? ((px - ema4) / ema4) * 100 : Number(cand.distanceToEma4Pct || 0);
+    const dist8 = ema8 > 0 && px > 0 ? ((px - ema8) / ema8) * 100 : Number(cand.distanceToEma4Pct || 0);
 
     if (stage === "PULLBACK_READY") {
       return blocker
@@ -1425,7 +1446,8 @@
         : `⚡ ผ่านครบทุกข้อ! พร้อมส่งซื้อเข้า Slot (Sc ${Number(cand.score || 0).toFixed(1)})`;
     }
     if (stage === "WAITING_PULLBACK") {
-      return `⏳ รอราคาย่อแตะ EMA4 ($${fmtPrice(ema4)} • ห่าง ${dist4 >= 0 ? "+" : ""}${dist4.toFixed(2)}%)`;
+      if (cand.filterNote) return `⏳ ${cand.filterNote} (EMA8 $${fmtPrice(ema8)} • ${dist8 >= 0 ? "+" : ""}${dist8.toFixed(2)}%)`;
+      return `⏳ รอราคาย่อแตะฐาน ($${fmtPrice(ema8 || ema4)} • ห่าง ${dist8 >= 0 ? "+" : ""}${dist8.toFixed(2)}%)`;
     }
     if (stage === "CROSS_8X16_FAIL_FILTERS") {
       return `🚫 ย่อถึงจุดแล้วแต่ติดฟิลเตอร์: ${cand.filterNote || "ไม่ผ่านเงื่อนไข"}`;
@@ -1564,11 +1586,13 @@
           if (!Number.isFinite(progPct)) {
             progPct = (tp1 > sl && sl > 0) ? Math.max(4, Math.min(100, ((cur - sl) / (tp1 - sl)) * 100)) : 50;
           }
-          const stageTag = slot.tp1Done
-            ? "✅ TP1 Hit • Runner"
-            : slot.beLocked
-              ? "🛡️ BE Locked"
-              : (slot.phaseText || "⏳ Hunting EMA200");
+          const stageTag = slot.pendingExitOnOpen
+            ? "⏳ รอคัทตอนตลาดเปิด"
+            : slot.tp1Done
+              ? "✅ TP1 Hit • Runner"
+              : slot.beLocked
+                ? "🛡️ BE Locked"
+                : (slot.phaseText || "⏳ Hunting EMA200");
           cardsHtml.push(`
             <div class="pf-slot-card ${isInspected ? "pf-slot-active" : ""}" data-pf-sym="${slot.symbol}">
               <div class="pf-slot-top">
@@ -1590,27 +1614,35 @@
               </div>
               <div class="pf-slot-footer">
                 <span class="pf-slot-status-tag">${stageTag} • TP1 $${fmtPrice(tp1)}</span>
-                <button type="button" class="pf-btn-close-slot" data-close-slot="${i}" data-close-sym="${slot.symbol}">🛑 ปิด Slot</button>
+                <button type="button" class="pf-btn-close-slot" data-close-slot="${i}" data-close-sym="${slot.symbol}">${slot.pendingExitOnOpen ? "⏳ รอคัทเปิดตลาด" : "🛑 ปิด Slot"}</button>
               </div>
             </div>
           `);
         } else {
           const holdingSyms = new Set(activeSlots.filter((s) => s.status === "HOLDING" && s.symbol).map((s) => s.symbol));
-          const nextCand = emptyInfo?.nextCandidate || radar.find((r) => !holdingSyms.has(r.symbol));
-          const readyBudgetStr = emptyInfo?.readyBudget > 0
-            ? `~$${Math.round(emptyInfo.readyBudget).toLocaleString()}`
-            : `~${Math.round(100 / maxSlots)}%`;
+          const blockedNewEntries = Boolean(blocker);
+          const nextCand = blockedNewEntries
+            ? null
+            : (emptyInfo?.nextCandidate ?? (emptyInfo ? null : radar.find((r) => !holdingSyms.has(r.symbol))));
+          const readyBudgetStr = blockedNewEntries || (emptyInfo && !(emptyInfo.readyBudget > 0))
+            ? "$0 (พัก)"
+            : (emptyInfo?.readyBudget > 0 ? `~$${Math.round(emptyInfo.readyBudget).toLocaleString()}` : `~${Math.round(100 / maxSlots)}%`);
           const candPrice = Number(nextCand?.price ?? nextCand?.livePrice ?? 0);
           const isInspectedEmpty = Boolean(nextCand?.symbol && nextCand.symbol === inspected);
           const stageLabel = nextCand
-            ? (nextCand.stage === "PULLBACK_READY" ? (blocker ? `READY (${blocker.shortTag})` : "⚡ READY") : nextCand.stage)
+            ? (nextCand.stage === "PULLBACK_READY" ? "⚡ READY" : nextCand.stage)
             : "SCANNING";
+          const hasHeldSlots = holdingSyms.size > 0;
           const emptyHeadline = nextCand
-            ? `ตัวเต็ง: <strong style="color:#e2e8f0;">${nextCand.symbol}</strong>${candPrice > 0 ? ` ($${fmtPrice(candPrice)})` : ""} • <span style="color:${nextCand.stage === "PULLBACK_READY" && !blocker ? "#34d399" : "#fbbf24"};">${stageLabel}</span>`
-            : `กำลังสแกน ${macro.universeCount || 30} ตัว...`;
-          const waitDetail = blocker && nextCand?.stage !== "PULLBACK_READY"
-            ? `${blocker.label} • ${describePortfolioCandidateWait(nextCand, blocker)}`
-            : describePortfolioCandidateWait(nextCand, blocker);
+            ? `ตัวเต็ง: <strong style="color:#e2e8f0;">${nextCand.symbol}</strong>${candPrice > 0 ? ` ($${fmtPrice(candPrice)})` : ""} • <span style="color:${nextCand.stage === "PULLBACK_READY" ? "#34d399" : "#fbbf24"};">${stageLabel}</span>`
+            : blocker?.code === "CLOSED"
+              ? `⏸️ ตลาดปิดทำการ • <strong style="color:#94a3b8;">พักสแกนสัญญาณเข้าซื้อ</strong>`
+              : (blocker && hasHeldSlots)
+                ? `🔒 พักรับไม้ใหม่ • <strong style="color:#38bdf8;">โฟกัสดูแลไม้ที่ถืออยู่</strong>`
+                : `กำลังสแกน ${macro.universeCount || 30} ตัว...`;
+          const waitDetail = nextCand
+            ? describePortfolioCandidateWait(nextCand, blocker)
+            : (blocker ? `${blocker.label} • ${blocker.detail}` : "รอรอบสแกนถัดไป");
           cardsHtml.push(`
             <div class="pf-slot-card pf-slot-empty ${isInspectedEmpty ? "pf-slot-active" : ""} ${nextCand?.symbol ? "is-clickable" : ""}" ${nextCand?.symbol ? `data-pf-sym="${nextCand.symbol}" title="คลิกเพื่อดูกราฟและจุดรอเข้าของ ${nextCand.symbol}"` : ""}>
               <div class="pf-slot-top">
@@ -1682,10 +1714,10 @@
       const elChkStage = document.getElementById("pfChecklistStage");
       const elChkGrid = document.getElementById("pfChecklistGrid");
 
-      if (elChkTitle) elChkTitle.textContent = `🔎 สัญญาณ: ${inspected || "--"}`;
+      if (elChkTitle) elChkTitle.textContent = inspectedSlot ? `💼 โฟกัสไม้ที่ถือ: ${inspected || "--"}` : `🔎 สัญญาณ: ${inspected || "--"}`;
       if (elChkStage) {
         const stg = inspectedSlot
-          ? `HOLDING SLOT ${inspectedSlot.slotIndex + 1}`
+          ? (inspectedSlot.pendingExitOnOpen ? `SLOT ${inspectedSlot.slotIndex + 1} • PENDING EXIT` : `HOLDING SLOT ${inspectedSlot.slotIndex + 1}`)
           : (inspectedRadar?.symbol === inspected ? (inspectedRadar?.stage || "SCANNING") : "BENCHMARK");
         elChkStage.textContent = !inspectedSlot && stg === "PULLBACK_READY" && blocker
           ? `PULLBACK_READY (${blocker.shortTag})`
@@ -1693,7 +1725,70 @@
       }
 
       if (elChkGrid) {
-        if (inspectedRadar && inspectedRadar.symbol === inspected) {
+        if (inspectedSlot) {
+          const curPx = Number(inspectedSlot.currentPrice || inspectedSlot.entryPrice || 0);
+          const entryPx = Number(inspectedSlot.entryPrice || 0);
+          const slPx = Number(inspectedSlot.stopLossPrice || 0);
+          const tp1Px = Number(inspectedSlot.tp1TargetPrice || 0);
+          const pnl = Number(inspectedSlot.unrealizedPnl || 0);
+          const pnlPct = Number(inspectedSlot.unrealizedPnlPct ?? inspectedSlot.unrealizedPct ?? 0);
+          const slDistPct = curPx > 0 && slPx > 0 ? ((curPx - slPx) / curPx) * 100 : 0;
+          const tpDistPct = curPx > 0 && tp1Px > 0 ? ((tp1Px - curPx) / curPx) * 100 : 0;
+          const holdChecks = [
+            {
+              label: "สถานะไม้",
+              ok: !inspectedSlot.pendingExitOnOpen,
+              blocked: Boolean(inspectedSlot.pendingExitOnOpen),
+              val: `Slot ${inspectedSlot.slotIndex + 1} (${inspectedSlot.pendingExitOnOpen ? "⏳ รอคัทตอนตลาดเปิด" : "🟢 เฝ้าจุดออก"})`,
+            },
+            {
+              label: "ทุนเข้า / ล่าสุด",
+              ok: curPx >= entryPx,
+              val: `$${fmtPrice(entryPx)} ➔ $${fmtPrice(curPx)}`,
+            },
+            {
+              label: "Unrealized PnL",
+              ok: pnl >= 0,
+              val: `${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toFixed(2)} (${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%)`,
+            },
+            {
+              label: "Stop Loss",
+              ok: slDistPct > 1.2,
+              blocked: slDistPct <= 1.2 && slDistPct > 0,
+              val: `$${fmtPrice(slPx)} (ห่าง ${slDistPct.toFixed(2)}%)`,
+            },
+            {
+              label: "เป้า TP1",
+              ok: tpDistPct <= 0.5,
+              val: `$${fmtPrice(tp1Px)} (ห่าง ${tpDistPct.toFixed(2)}%)`,
+            },
+            {
+              label: "Lock Breakeven",
+              ok: Boolean(inspectedSlot.beLocked),
+              val: inspectedSlot.beLocked ? "✅ ล็อกทุนแล้ว" : "⏳ รอแตะ TP1",
+            },
+            {
+              label: "TP1 Partial (50%)",
+              ok: Boolean(inspectedSlot.tp1Done),
+              val: inspectedSlot.tp1Done ? "✅ แบ่งขายแล้ว" : "⏳ รอแตะเป้า",
+            },
+            {
+              label: "พัด Bullish Fan",
+              ok: Boolean(inspectedSlot.isBullishFan),
+              val: inspectedSlot.isBullishFan ? "🚀 เรียงพัดขาขึ้นครบ!" : "⏳ รอพัดเรียงตัว",
+            },
+          ];
+          elChkGrid.innerHTML = holdChecks.map((c) => {
+            const cls = c.ok ? "is-pass" : (c.blocked ? "is-blocked" : "is-fail");
+            const icon = c.ok ? "✅" : (c.blocked ? "🛡️" : "⏳");
+            return `
+              <div class="pf-chk-item ${cls}">
+                <span>${icon} ${c.label}</span>
+                <strong>${c.val}</strong>
+              </div>
+            `;
+          }).join("");
+        } else if (inspectedRadar && inspectedRadar.symbol === inspected) {
           const rStage = inspectedRadar.stage || "SCANNING";
           const hasBottomFan = Boolean(
             inspectedRadar.hadBottomFan ||
@@ -9329,6 +9424,12 @@
     const rs = Number.isFinite(Number(p.portfolioMinRelStrength24h)) ? Number(p.portfolioMinRelStrength24h) : -1.0;
     const rsi = Number.isFinite(Number(p.portfolioMinRsi1h)) ? Number(p.portfolioMinRsi1h) : 40;
     const macro = String(p.portfolioSitOutMode || "dual").toUpperCase();
+    const quantTags = [];
+    if (p.portfolioQuantCorrelationGuard !== false) quantTags.push("Corr≤0.75");
+    if (p.portfolioQuantRegimeConditional !== false) quantTags.push("Regime");
+    if (p.portfolioQuantSessionGuard !== false) quantTags.push("Open45m");
+    if (p.portfolioQuantVolTargetedRisk !== false) quantTags.push("VolSNR");
+    if (p.portfolioQuantEmpiricalEv !== false) quantTags.push("BayesEV");
     const chipStyle = "padding:2px 8px; border-radius:999px; background:rgba(15,23,42,0.75); border:1px solid rgba(148,163,184,0.25); color:#e2e8f0;";
     return [
       `MM: <b>${mmPct}%</b>`,
@@ -9339,6 +9440,7 @@
       `RS 24h: <b>&ge;${rs}%</b>`,
       `1h RSI: <b>&ge;${rsi}</b>`,
       `Macro Guard: <b>${macro}</b>`,
+      quantTags.length > 0 ? `Quant ${quantTags.length}x: <b>${quantTags.join(" • ")}</b>` : `Quant: <b>OFF</b>`,
     ].map((txt) => `<span style="${chipStyle}">${txt}</span>`).join("");
   }
 

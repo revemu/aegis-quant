@@ -71,6 +71,8 @@ export interface ShadowLearningSummary {
   topProvenSymbols: ShadowSymbolProfile[];
   riskyWhipsawSymbols: ShadowSymbolProfile[];
   bySymbol: Record<string, ShadowSymbolProfile>;
+  featureBucketEv?: Record<string, { setups: number; winRatePct: number; avgPnlPct: number }>;
+  openingSessionStats?: { setups: number; winRatePct: number; avgPnlPct: number };
   tuning?: TuningAnalysis | null;
 }
 
@@ -157,6 +159,134 @@ export function isGapInducedBar(prevBar: Candle | undefined, curBar: Candle): bo
   return gapOpenPct >= 0.5 || jumpClosePct >= 0.9;
 }
 
+/**
+ * Quant Q1: Rolling Pearson correlation of 1-bar returns across aligned timestamps
+ * between candidate `c15A[idxA]` and held slot `c15B[idxB]`.
+ */
+export function calcRollingReturnCorrelation(
+  c15A: Array<{ time: number; close: number }>,
+  idxA: number,
+  c15B: Array<{ time: number; close: number }>,
+  idxB: number,
+  windowBars = 48,
+): number {
+  if (!c15A || !c15B || idxA < windowBars || idxB < windowBars) return 0;
+  const bTimeToIdx = new Map<number, number>();
+  const startB = Math.max(1, idxB - windowBars * 2);
+  for (let j = startB; j <= idxB && j < c15B.length; j++) {
+    bTimeToIdx.set(c15B[j]!.time, j);
+  }
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (let k = 0; k < windowBars; k++) {
+    const iA = idxA - k;
+    if (iA <= 0 || iA >= c15A.length) continue;
+    const curA = c15A[iA]!;
+    const prevA = c15A[iA - 1]!;
+    const jB = bTimeToIdx.get(curA.time);
+    if (jB === undefined || jB <= 0 || prevA.close <= 0) continue;
+    const curB = c15B[jB]!;
+    const prevB = c15B[jB - 1]!;
+    if (prevB.close <= 0) continue;
+    xs.push((curA.close - prevA.close) / prevA.close);
+    ys.push((curB.close - prevB.close) / prevB.close);
+  }
+  if (xs.length < 15) return 0;
+  const n = xs.length;
+  const meanX = xs.reduce((a, b) => a + b, 0) / n;
+  const meanY = ys.reduce((a, b) => a + b, 0) / n;
+  let cov = 0;
+  let varX = 0;
+  let varY = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i]! - meanX;
+    const dy = ys[i]! - meanY;
+    cov += dx * dy;
+    varX += dx * dx;
+    varY += dy * dy;
+  }
+  if (varX <= 1e-12 || varY <= 1e-12) return 0;
+  return clamp(cov / Math.sqrt(varX * varY), -1, 1);
+}
+
+/**
+ * Quant Q4: 14-bar Wilder True Range percentage up to `upToIdx`.
+ */
+export function calcCandleAtrPct14(
+  c15: Array<{ high: number; low: number; close: number }>,
+  upToIdx?: number,
+): number {
+  if (!c15 || c15.length < 15) return 0.35;
+  const end = Math.min(c15.length - 1, upToIdx ?? c15.length - 1);
+  if (end < 14) return 0.35;
+  const warmStart = Math.max(1, end - 70);
+  if (end - warmStart + 1 < 14) return 0.35;
+
+  let trSum = 0;
+  let atrPct = 0.35;
+  let count = 0;
+  for (let i = warmStart; i <= end; i++) {
+    const c = c15[i]!;
+    const p = c15[i - 1]!;
+    const tr = Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close));
+    const trPct = c.close > 0 ? (tr / c.close) * 100 : 0;
+    count++;
+    if (count <= 14) {
+      trSum += trPct;
+      if (count === 14) atrPct = trSum / 14;
+    } else {
+      atrPct = (atrPct * 13 + trPct) / 14;
+    }
+  }
+  return atrPct > 0 ? atrPct : 0.35;
+}
+
+/**
+ * Quant Q3: Detects volatile session-opening windows (first 45m of US equities regular session,
+ * or 13:30-14:00 UTC US cash open volatility spikes for 24/7 crypto).
+ */
+export function isOpeningSession45mBar(
+  c15: Array<{ time: number; high?: number; low?: number; close?: number }>,
+  idx: number,
+  exchangeName = "alpaca",
+): boolean {
+  if (!c15 || idx <= 0 || idx >= c15.length) return false;
+  if ((exchangeName || "").toLowerCase() === "alpaca") {
+    for (let back = 0; back <= 2; back++) {
+      const j = idx - back;
+      if (j > 0 && c15[j]!.time - c15[j - 1]!.time > 3600) {
+        return true;
+      }
+    }
+    return false;
+  }
+  const bar = c15[idx]!;
+  const d = new Date(bar.time * 1000);
+  const utcMins = d.getUTCHours() * 60 + d.getUTCMinutes();
+  const inUsCashOpenWindow = utcMins >= 13 * 60 + 30 && utcMins < 14 * 60;
+  if (!inUsCashOpenWindow) return false;
+  const rangePct = bar.close && bar.close > 0 && bar.high !== undefined && bar.low !== undefined
+    ? ((bar.high - bar.low) / bar.close) * 100
+    : 0;
+  return rangePct >= 1.2;
+}
+
+/**
+ * Quant Q5: Discretize multi-factor setup features for Empirical Bayes expected-value shrinkage.
+ */
+export function computeFeatureBucketKey(
+  rs24h: number,
+  buyVolRatio: number,
+  distanceToEma200Pct: number,
+  rsi1h: number,
+): string {
+  const rsB = rs24h >= 1.2 ? "RS_HI" : rs24h >= 0 ? "RS_MID" : "RS_LO";
+  const volB = buyVolRatio >= 2.0 ? "VOL_HI" : buyVolRatio >= 1.5 ? "VOL_MID" : "VOL_LO";
+  const spB = distanceToEma200Pct >= 0.8 && distanceToEma200Pct <= 3.2 ? "SP_SWEET" : "SP_OUT";
+  const rsiB = rsi1h >= 48 ? "H_STRONG" : "H_WEAK";
+  return `${rsB}:${volB}:${spB}:${rsiB}`;
+}
+
 function normalizeBlockReasonKey(rawReason: string | null | undefined): string {
   const first = (rawReason || "OTHER").split(",")[0]?.trim() || "OTHER";
   if (first === "MACRO_SIT_OUT" || first === "SHADOW_BEAR_MACRO" || first === "FILTER_FAIL") {
@@ -173,6 +303,10 @@ function normalizeBlockReasonKey(rawReason: string | null | undefined): string {
     if (detail.includes("Cooldown")) return "FILTER:Cooldown";
     if (detail.includes("8x16_WeakMom")) return "FILTER:8x16_WeakMom";
     if (detail.startsWith("GAP_TRAP")) return "FILTER:GAP_TRAP";
+    if (detail.startsWith("HIGH_CORR")) return "FILTER:HIGH_CORR";
+    if (detail.startsWith("OPEN_SESSION_45M")) return "FILTER:OPEN_SESSION_45M";
+    if (detail.startsWith("LOW_SNR_ATR")) return "FILTER:LOW_SNR_ATR";
+    if (detail.startsWith("NEG_EMPIRICAL_EV")) return "FILTER:NEG_EMPIRICAL_EV";
     if (detail.includes("Survival")) return `FILTER:${detail}`;
   }
   return first;
@@ -840,6 +974,40 @@ export class LearningEngine {
     return Boolean(prof?.avoidInDefensive);
   }
 
+  /**
+   * Quant Q5: Compute Empirical Bayes Expected Value shrinkage combining symbol history
+   * with the structural feature-bucket prior (RS24h, BuyVolRatio, DistanceToEMA200, 1hRSI).
+   */
+  public getEmpiricalBayesEvAdjustment(
+    symbol: string,
+    features: { rs24h: number; buyVolRatio12: number; distanceToEma200Pct: number; rsi1h: number },
+  ): { shrunkEvPct: number; scoreAdj: number; shouldBlockTrap: boolean } {
+    const sym = String(symbol || "").toUpperCase();
+    const symProf = this.shadowSummary?.bySymbol?.[sym];
+    const n = symProf?.trades ?? 0;
+    const symMean = symProf?.avgPnlPct ?? 0;
+    const symWr = symProf?.winRatePct ?? 50;
+
+    const bucketKey = computeFeatureBucketKey(
+      features.rs24h,
+      features.buyVolRatio12,
+      features.distanceToEma200Pct,
+      features.rsi1h,
+    );
+    const bucket = this.shadowSummary?.featureBucketEv?.[bucketKey];
+    const priorMean = bucket && bucket.setups >= 4 ? bucket.avgPnlPct : 0.05;
+
+    const shrunkEvPct = (n * symMean + 5 * priorMean) / (n + 5);
+    const shouldBlockTrap = n >= 3 && shrunkEvPct < -0.18 && symWr < 45;
+    const scoreAdj = Math.round(clamp(shrunkEvPct * 30, -20, 25));
+
+    return {
+      shrunkEvPct: Number(shrunkEvPct.toFixed(3)),
+      scoreAdj,
+      shouldBlockTrap,
+    };
+  }
+
   public getShadowSummary(): ShadowLearningSummary | null {
     return this.shadowSummary;
   }
@@ -1409,6 +1577,8 @@ export class LearningEngine {
       const bySymbol: Record<string, ShadowSymbolProfile> = {};
       const tuningEvents: TuningEvent[] = [];
       const winMaeAbs: number[] = [];
+      const featureBucketAcc = new Map<string, { setups: number; wins: number; sumPnl: number }>();
+      const openSessionAcc = { setups: 0, wins: 0, sumPnl: 0 };
 
       let totalSetups = 0;
       let totalWins = 0;
@@ -1586,6 +1756,19 @@ export class LearningEngine {
                   if (isWin) lowBreadthWins++;
                   lowBreadthPnlSum += sim.finalRet;
                 }
+
+                const bKey = computeFeatureBucketKey(rs24, volR, d200, rsi1hVal);
+                const fb = featureBucketAcc.get(bKey) || { setups: 0, wins: 0, sumPnl: 0 };
+                fb.setups++;
+                if (isWin) fb.wins++;
+                fb.sumPnl += sim.finalRet;
+                featureBucketAcc.set(bKey, fb);
+
+                if (isOpeningSession45mBar(coin.c15, idx, ex)) {
+                  openSessionAcc.setups++;
+                  if (isWin) openSessionAcc.wins++;
+                  openSessionAcc.sumPnl += sim.finalRet;
+                }
               }
             }
           }
@@ -1690,6 +1873,20 @@ export class LearningEngine {
         portfolioTp1TargetMode: baseTpMode,
         portfolioPullbackMode: basePullbackMode,
       } as Config);
+      const featureBucketEv: Record<string, { setups: number; winRatePct: number; avgPnlPct: number }> = {};
+      for (const [k, st] of featureBucketAcc.entries()) {
+        featureBucketEv[k] = {
+          setups: st.setups,
+          winRatePct: st.setups > 0 ? Number(((st.wins / st.setups) * 100).toFixed(1)) : 0,
+          avgPnlPct: st.setups > 0 ? Number((st.sumPnl / st.setups).toFixed(3)) : 0,
+        };
+      }
+      const openingSessionStats = {
+        setups: openSessionAcc.setups,
+        winRatePct: openSessionAcc.setups > 0 ? Number(((openSessionAcc.wins / openSessionAcc.setups) * 100).toFixed(1)) : 0,
+        avgPnlPct: openSessionAcc.setups > 0 ? Number((openSessionAcc.sumPnl / openSessionAcc.setups).toFixed(3)) : 0,
+      };
+
       const summary: ShadowLearningSummary = {
         updatedAt: now,
         exchange: ex,
@@ -1712,6 +1909,8 @@ export class LearningEngine {
         topProvenSymbols,
         riskyWhipsawSymbols,
         bySymbol,
+        featureBucketEv,
+        openingSessionStats,
         tuning: analyzeTuning(tuningEvents, initTuneCfg, costPct),
       };
 
@@ -2185,6 +2384,11 @@ export class LearningEngine {
         : -1.0,
       portfolioMinRsi1h: Number.isFinite(Number(cfg.portfolioMinRsi1h)) ? Number(cfg.portfolioMinRsi1h) : 40,
       portfolioSitOutMode: cfg.portfolioSitOutMode || "dual",
+      portfolioQuantCorrelationGuard: cfg.portfolioQuantCorrelationGuard !== false,
+      portfolioQuantRegimeConditional: cfg.portfolioQuantRegimeConditional !== false,
+      portfolioQuantSessionGuard: cfg.portfolioQuantSessionGuard !== false,
+      portfolioQuantVolTargetedRisk: cfg.portfolioQuantVolTargetedRisk !== false,
+      portfolioQuantEmpiricalEv: cfg.portfolioQuantEmpiricalEv !== false,
     };
 
     const pg = this.getPg();

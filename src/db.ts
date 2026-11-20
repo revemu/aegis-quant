@@ -71,6 +71,8 @@ export interface PortfolioSlotRecord {
   tp1TargetPrice?: number;
   entryReason?: string;
   learningJournalUid?: string;
+  pendingExitOnOpen?: boolean;
+  pendingExitReason?: string;
 }
 
 export interface StrategyStateRecord {

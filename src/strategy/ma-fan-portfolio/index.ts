@@ -11,7 +11,14 @@ import { AlpacaPortfolioWsClient } from "../../exchange/alpaca/ws.js";
 import type { Candle } from "../../market-structure.js";
 import type { AtrSource } from "../../types.js";
 import { BotDatabase, getDatabase, type PortfolioSlotRecord, type UnifiedOrderRecord } from "../../db.js";
-import { isGapInducedBar, LearningEngine, type SurvivalGuardDecision } from "../../learning-engine.js";
+import {
+  calcCandleAtrPct14,
+  calcRollingReturnCorrelation,
+  isGapInducedBar,
+  isOpeningSession45mBar,
+  LearningEngine,
+  type SurvivalGuardDecision,
+} from "../../learning-engine.js";
 export { isGapInducedBar };
 import type { IStrategy, Lot, MarketClockInfo, StrategyContext, StrategyEvent, StrategyType } from "../types.js";
 import type {
@@ -437,6 +444,17 @@ export class MaFanPortfolioStrategy implements IStrategy {
     if (clean.portfolioPullbackMode === "EMA8_HOLD" || clean.portfolioPullbackMode === "EMA4_TOUCH") {
       this.cfg.portfolioPullbackMode = clean.portfolioPullbackMode;
     }
+    for (const qKey of [
+      "portfolioQuantCorrelationGuard",
+      "portfolioQuantRegimeConditional",
+      "portfolioQuantSessionGuard",
+      "portfolioQuantVolTargetedRisk",
+      "portfolioQuantEmpiricalEv",
+    ] as const) {
+      if (clean[qKey] !== undefined) {
+        (this.cfg as any)[qKey] = Boolean(clean[qKey]);
+      }
+    }
     if (Number.isFinite(Number(this.cfg.portfolioMinBuyVolRatio))) {
       this.cfg.portfolioMinBuyVolRatio = Math.min(5.0, Math.max(0.5, Number(this.cfg.portfolioMinBuyVolRatio)));
     }
@@ -470,6 +488,11 @@ export class MaFanPortfolioStrategy implements IStrategy {
       }
     }
     this.db.setSetting("portfolioMaxSlots", this.cfg.portfolioMaxSlots);
+    this.db.setSetting("portfolioQuantCorrelationGuard", this.cfg.portfolioQuantCorrelationGuard !== false);
+    this.db.setSetting("portfolioQuantRegimeConditional", this.cfg.portfolioQuantRegimeConditional !== false);
+    this.db.setSetting("portfolioQuantSessionGuard", this.cfg.portfolioQuantSessionGuard !== false);
+    this.db.setSetting("portfolioQuantVolTargetedRisk", this.cfg.portfolioQuantVolTargetedRisk !== false);
+    this.db.setSetting("portfolioQuantEmpiricalEv", this.cfg.portfolioQuantEmpiricalEv !== false);
     this.db.setSetting("portfolioMinBuyVolRatio", this.cfg.portfolioMinBuyVolRatio ?? 1.3);
     this.db.setSetting("portfolioMinRelStrength24h", this.cfg.portfolioMinRelStrength24h ?? -1.0);
     this.db.setSetting("portfolioMinRsi1h", this.cfg.portfolioMinRsi1h ?? 40);
@@ -500,6 +523,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
       this.initialCapital = Number(saved.portfolioInitialCapital || 0);
       if (typeof saved.isPaused === "boolean") {
         // Keep safe boot respect if called from boot; update on explicit reload
+      }
+      if (this.slots.length > 0 && !this.slots.some((s) => s.symbol === this.inspectedSymbol)) {
+        this.inspectedSymbol = this.slots[0]!.symbol;
+        this.cfg.portfolioInspectedSymbol = this.inspectedSymbol;
       }
     } else {
       this.slots = [];
@@ -792,16 +819,21 @@ export class MaFanPortfolioStrategy implements IStrategy {
       try {
         const positions = await (this.exchange as any).getAllPositions();
         const heldMap = new Map<string, any>(positions.map((p: any) => [p.symbol, p]));
-        // Update live qty / price on matching persisted slots, and adopt orphaned Alpaca positions if free slots exist
+        // Update live qty / price on matching persisted slots, clear closed Alpaca positions, and adopt orphaned ones
+        const retainedSlots: ActivePortfolioSlot[] = [];
         for (const slot of this.slots) {
           const exPos = heldMap.get(slot.symbol);
           if (exPos && exPos.qty > 0) {
             slot.qty = exPos.qty;
             slot.lastKnownPrice = exPos.currentPrice || slot.lastKnownPrice;
             if (slot.entryPrice <= 0 && exPos.avgEntryPrice > 0) slot.entryPrice = exPos.avgEntryPrice;
+            retainedSlots.push(slot);
             heldMap.delete(slot.symbol);
+          } else {
+            this.log(`🔄 [Portfolio Sync] Slot ${slot.slotIndex + 1} (${slot.symbol}) position is 0 on Alpaca — cleared closed slot`);
           }
         }
+        this.slots = retainedSlots;
         const maxSlots = this.getMaxSlots();
         for (const [sym, p] of heldMap.entries()) {
           if (this.slots.length >= maxSlots) break;
@@ -831,6 +863,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
           });
           this.log(`🔄 [Portfolio Sync] Adopted live Alpaca position into Slot ${slotIndex + 1}: ${sym} (${p.qty} @ $${p.avgEntryPrice})`);
         }
+        if (this.slots.length > 0 && !this.slots.some((s) => s.symbol === this.inspectedSymbol)) {
+          this.inspectedSymbol = this.slots[0]!.symbol;
+          this.cfg.portfolioInspectedSymbol = this.inspectedSymbol;
+        }
         this.saveState();
       } catch (err) {
         this.log(`⚠️ Failed to sync Alpaca positions: ${(err as Error).message}`);
@@ -858,32 +894,61 @@ export class MaFanPortfolioStrategy implements IStrategy {
     return { cancelledCount: count };
   }
 
-  public async closeSlot(slotIndex: number, reason = "MANUAL_SLOT_EXIT"): Promise<{ success: boolean; symbol?: string; pnl?: number; error?: string }> {
+  public async closeSlot(slotIndex: number, reason = "MANUAL_SLOT_EXIT"): Promise<{ success: boolean; symbol?: string; pnl?: number; queuedForMarketOpen?: boolean; error?: string }> {
     const idx = this.slots.findIndex((s) => s.slotIndex === slotIndex);
     if (idx < 0) return { success: false, error: `Slot ${slotIndex + 1} is empty` };
     const slot = this.slots[idx]!;
+    if (this.isMarketClosed && !this.cfg.dryRun && this.exchange.exchangeName === "alpaca") {
+      slot.pendingExitOnOpen = true;
+      slot.pendingExitReason = reason;
+      this.saveState(true);
+      this.emitTelemetryTick();
+      this.log(`⏳ [Slot ${slotIndex + 1} ${slot.symbol}] ตลาดหุ้น US ปิดทำการ — ล็อกคิวคัทอัตโนมัติทันทีที่ตลาดเปิด (${reason})`);
+      return { success: true, symbol: slot.symbol, queuedForMarketOpen: true };
+    }
     const exitPrice = this.snapshots.get(slot.symbol)?.livePrice || slot.lastKnownPrice || slot.entryPrice;
     const ok = await this.executeExitSlot(slot, slot.qty, exitPrice, reason, true);
     this.emitTelemetryTick();
-    if (!ok) return { success: false, symbol: slot.symbol, error: `Failed to execute exit order for ${slot.symbol}` };
+    if (!ok) {
+      return {
+        success: Boolean(slot.pendingExitOnOpen),
+        symbol: slot.symbol,
+        queuedForMarketOpen: Boolean(slot.pendingExitOnOpen),
+        ...(slot.pendingExitOnOpen ? {} : { error: `Failed to execute exit order for ${slot.symbol}` }),
+      };
+    }
     return { success: true, symbol: slot.symbol };
   }
 
-  public async sellAllUser(): Promise<{ success: boolean; soldQty: number; price: number; error?: string }> {
+  public async sellAllUser(): Promise<{ success: boolean; soldQty: number; price: number; queuedForMarketOpen?: boolean; error?: string }> {
     if (this.slots.length === 0) {
       return { success: true, soldQty: 0, price: 0 };
+    }
+    if (this.isMarketClosed && !this.cfg.dryRun && this.exchange.exchangeName === "alpaca") {
+      for (const slot of this.slots) {
+        slot.pendingExitOnOpen = true;
+        slot.pendingExitReason = "EMERGENCY_CLOSE_ALL";
+      }
+      this.saveState(true);
+      this.emitTelemetryTick();
+      this.log(`⏳ [Portfolio] ตลาดหุ้น US ปิดทำการ — ล็อกคิวคัททุก Slot (${this.slots.length} ช่อง) อัตโนมัติทันทีที่ตลาดเปิด`);
+      return { success: true, soldQty: 0, price: 0, queuedForMarketOpen: true };
     }
     let totalSold = 0;
     let lastPrice = 0;
     const copy = [...this.slots];
     for (const slot of copy) {
       const px = this.snapshots.get(slot.symbol)?.livePrice || slot.lastKnownPrice || slot.entryPrice;
-      totalSold += slot.qty;
-      lastPrice = px;
-      await this.executeExitSlot(slot, slot.qty, px, "EMERGENCY_CLOSE_ALL", true);
+      const qtyBefore = slot.qty;
+      const ok = await this.executeExitSlot(slot, qtyBefore, px, "EMERGENCY_CLOSE_ALL", true);
+      if (ok) {
+        totalSold += qtyBefore;
+        lastPrice = px;
+      }
     }
+    const anyQueued = this.slots.some((s) => s.pendingExitOnOpen);
     this.emitTelemetryTick();
-    return { success: true, soldQty: totalSold, price: lastPrice };
+    return { success: totalSold > 0 || anyQueued, soldQty: totalSold, price: lastPrice, ...(anyQueued ? { queuedForMarketOpen: true } : {}) };
   }
 
   public async resetPosition(): Promise<{ success: boolean; clearedLots: number }> {
@@ -935,8 +1000,9 @@ export class MaFanPortfolioStrategy implements IStrategy {
         await this.refreshLiveQuotes(creds);
       }
 
-      // 3. Refresh wallet balance periodically
+      // 3. Synchronize exchange positions & wallet balance periodically
       if (now - this.lastBalanceSyncTs >= 20_000) {
+        await this.syncOnChainOrders();
         await this.refreshWalletBalances();
       }
 
@@ -1115,7 +1181,31 @@ export class MaFanPortfolioStrategy implements IStrategy {
     };
 
     // 1. Evaluate Active Slot Exits (always update telemetry prices, execute only when active)
-    const tp1Mode = this.cfg.portfolioTp1TargetMode || "EMA200";
+    const q2RegimeActive = this.cfg.portfolioQuantRegimeConditional !== false;
+    const breadthPct = Number(this.macroState.breadthAboveEma25Pct ?? 50);
+    const configuredTp1Mode = this.cfg.portfolioTp1TargetMode || "EMA200";
+    let tp1Mode = configuredTp1Mode;
+    let regimeMinVolR = 1.3;
+    let regimeMinRs = -1.0;
+    let regimeMinRsi1h = 40;
+    if (q2RegimeActive) {
+      if (breadthPct < 38) {
+        tp1Mode = configuredTp1Mode === "none" ? "none" : "EMA25";
+        regimeMinVolR = 1.5;
+        regimeMinRs = 0.0;
+        regimeMinRsi1h = 42;
+      } else if (breadthPct >= 58) {
+        tp1Mode = configuredTp1Mode === "none" ? "none" : "EMA75";
+        regimeMinVolR = 1.3;
+        regimeMinRs = -0.5;
+        regimeMinRsi1h = 40;
+      } else {
+        tp1Mode = configuredTp1Mode;
+        regimeMinVolR = 1.4;
+        regimeMinRs = -0.5;
+        regimeMinRsi1h = 41;
+      }
+    }
     const disasterSlPct = Number(this.cfg.portfolioDisasterSlPct ?? 3.5);
     const maxHoldHours = Number(this.cfg.portfolioMaxHoldHours || 0);
 
@@ -1147,6 +1237,11 @@ export class MaFanPortfolioStrategy implements IStrategy {
       slot.tp1TargetPrice = tp1TargetPrice;
 
       if (!canExecute) continue;
+
+      if (slot.pendingExitOnOpen) {
+        const exited = await this.executeExitSlot(slot, slot.qty, px, slot.pendingExitReason || "PENDING_EXIT_ON_OPEN", true);
+        if (exited) continue;
+      }
 
       // Hard Disaster SL
       if (disasterSlPct > 0 && px <= slot.entryPrice * (1 - disasterSlPct / 100)) {
@@ -1224,9 +1319,34 @@ export class MaFanPortfolioStrategy implements IStrategy {
       ? Number(this.cfg.portfolioMinRelStrength24h)
       : -1.0;
 
-    const effMinRsi1h = survival.enforced ? Math.max(baseMinRsi1h, survival.minRsi1h) : baseMinRsi1h;
-    const effMinVolR = survival.enforced ? Math.max(baseMinVolR, survival.minBuyVolRatio12) : baseMinVolR;
-    const effMinRs = survival.enforced ? Math.max(baseMinRs, survival.minRelStrength24h) : baseMinRs;
+    const effMinRsi1h = Math.max(
+      survival.enforced ? Math.max(baseMinRsi1h, survival.minRsi1h) : baseMinRsi1h,
+      q2RegimeActive ? regimeMinRsi1h : baseMinRsi1h,
+    );
+    const effMinVolR = Math.max(
+      survival.enforced ? Math.max(baseMinVolR, survival.minBuyVolRatio12) : baseMinVolR,
+      q2RegimeActive ? regimeMinVolR : baseMinVolR,
+    );
+    const effMinRs = Math.max(
+      survival.enforced ? Math.max(baseMinRs, survival.minRelStrength24h) : baseMinRs,
+      q2RegimeActive ? regimeMinRs : baseMinRs,
+    );
+
+    const q1CorrActive = this.cfg.portfolioQuantCorrelationGuard !== false;
+    const q3SessionActive = this.cfg.portfolioQuantSessionGuard !== false;
+    const q4VolActive = this.cfg.portfolioQuantVolTargetedRisk !== false;
+    const q5EvActive = this.cfg.portfolioQuantEmpiricalEv !== false;
+
+    const atrPctBySym = new Map<string, number>();
+    const atrVals: number[] = [];
+    for (const [sKey, sInd] of this.snapshots.entries()) {
+      if (sKey === this.benchmarkSymbol || sInd.lastClosedIdx < 20) continue;
+      const aPct = calcCandleAtrPct14(sInd.c15, sInd.lastClosedIdx);
+      atrPctBySym.set(sKey, aPct);
+      atrVals.push(aPct);
+    }
+    atrVals.sort((a, b) => a - b);
+    const medianAtrPct = atrVals.length > 0 ? atrVals[Math.floor(atrVals.length / 2)]! : 0.35;
 
     const newRadar: PortfolioRadarCandidate[] = [];
     const entryCandidates: Array<{ sym: string; price: number; score: number; cand: PortfolioRadarCandidate }> = [];
@@ -1325,7 +1445,6 @@ export class MaFanPortfolioStrategy implements IStrategy {
           ? rsi15
           : Math.min(3, buyVolRatio12) * 20 + Math.max(-5, Math.min(10, relStrength24h)) * 3 - upperSpreadPct * 10;
       const scoreAdj = this.learning.getSymbolScoreAdjustment(sym, this.cfg);
-      const score = baseScore + scoreAdj;
       const onLearningCooldown = this.learning.isSymbolOnCooldown(sym, this.cfg);
       const shadowRiskyBlocked =
         survival.enforced && survival.blockRiskySymbols && this.learning.isSymbolShadowRisky(sym, this.cfg);
@@ -1334,9 +1453,41 @@ export class MaFanPortfolioStrategy implements IStrategy {
       const distanceToEma4Pct = m4 > 0 ? ((livePx - m4) / m4) * 100 : 0;
       const distanceToEma200Pct = livePx > 0 ? ((m200 - livePx) / livePx) * 100 : 0;
 
+      // Quant Q4 (SNR/ATR), Q5 (Empirical Bayes EV), Q1 (Cross-Asset Correlation)
+      const curAtrPct = atrPctBySym.get(sym) ?? calcCandleAtrPct14(ind.c15, idx);
+      const snrAtr = distanceToEma200Pct / Math.max(0.12, curAtrPct);
+      const snrScoreBonus = q4VolActive && snrAtr >= 3.5 && snrAtr <= 12 ? 8 : 0;
+      const evRes = q5EvActive
+        ? this.learning.getEmpiricalBayesEvAdjustment(sym, {
+            rs24h: relStrength24h,
+            buyVolRatio12,
+            distanceToEma200Pct,
+            rsi1h,
+          })
+        : { shrunkEvPct: 0, scoreAdj: 0, shouldBlockTrap: false };
+      let maxHeldCorr = 0;
+      let corrHeldSym = "";
+      if (!isHeld && q1CorrActive && this.slots.length > 0 && sym !== this.benchmarkSymbol) {
+        for (const held of this.slots) {
+          const hInd = this.snapshots.get(held.symbol);
+          if (hInd) {
+            const rho = calcRollingReturnCorrelation(ind.c15, idx, hInd.c15, hInd.lastClosedIdx, 48);
+            if (rho > maxHeldCorr) {
+              maxHeldCorr = rho;
+              corrHeldSym = held.symbol;
+            }
+          }
+        }
+      }
+      const score = baseScore + scoreAdj + snrScoreBonus + evRes.scoreAdj;
+
       let stage: PortfolioRadarCandidate["stage"] = "SCANNING";
       let filterNote = "";
       let gapBlockedThisBar = false;
+      let openSessionBlocked = false;
+      let lowSnrBlocked = false;
+      let negEvBlocked = false;
+      let highCorrBlocked = false;
       const passesBaseFilters = rsi1h >= baseMinRsi1h && buyVolRatio12 >= baseMinVolR && relStrength24h >= baseMinRs;
       const passesSurvivalFilters =
         rsi1h >= effMinRsi1h && buyVolRatio12 >= effMinVolR && relStrength24h >= effMinRs && !shadowRiskyBlocked;
@@ -1352,6 +1503,9 @@ export class MaFanPortfolioStrategy implements IStrategy {
 
       if (isHeld) {
         stage = "HOLDING";
+      } else if (this.isMarketClosed) {
+        stage = "SCANNING";
+        filterNote = "ตลาดปิดทำการ (พักสแกนสัญญาณเข้าซื้อ)";
       } else if (st.waitingPullback && m8 >= m16) {
         const pullbackMode = this.cfg.portfolioPullbackMode || "EMA8_HOLD";
         const prevBar = ind.c15[Math.max(0, idx - 1)];
@@ -1385,6 +1539,26 @@ export class MaFanPortfolioStrategy implements IStrategy {
           if (onLearningCooldown) {
             stage = "CROSS_8X16_FAIL_FILTERS";
             filterNote = "Learning Cooldown";
+          } else if (
+            q3SessionActive &&
+            isOpeningSession45mBar(ind.c15, idx, this.exchange.exchangeName) &&
+            (buyVolRatio12 < 1.85 || relStrength24h < 0.4)
+          ) {
+            stage = "CROSS_8X16_FAIL_FILTERS";
+            filterNote = "Opening 45m Guard (รอ Vol≥1.85x & RS≥+0.4%)";
+            openSessionBlocked = true;
+          } else if (q4VolActive && snrAtr < 1.25) {
+            stage = "CROSS_8X16_FAIL_FILTERS";
+            filterNote = `Low SNR (${snrAtr.toFixed(2)}x ATR < 1.25x)`;
+            lowSnrBlocked = true;
+          } else if (q5EvActive && evRes.shouldBlockTrap && (!q4VolActive || snrAtr < 1.6)) {
+            stage = "CROSS_8X16_FAIL_FILTERS";
+            filterNote = `Negative Empirical EV (${evRes.shrunkEvPct.toFixed(2)}%)`;
+            negEvBlocked = true;
+          } else if (q1CorrActive && maxHeldCorr > 0.75) {
+            stage = "CROSS_8X16_FAIL_FILTERS";
+            filterNote = `High Corr (${(maxHeldCorr * 100).toFixed(0)}% > 75% vs ${corrHeldSym})`;
+            highCorrBlocked = true;
           } else if (passesSurvivalFilters) {
             stage = "PULLBACK_READY";
           } else {
@@ -1425,6 +1599,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
         filterNote,
         barTimeSec: barTime,
         shadowScoreAdj: scoreAdj,
+        atrPct: Number(curAtrPct.toFixed(3)),
+        snrAtr: Number(snrAtr.toFixed(2)),
+        ...(maxHeldCorr > 0 ? { maxHeldCorr: Number(maxHeldCorr.toFixed(3)) } : {}),
+        ...(q5EvActive ? { empiricalEvPct: evRes.shrunkEvPct } : {}),
       };
       newRadar.push(cand);
 
@@ -1432,6 +1610,14 @@ export class MaFanPortfolioStrategy implements IStrategy {
         extraBlocked.push({ candidate: cand, blockReason: "FILTER:8x16_WeakMom", barTimeSec: barTime });
       } else if (gapBlockedThisBar) {
         extraBlocked.push({ candidate: cand, blockReason: "FILTER:GAP_TRAP", barTimeSec: barTime });
+      } else if (openSessionBlocked) {
+        extraBlocked.push({ candidate: cand, blockReason: "FILTER:OPEN_SESSION_45M", barTimeSec: barTime });
+      } else if (lowSnrBlocked) {
+        extraBlocked.push({ candidate: cand, blockReason: "FILTER:LOW_SNR_ATR", barTimeSec: barTime });
+      } else if (negEvBlocked) {
+        extraBlocked.push({ candidate: cand, blockReason: "FILTER:NEG_EMPIRICAL_EV", barTimeSec: barTime });
+      } else if (highCorrBlocked) {
+        extraBlocked.push({ candidate: cand, blockReason: "FILTER:HIGH_CORR", barTimeSec: barTime });
       } else if (stage === "WAITING_PULLBACK" && !passesSurvivalFilters && distanceToEma4Pct <= 0.6) {
         const nearFails = buildFailDetails(effMinRsi1h, effMinVolR, effMinRs, shadowRiskyBlocked);
         extraBlocked.push({
@@ -1454,25 +1640,25 @@ export class MaFanPortfolioStrategy implements IStrategy {
         extraBlocked.push({ candidate: cand, blockReason: "SHADOW_BEAR_MACRO", barTimeSec: barTime });
       }
 
-      if (!isHeld && stage === "PULLBACK_READY" && !onLearningCooldown) {
+      if (!isHeld && !this.isMarketClosed && stage === "PULLBACK_READY" && !onLearningCooldown) {
         entryCandidates.push({ sym, price: livePx, score, cand });
       }
     }
 
-    // Sort Radar cleanly by actionable stage priority, then score descending
+    // Sort Radar cleanly by pinning HOLDING at the very top, then actionable stage priority & score
     const stageWeight: Record<PortfolioRadarCandidate["stage"], number> = {
+      HOLDING: 1000,
       PULLBACK_READY: 500,
       WAITING_PULLBACK: 400,
       BOTTOM_FAN: 300,
       CROSS_8X16_FAIL_FILTERS: 200,
-      HOLDING: 150,
       SCANNING: 0,
     };
     newRadar.sort((a, b) => (stageWeight[b.stage] + b.score) - (stageWeight[a.stage] + a.score));
     this.radarList = newRadar;
     this.syncAlpacaWsSubscriptions();
 
-    // 3. Allocate Free Slots (strict MM capital usage % + fixed per-slot cap so reserve absorbs drawdowns)
+    // 3. Allocate Free Slots (strict MM capital usage %, Q1 dynamic correlation guard & Q4 inverse-vol sizing)
     entryCandidates.sort((a, b) => b.score - a.score);
     const effectiveMaxSlots = survival.enforced ? survival.effectiveMaxSlots : configuredMaxSlots;
     const sizeScale = survival.enforced ? survival.positionSizeScale : 1.0;
@@ -1514,11 +1700,39 @@ export class MaFanPortfolioStrategy implements IStrategy {
     });
 
     if (canExecute && freeSlots > 0 && sizeScale > 0 && !sitOutEval.isSitOut && entryCandidates.length > 0) {
-      for (const ch of entryCandidates.slice(0, freeSlots)) {
-        const currentEffFree = effectiveMaxSlots - this.slots.length;
-        if (currentEffFree <= 0) break;
+      for (const ch of entryCandidates) {
+        if (this.slots.length >= effectiveMaxSlots) break;
+
+        // Re-check Q1 correlation dynamically against all currently held slots (including just-entered slots in this cycle)
+        if (q1CorrActive && this.slots.length > 0) {
+          const chInd = this.snapshots.get(ch.sym);
+          if (chInd) {
+            let maxCorr = 0;
+            let corrSym = "";
+            for (const held of this.slots) {
+              const hInd = this.snapshots.get(held.symbol);
+              if (hInd) {
+                const rho = calcRollingReturnCorrelation(chInd.c15, chInd.lastClosedIdx, hInd.c15, hInd.lastClosedIdx, 48);
+                if (rho > maxCorr) {
+                  maxCorr = rho;
+                  corrSym = held.symbol;
+                }
+              }
+            }
+            if (maxCorr > 0.75) {
+              this.log(`🛡️ [Quant Q1 Corr Guard] Skipped ${ch.sym} (corr ${(maxCorr * 100).toFixed(0)}% > 75% vs held ${corrSym})`);
+              continue;
+            }
+          }
+        }
+
         const availCash = this.getAvailableBuyCash();
-        const standardSlotAlloc = this.getStandardSlotUnit() * sizeScale;
+        let volScale = 1.0;
+        const chAtrPct = ch.cand.atrPct ?? 0.35;
+        if (q4VolActive && chAtrPct > medianAtrPct * 1.35) {
+          volScale = Math.max(0.7, Math.min(1.0, (medianAtrPct * 1.25) / chAtrPct));
+        }
+        const standardSlotAlloc = this.getStandardSlotUnit() * sizeScale * volScale;
         const alloc = Math.min(standardSlotAlloc, availCash);
         if (alloc < 5) break;
         await this.executeEntrySlot(ch.sym, ch.price, alloc, ch.score, ch.cand);
@@ -1670,6 +1884,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
       entryReason: `MA-Fan Pullback ${this.cfg.portfolioPullbackMode === "EMA4_TOUCH" ? "EMA4" : "EMA8"} (Score ${score.toFixed(1)})`,
     };
     this.slots.push(slot);
+    this.inspectedSymbol = symbol;
+    this.cfg.portfolioInspectedSymbol = symbol;
     if (this.cfg.dryRun || this.cashBalance > 0) {
       this.cashBalance = Math.max(0, this.cashBalance - actualCost);
     }
@@ -1745,10 +1961,13 @@ export class MaFanPortfolioStrategy implements IStrategy {
       if (sellQty <= 0) return false;
 
       if (!this.cfg.dryRun && this.exchange.hasCredentials()) {
-        const isUrgentExit = reason.startsWith("SL_") || reason.startsWith("EMERGENCY") || reason.startsWith("MANUAL");
+        const isUrgentExit = reason.startsWith("SL_") || reason.startsWith("EMERGENCY") || reason.startsWith("MANUAL") || reason.startsWith("PENDING_EXIT");
         const isAlpaca = this.exchange.exchangeName === "alpaca";
         const orderType = isAlpaca && isUrgentExit ? "MARKET" : "IOC";
         const floorBuffer = isAlpaca ? 0.997 : 0.998;
+        if (isAlpaca && isUrgentExit) {
+          await this.exchange.cancelAllOpenOrders(slot.symbol).catch(() => {});
+        }
         const orderRes = await this.exchange.placeOrder({
           symbol: slot.symbol,
           side: "SELL",
@@ -1758,7 +1977,14 @@ export class MaFanPortfolioStrategy implements IStrategy {
         });
         orderId = String(orderRes.orderId || orderId);
         if (!orderRes.executedQty || orderRes.executedQty <= 0) {
-          this.log(`⚠️ [Slot ${slot.slotIndex + 1} ${slot.symbol}] Exit (${reason}) limit order unfilled — keeping slot open.`);
+          if (isAlpaca && (orderRes.status === "NEW" || orderRes.status === "PARTIALLY_FILLED" || this.isMarketClosed)) {
+            slot.pendingExitOnOpen = true;
+            slot.pendingExitReason = reason;
+            this.saveState(true);
+            this.log(`⏳ [Slot ${slot.slotIndex + 1} ${slot.symbol}] Exit (${reason}) queued on Alpaca (${orderRes.status || "NEW"}) — marked Pending Exit.`);
+          } else {
+            this.log(`⚠️ [Slot ${slot.slotIndex + 1} ${slot.symbol}] Exit (${reason}) limit order unfilled — keeping slot open.`);
+          }
           return false;
         }
         sellQty = Math.min(slot.qty, orderRes.executedQty);
@@ -1842,6 +2068,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
         cfg: this.cfg,
       });
       this.slots = this.slots.filter((s) => s.slotIndex !== slot.slotIndex);
+      if (this.slots.length > 0 && !this.slots.some((s) => s.symbol === this.inspectedSymbol)) {
+        this.inspectedSymbol = this.slots[0]!.symbol;
+        this.cfg.portfolioInspectedSymbol = this.inspectedSymbol;
+      }
       const st = this.setupStates.get(slot.symbol);
       if (st) {
         st.hadBottomFan = false;
@@ -1860,10 +2090,17 @@ export class MaFanPortfolioStrategy implements IStrategy {
 
   private buildSlotTelemetryList(): PortfolioSlotTelemetry[] {
     const maxSlots = this.getMaxSlots();
+    const effMaxSlots = this.latestSurvival?.enforced ? this.latestSurvival.effectiveMaxSlots : maxSlots;
     const list: PortfolioSlotTelemetry[] = [];
     const freeCash = this.getAvailableBuyCash();
+    const canOpenNewSlot =
+      !this.isMarketClosed &&
+      !this.isPaused &&
+      !this.macroState.isSitOut &&
+      this.slots.length < effMaxSlots &&
+      freeCash >= 5;
     const heldSyms = new Set(this.slots.map((s) => s.symbol));
-    const readyCandidates = this.radarList.filter((r) => !heldSyms.has(r.symbol));
+    const readyCandidates = canOpenNewSlot ? this.radarList.filter((r) => !heldSyms.has(r.symbol)) : [];
     let waitCursor = 0;
 
     for (let i = 0; i < maxSlots; i++) {
@@ -1901,7 +2138,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
         }
 
         let phaseText = "ถือรอถึง EMA200";
-        if (slot.tp1Done && slot.beLocked) phaseText = "TP1 แล้ว • ล็อก BE รอ Full Fan";
+        if (slot.pendingExitOnOpen) phaseText = "⏳ รอคัทตอนตลาดเปิด";
+        else if (slot.tp1Done && slot.beLocked) phaseText = "TP1 แล้ว • ล็อก BE รอ Full Fan";
         else if (slot.beLocked) phaseText = "ล็อก BE แล้ว • รันกำไร";
         else if (isBullishFan) phaseText = "Full Bullish Fan!";
 
@@ -1926,18 +2164,20 @@ export class MaFanPortfolioStrategy implements IStrategy {
           entryTime: slot.entryTime,
           phaseText,
           progressPct,
+          pendingExitOnOpen: slot.pendingExitOnOpen,
+          pendingExitReason: slot.pendingExitReason,
           emas,
         });
       } else {
-        const freeSlotCount = Math.max(1, maxSlots - this.slots.length);
-        const nextCand = readyCandidates[waitCursor++];
+        const freeSlotCount = Math.max(1, effMaxSlots - this.slots.length);
+        const nextCand = canOpenNewSlot ? readyCandidates[waitCursor++] : undefined;
         const survScale = this.latestSurvival?.enforced ? this.latestSurvival.positionSizeScale : 1;
         const perSlotCap = this.getStandardSlotUnit() * survScale;
         list.push({
           slotIndex: i,
           status: "EMPTY",
           nextCandidate: nextCand,
-          readyBudget: Math.min(perSlotCap, freeCash / freeSlotCount),
+          readyBudget: canOpenNewSlot ? Math.min(perSlotCap, freeCash / freeSlotCount) : 0,
         });
       }
     }

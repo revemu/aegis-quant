@@ -438,6 +438,16 @@ export const defaultStrategyConfig = {
   portfolioCapitalUsagePct: 50,
   /** Pullback entry timing mode: "EMA8_HOLD" (wait for EMA8 support pullback & hold + anti-gap) or "EMA4_TOUCH". */
   portfolioPullbackMode: "EMA8_HOLD" as "EMA8_HOLD" | "EMA4_TOUCH",
+  /** Quant Q1: Cross-asset rolling return correlation guard (blocks rho > 0.75 vs held slots). */
+  portfolioQuantCorrelationGuard: true,
+  /** Quant Q2: Regime-conditional TP1 & filter auto-switching by market breadth. */
+  portfolioQuantRegimeConditional: true,
+  /** Quant Q3: Opening-session 45m trap filter requiring stronger momentum/volume confirmation. */
+  portfolioQuantSessionGuard: true,
+  /** Quant Q4: Volatility-normalized ATR SNR gate (>=1.25x) & inverse-vol outlier sizing. */
+  portfolioQuantVolTargetedRisk: true,
+  /** Quant Q5: Empirical Bayes Expected Value ranking from Shadow Walk-Forward buckets. */
+  portfolioQuantEmpiricalEv: true,
   /** Minimum 12-bar buy volume ratio required before entering a pullback (default 1.3). */
   portfolioMinBuyVolRatio: 1.3,
   /** Minimum 24h relative strength vs benchmark in % required before entering (default -1.0). */
@@ -667,6 +677,21 @@ export function loadConfigFromDatabase(): typeof defaultStrategyConfig {
       }
       if (saved.portfolioPullbackMode === "EMA8_HOLD" || saved.portfolioPullbackMode === "EMA4_TOUCH") {
         merged.portfolioPullbackMode = saved.portfolioPullbackMode;
+      }
+      if (typeof saved.portfolioQuantCorrelationGuard === "boolean") {
+        merged.portfolioQuantCorrelationGuard = saved.portfolioQuantCorrelationGuard;
+      }
+      if (typeof saved.portfolioQuantRegimeConditional === "boolean") {
+        merged.portfolioQuantRegimeConditional = saved.portfolioQuantRegimeConditional;
+      }
+      if (typeof saved.portfolioQuantSessionGuard === "boolean") {
+        merged.portfolioQuantSessionGuard = saved.portfolioQuantSessionGuard;
+      }
+      if (typeof saved.portfolioQuantVolTargetedRisk === "boolean") {
+        merged.portfolioQuantVolTargetedRisk = saved.portfolioQuantVolTargetedRisk;
+      }
+      if (typeof saved.portfolioQuantEmpiricalEv === "boolean") {
+        merged.portfolioQuantEmpiricalEv = saved.portfolioQuantEmpiricalEv;
       }
       if (saved.portfolioMinBuyVolRatio !== undefined && Number.isFinite(Number(saved.portfolioMinBuyVolRatio))) {
         merged.portfolioMinBuyVolRatio = Math.min(5.0, Math.max(0.5, Number(saved.portfolioMinBuyVolRatio)));

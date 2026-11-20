@@ -10072,3 +10072,30 @@ When investigating live production behavior, debugging issues, or analyzing trad
      - แยกจังหวะสัญญาณเข้าซื้อ (`CROSS_UP`) ออกจากจังหวะย่อหาฐาน (`PULLBACK_READY`): ใช้ `isGapInducedBar` ตรวจจับแท่งกระโดดข้ามเซสชัน/เปิดตลาด (`FILTER:GAP_TRAP` ใน `normalizeBlockReasonKey`) และรอราคา Pullback ลงมาแตะ/ยืนฐาน `EMA8` โดยไม่ทำลายแนวรับก่อนเข้าซื้อ
      - ผสาน `portfolioPullbackMode` (`8 <-> EMA8_HOLD`, `4 <-> EMA4_TOUCH`) เข้ากับ `LearningEngine` (`ShadowWalkForwardContext`, `runShadowWalkForward`, `evalTuneConfig`, `analyzeTuning`, `AUTO_TUNABLE_PARAMS`, `applyAutonomousTuning` Step B rollback, `buildReport().summary.activeTechnicalParams`) และ Dashboard (`buildActiveTechParamChipsHtml`, `formatLearningAdjustment`)
 - **Version Bump**: **`0.3.0.99`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 344. 5 Quant Learning Modules, Holding Focus Mode & Pre-Signal/Pre-Order Market-Closed Guard (v0.3.1.0)
+- **ปัญหาที่พบและเป้าหมาย**:
+  1. หุ้นในพอร์ตเกิดสหสัมพันธ์สูงเกินไป (เช่นถือ `VTI` + `VOO` พร้อมกัน) และยังขาดการปรับพารามิเตอร์ตาม Market Regime, การป้องกันความผันผวนช่วงเปิดตลาด 45 นาทีแรก, การคัดกรอง Reward-to-Noise (ATR SNR), และ Expected Value เชิงสถิติจาก Shadow Walk-Forward
+  2. เมื่อตลาดหุ้น US ปิด (`isMarketClosed === true`) หรือพอร์ตถือครบโควตา/งบ MM 50% แล้ว UI ยังแสดงตัวเต็ง `READY` บน Slot ว่าง กราฟไม่โฟกัสตัวที่ถือ และคำสั่งคัทตอนตลาดปิดยังส่งไปค้างสถานะ `unfilled`
+- **การแก้ไขและสถาปัตยกรรมใหม่**:
+  1. **5 Quant Learning Modules** (`src/config.ts`, `src/learning-engine.ts`, `src/strategy/ma-fan-portfolio/index.ts`, `public/app.js` — เปิดใช้งาน Default ON ทั้ง 5 ข้อ):
+     - **Q1 (`portfolioQuantCorrelationGuard`)**: `calcRollingReturnCorrelation` (48-bar 15m rolling Pearson $\rho$) บล็อกตัวที่มี $\rho > 0.75$ กับ Slot ที่ถืออยู่ (รวมถึงเช็กแบบ Dynamic ระหว่างออกหลายไม้ใน Cycle เดียวกัน, `FILTER:HIGH_CORR`)
+     - **Q2 (`portfolioQuantRegimeConditional`)**: สลับ TP1 และ Filter อัตโนมัติตาม Breadth (`<38%`: `EMA25` + `VolR>=1.5, RS>=0%, 1hRSI>=42`; `>=58%`: `EMA75` + `VolR>=1.3, RS>=-0.5%, 1hRSI>=40`; `38–58%`: `VolR>=1.4, RS>=-0.5%, 1hRSI>=41`)
+     - **Q3 (`portfolioQuantSessionGuard`)**: `isOpeningSession45mBar` กรองช่วง 45 นาทีแรกของตลาด US (หรือ US cash open spike บน Crypto) ต้องยืนยัน `VolR >= 1.85` และ `RS >= +0.40%` (`FILTER:OPEN_SESSION_45M`)
+     - **Q4 (`portfolioQuantVolTargetedRisk`)**: `calcCandleAtrPct14` กรอง Reward-to-ATR `snrAtr = distanceToEma200Pct / max(0.12, atrPct) >= 1.25` (`FILTER:LOW_SNR_ATR`), โบนัสคะแนน `+8` เมื่อ SNR `3.5–12`, และลดขนาดไม้แบบ Inverse-Vol (`0.70–1.0x`) เมื่อ `atrPct > 1.35 * medianAtrPct`
+     - **Q5 (`portfolioQuantEmpiricalEv`)**: `computeFeatureBucketKey` & `getEmpiricalBayesEvAdjustment` คำนวณ Empirical Bayes Expected Value shrinkage จาก `featureBucketEv` ของ Shadow Walk-Forward (`FILTER:NEG_EMPIRICAL_EV`)
+     - **ผล Backtest เปรียบเทียบ (หุ้น US 49-Ticker Universe, 60 วัน / 1,555 แท่ง 15m, `$100k`, 50% MM, ต้นทุน 0.06%)**:
+       - Baseline (`v0.3.0.99`, Quant OFF): `65` ไม้ | WR `83.1%` | Net `+$700.57 (+0.70%)` | PF `1.11` | MaxDD `2.46%` | SL `8`
+       - `+Q1 Only`: `65` ไม้ | WR `83.1%` | Net `+$2,474.15 (+2.47%)` | PF `1.50` | MaxDD `1.79%` | SL `7`
+       - `+Q2 Only`: `54` ไม้ | WR `83.3%` | Net `+$1,088.31 (+1.09%)` | PF `1.22` | MaxDD `1.64%` | SL `7`
+       - `+Q3 Only`: `64` ไม้ | WR `84.4%` | Net `+$1,205.38 (+1.21%)` | PF `1.22` | MaxDD `2.24%` | SL `7`
+       - `+Q4 Only`: `53` ไม้ | WR `84.9%` | Net `+$3,133.86 (+3.13%)` | PF `1.86` | MaxDD `1.85%` | SL `5`
+       - `+Q5 Only`: `60` ไม้ | WR `86.7%` | Net `+$3,806.37 (+3.81%)` | PF `2.17` | MaxDD `1.78%` | SL `5`
+       - **Full Quant Suite (เปิดทั้ง 5 ข้อ)**: `40` ไม้ | WR **`90.0%`** | Net **`+$3,602.33 (+3.60%)`** | PF **`2.75`** | MaxDD **`1.19%`** | SL **`2`**
+  2. **Holding Focus Mode & Pre-Signal/Pre-Order Market-Closed Guard** (`src/db.ts`, `src/strategy/ma-fan-portfolio/types.ts`, `src/strategy/ma-fan-portfolio/index.ts`, `public/app.js`):
+     - Pre-Signal Guard: เมื่อ `isMarketClosed === true` พักออกสัญญาณเข้าซื้อบน Radar (`SCANNING`) และ `buildSlotTelemetryList()` ซ่อน `nextCandidate` (`readyBudget = 0`) บน Slot ว่างเมื่อตลาดปิด / Paused / Sit-Out / ครบโควตา Survival / ครบเพดาน MM 50%
+     - Pre-Order Market-Closed Cut Queue: `closeSlot()` / `sellAllUser()` ตอน `isMarketClosed === true` บน Alpaca จะตั้งค่า `pendingExitOnOpen = true` (`pendingExitReason`) และปิดไม้อัตโนมัติทันทีที่ตลาดเปิดใน `evaluatePortfolioCycle()`, พร้อม `cancelAllOpenOrders()` ก่อน Urgent Market Sell และให้ `syncOnChainOrders()` (ทุก 20s ใน `tick()`) เคลียร์ Slot ที่ Position บน Alpaca เป็น 0 ออกอัตโนมัติ
+     - Holding Focus UX: `stageWeight.HOLDING = 1000`, Auto-Focus `inspectedSymbol` ไปยัง Slot ที่ถือ, แสดง Holding Management Checklist บน `#pfChecklistGrid`, และป้าย `SURVIVAL_CAP` / `MM_CAP` + `Quant 5x` chip
+- **Version Bump**: **`0.3.1.0`** (`package.json`, `src/version.ts`, `public/index.html`)

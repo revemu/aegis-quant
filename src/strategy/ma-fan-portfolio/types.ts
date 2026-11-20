@@ -66,6 +66,10 @@ export interface PortfolioRadarCandidate {
   filterNote?: string;
   barTimeSec?: number;
   shadowScoreAdj?: number;
+  atrPct?: number;
+  snrAtr?: number;
+  maxHeldCorr?: number;
+  empiricalEvPct?: number;
 }
 
 export interface PortfolioSlotTelemetry {
@@ -89,6 +93,8 @@ export interface PortfolioSlotTelemetry {
   entryTime?: number;
   phaseText?: string;
   progressPct?: number;
+  pendingExitOnOpen?: boolean;
+  pendingExitReason?: string;
   emas?: {
     ema4: number;
     ema8: number;
