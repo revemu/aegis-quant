@@ -241,14 +241,24 @@ export function calcCandleAtrPct14(
   return atrPct > 0 ? atrPct : 0.35;
 }
 
+const nyOpenFmt = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  weekday: "short",
+  hour: "numeric",
+  minute: "numeric",
+  hourCycle: "h23",
+});
+const nyOpenBucketCache = new Map<number, { isWeekday: boolean; baseMin: number }>();
+
 /**
  * Quant Q3: Detects volatile session-opening windows (first 45m of US equities regular session,
- * or 13:30-14:00 UTC US cash open volatility spikes for 24/7 crypto).
+ * or DST-aware 09:30-10:15 ET US cash open volatility spikes for 24/7 crypto).
  */
 export function isOpeningSession45mBar(
   c15: Array<{ time: number; high?: number; low?: number; close?: number }>,
   idx: number,
   exchangeName = "alpaca",
+  requireCryptoSpike = true,
 ): boolean {
   if (!c15 || idx <= 0 || idx >= c15.length) return false;
   if ((exchangeName || "").toLowerCase() === "alpaca") {
@@ -261,14 +271,31 @@ export function isOpeningSession45mBar(
     return false;
   }
   const bar = c15[idx]!;
-  const d = new Date(bar.time * 1000);
-  const utcMins = d.getUTCHours() * 60 + d.getUTCMinutes();
-  const inUsCashOpenWindow = utcMins >= 13 * 60 + 30 && utcMins < 14 * 60;
-  if (!inUsCashOpenWindow) return false;
-  const rangePct = bar.close && bar.close > 0 && bar.high !== undefined && bar.low !== undefined
-    ? ((bar.high - bar.low) / bar.close) * 100
-    : 0;
-  return rangePct >= 1.2;
+  const hb = Math.floor(bar.time / 3600);
+  let cached = nyOpenBucketCache.get(hb);
+  if (!cached) {
+    const parts = nyOpenFmt.formatToParts(new Date(hb * 3600 * 1000));
+    let wd = "";
+    let hr = 0;
+    let mn = 0;
+    for (const p of parts) {
+      if (p.type === "weekday") wd = p.value;
+      else if (p.type === "hour") hr = Number(p.value) % 24;
+      else if (p.type === "minute") mn = Number(p.value) || 0;
+    }
+    cached = { isWeekday: wd !== "Sun" && wd !== "Sat", baseMin: hr * 60 + mn };
+    if (nyOpenBucketCache.size > 10_000) nyOpenBucketCache.clear();
+    nyOpenBucketCache.set(hb, cached);
+  }
+  if (!cached.isWeekday) return false;
+  const mins = cached.baseMin + Math.floor((bar.time - hb * 3600) / 60);
+  if (mins < 570 || mins >= 615) return false; // 09:30 - 10:15 ET (DST-aware EST & EDT)
+  if (!requireCryptoSpike) return true;
+  const rangePct =
+    bar.close && bar.close > 0 && bar.high !== undefined && bar.low !== undefined
+      ? ((bar.high - bar.low) / bar.close) * 100
+      : 0;
+  return rangePct >= 0.85;
 }
 
 /**
@@ -473,6 +500,8 @@ interface TuningEvent {
   entryPrice: number;
   entryPriceEma8?: number;
   ema8HoldOk?: boolean;
+  snrAtr?: number;
+  minSnrAtr?: number;
   rsi1h: number;
   volR: number;
   rs24: number;
@@ -583,6 +612,7 @@ function evalTuneConfig(groups: TuningEvent[][], cfg: TuneCfg, splitTime: number
       (ev) =>
         ev.barIdx - (lastBarBySym.get(ev.symbol) ?? -999) >= 8 &&
         (!useEma8 || ev.ema8HoldOk !== false) &&
+        (ev.snrAtr === undefined || ev.snrAtr >= (ev.minSnrAtr ?? 1.25)) &&
         ev.rsi1h >= cfg.minRsi1h &&
         ev.volR >= cfg.minVolR &&
         ev.rs24 >= cfg.minRs,
@@ -1689,6 +1719,12 @@ export class LearningEngine {
               const dist75Ema8 = ((coin.m75[prev]! - entryPriceEma8) / entryPriceEma8) * 100;
               const dist200Ema8 = ((coin.m200[prev]! - entryPriceEma8) / entryPriceEma8) * 100;
 
+              const curAtrPct = Math.max(0.12, calcCandleAtrPct14(coin.c15, prev));
+              const isAlpacaEx = ex === "alpaca";
+              const effDist200 = basePullbackMode === "EMA8_HOLD" ? dist200Ema8 : dist200;
+              const snrAtr = (isAlpacaEx ? effDist200 : Math.max(0.8, effDist200)) / curAtrPct;
+              const minSnrAtr = isAlpacaEx ? 1.25 : 0.65;
+
               if (activeRaw) {
                 tuningEvents.push({
                   setupId: `${coin.symbol}|${rawWaitFromIdx}`,
@@ -1698,6 +1734,8 @@ export class LearningEngine {
                   entryPrice,
                   entryPriceEma8,
                   ema8HoldOk,
+                  snrAtr,
+                  minSnrAtr,
                   rsi1h: rsi1hVal,
                   volR,
                   rs24,
@@ -1764,7 +1802,7 @@ export class LearningEngine {
                 fb.sumPnl += sim.finalRet;
                 featureBucketAcc.set(bKey, fb);
 
-                if (isOpeningSession45mBar(coin.c15, idx, ex)) {
+                if (isOpeningSession45mBar(coin.c15, idx, ex, false)) {
                   openSessionAcc.setups++;
                   if (isWin) openSessionAcc.wins++;
                   openSessionAcc.sumPnl += sim.finalRet;

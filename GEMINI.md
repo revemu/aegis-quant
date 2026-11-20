@@ -10111,3 +10111,22 @@ When investigating live production behavior, debugging issues, or analyzing trad
   1. **Closed-Bar `1h RSI` Causal Lookup**: ถอยดัชนี `closed1hIdx` เพื่อบังคับใช้เฉพาะแท่ง `1h` ที่ `isClosed !== false` และ `c1h.time + 3600 <= c.time + 900` เสมอ (Causal Parity 100% กับ Backtest)
   2. **OOS-Calibrated `Q2` Regime TP1 Horizon Switching**: ให้ `Q2` ปรับเฉพาะเป้าหมาย `TP1` ตาม Market Breadth (`<55% -> EMA25`, `55–70% -> EMA75`, `>=70% -> EMA200`) โดยคงตัวกรองคุณภาพไว้ที่ `SurvivalGuard` + `Q4` ช่วยดัน **OOS Test Net Profit จาก `+$2,772 (PF 3.13, DD 1.22%, SL: 2)` ➔ `+$3,547 (PF 112.59, DD 0.67%, SL: 0)`**
 - **Version Bump**: **`0.3.1.1`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 346. Exchange-Aware Crypto vs US Equities Quant Profile, DST-Aware Q3 Session Window & Q4-Aligned Auto-Pilot (v0.3.1.2)
+- **สาเหตุที่ตรวจพบจากการตรวจสอบสดทั้ง 3 ข้อ (`alpaca_kyne` & `binance_dry` 60-Day Crypto Backtest)**:
+  1. **Binance Crypto 24/7 vs US Equities Volatility/Correlation Gap**: ผล Strict Zero-Lookahead Ablation บน Crypto 25 คู่ 60 วัน (5,765 แท่ง 15m, Dual Sit-Out ON, แยก Active Regime 50/50 Train vs OOS, ทุน `$10k`, 50% MM, ต้นทุน `0.15%`) พบว่า:
+     - Altcoin 24/7 มี `ATR%` สูงกว่าหุ้น US 3–5 เท่า และมีการบีบตัวของ `EMA200` ทำให้เกณฑ์หุ้น US (`Q4 snrAtr >= 1.25` และ `Q1 corr <= 0.75`) บล็อกไม้ Crypto เกินจำเป็น
+     - เมื่อปรับโปรไฟล์เป็น **Exchange-Aware Crypto Quant (`Q1 corr <= 0.85`, `Q2 TP1 <20% -> EMA75`, `Q4 effReward = max(0.80%, dist200)` + `snrAtr >= 0.65`)** ช่วยให้ `ALL 5 QUANT ON` บน Crypto 60 วันทำผลงานเหนือกว่า Baseline ทั้งด้านกำไรและ Risk-Adjusted:
+       - Baseline (`Dual SitOut, Quant OFF`): Train `37t | WR 81.1% | +$154 | PF 1.60` || OOS `30t | WR 76.7% | -$94 | PF 0.66 | SL:5` || Full 60D `68t | WR 79.4% | +$65 | PF 1.12 | DD 2.36% | SL:9`
+       - **Crypto Profile (`ALL 5 QUANT ON`)**: Full 60D `64t | WR 81.3% | +$103 (+58% Net Profit) | PF 1.22 | DD 1.92% | SL:8` และลดขาดทุนใน OOS Bear ลงเกือบครึ่ง (`-$94 -> -$51`, WR OOS `76.7% -> 77.8%`, DD `2.36% -> 1.91%`, SL `5 -> 4`)
+  2. **Q3 Crypto US Cash Open Window & DST**: `isOpeningSession45mBar()` ฝั่ง Crypto เดิมฮาร์ดโค้ด `13:30–14:00 UTC` (EDT เท่านั้น) ทำให้ช่วง EST (`14:30–15:15 UTC`) ค่า `openingSessionStats.setups` เป็น `0` บน `binance_dry`
+  3. **Auto-Pilot `evalTuneConfig` Parity**: `evalTuneConfig()` เดิมยังไม่ได้กรอง `snrAtr >= minSnrAtr` (`Q4`) ทำให้แบบจำลอง Auto-Tune ประเมินรวมสัญญาณที่ถูก `Q4` บล็อกในการเทรดจริง
+- **การแก้ไขและสถาปัตยกรรมใหม่**:
+  1. **Exchange-Aware Quant Parameters (`src/strategy/ma-fan-portfolio/index.ts`, `src/learning-engine.ts`)**:
+     - แยกโปรไฟล์อัตโนมัติตาม Exchange: US Equities (`alpaca`: `Q1 corr <= 0.75`, `Q2 <55% EMA25 / <70% EMA75 / >=70% EMA200`, `Q4 snrAtr >= 1.25`) vs Crypto (`binance`: `Q1 corr <= 0.85`, `Q2 <20% EMA75`, `Q4 max(0.8%, dist200)/atrPct >= 0.65`)
+  2. **DST-Aware Crypto `Q3` Session Guard & `Q4`-Aligned Auto-Pilot (`src/learning-engine.ts`)**:
+     - อัปเกรด `isOpeningSession45mBar()` ฝั่ง Crypto ให้คำนวณ `09:30–10:15 ET` จันทร์–ศุกร์แบบ DST-aware (America/New_York EST & EDT อัตโนมัติ) พร้อมรองรับ `requireCryptoSpike` สำหรับ `openingSessionStats`
+     - เพิ่มฟิลด์ `snrAtr` / `minSnrAtr` ใน `TuningEvent` และกรองใน `evalTuneConfig()` ให้ `Auto-Pilot` สอดคล้องกับ `Q4` 100%
+- **Version Bump**: **`0.3.1.2`** (`package.json`, `src/version.ts`, `public/index.html`)

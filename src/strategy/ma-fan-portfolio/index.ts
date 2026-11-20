@@ -1181,6 +1181,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
     };
 
     // 1. Evaluate Active Slot Exits (always update telemetry prices, execute only when active)
+    const isAlpaca = this.exchange.exchangeName === "alpaca";
     const q2RegimeActive = this.cfg.portfolioQuantRegimeConditional !== false;
     const breadthPct = Number(this.macroState.breadthAboveEma25Pct ?? 50);
     const configuredTp1Mode = this.cfg.portfolioTp1TargetMode || "EMA200";
@@ -1189,12 +1190,22 @@ export class MaFanPortfolioStrategy implements IStrategy {
     let regimeMinRs = -1.0;
     let regimeMinRsi1h = 40;
     if (q2RegimeActive) {
-      if (breadthPct < 55) {
-        tp1Mode = configuredTp1Mode === "none" ? "none" : "EMA25";
-      } else if (breadthPct < 70) {
-        tp1Mode = configuredTp1Mode === "none" ? "none" : "EMA75";
+      if (isAlpaca) {
+        if (breadthPct < 55) {
+          tp1Mode = configuredTp1Mode === "none" ? "none" : "EMA25";
+        } else if (breadthPct < 70) {
+          tp1Mode = configuredTp1Mode === "none" ? "none" : "EMA75";
+        } else {
+          tp1Mode = configuredTp1Mode === "none" ? "none" : "EMA200";
+        }
       } else {
-        tp1Mode = configuredTp1Mode === "none" ? "none" : "EMA200";
+        // On Crypto, Dual Sit-Out already blocks bear macro & fee is 0.15%; only step down TP1 in ultra-weak breadth (<20%)
+        tp1Mode =
+          configuredTp1Mode === "none"
+            ? "none"
+            : breadthPct < 20
+              ? "EMA75"
+              : configuredTp1Mode;
       }
     }
     const disasterSlPct = Number(this.cfg.portfolioDisasterSlPct ?? 3.5);
@@ -1454,8 +1465,11 @@ export class MaFanPortfolioStrategy implements IStrategy {
 
       // Quant Q4 (SNR/ATR), Q5 (Empirical Bayes EV), Q1 (Cross-Asset Correlation)
       const curAtrPct = atrPctBySym.get(sym) ?? calcCandleAtrPct14(ind.c15, idx);
-      const snrAtr = distanceToEma200Pct / Math.max(0.12, curAtrPct);
-      const snrScoreBonus = q4VolActive && snrAtr >= 3.5 && snrAtr <= 12 ? 8 : 0;
+      const effRewardPct = isAlpaca ? distanceToEma200Pct : Math.max(0.8, distanceToEma200Pct);
+      const snrAtr = effRewardPct / Math.max(0.12, curAtrPct);
+      const minSnrAtr = isAlpaca ? 1.25 : 0.65;
+      const snrScoreBonus = isAlpaca && q4VolActive && snrAtr >= 3.5 && snrAtr <= 12 ? 8 : 0;
+      const maxCorrLimit = isAlpaca ? 0.75 : 0.85;
       const evRes = q5EvActive
         ? this.learning.getEmpiricalBayesEvAdjustment(sym, {
             rs24h: relStrength24h,
@@ -1546,17 +1560,17 @@ export class MaFanPortfolioStrategy implements IStrategy {
             stage = "CROSS_8X16_FAIL_FILTERS";
             filterNote = "Opening 45m Guard (รอ Vol≥1.85x & RS≥+0.4%)";
             openSessionBlocked = true;
-          } else if (q4VolActive && snrAtr < 1.25) {
+          } else if (q4VolActive && snrAtr < minSnrAtr) {
             stage = "CROSS_8X16_FAIL_FILTERS";
-            filterNote = `Low SNR (${snrAtr.toFixed(2)}x ATR < 1.25x)`;
+            filterNote = `Low SNR (${snrAtr.toFixed(2)}x ATR < ${minSnrAtr.toFixed(2)}x)`;
             lowSnrBlocked = true;
-          } else if (q5EvActive && evRes.shouldBlockTrap && (!q4VolActive || snrAtr < 1.6)) {
+          } else if (q5EvActive && evRes.shouldBlockTrap && (!q4VolActive || snrAtr < minSnrAtr * 1.3)) {
             stage = "CROSS_8X16_FAIL_FILTERS";
             filterNote = `Negative Empirical EV (${evRes.shrunkEvPct.toFixed(2)}%)`;
             negEvBlocked = true;
-          } else if (q1CorrActive && maxHeldCorr > 0.75) {
+          } else if (q1CorrActive && maxHeldCorr > maxCorrLimit) {
             stage = "CROSS_8X16_FAIL_FILTERS";
-            filterNote = `High Corr (${(maxHeldCorr * 100).toFixed(0)}% > 75% vs ${corrHeldSym})`;
+            filterNote = `High Corr (${(maxHeldCorr * 100).toFixed(0)}% > ${(maxCorrLimit * 100).toFixed(0)}% vs ${corrHeldSym})`;
             highCorrBlocked = true;
           } else if (passesSurvivalFilters) {
             stage = "PULLBACK_READY";
@@ -1718,8 +1732,11 @@ export class MaFanPortfolioStrategy implements IStrategy {
                 }
               }
             }
-            if (maxCorr > 0.75) {
-              this.log(`🛡️ [Quant Q1 Corr Guard] Skipped ${ch.sym} (corr ${(maxCorr * 100).toFixed(0)}% > 75% vs held ${corrSym})`);
+            const maxCorrLimit = isAlpaca ? 0.75 : 0.85;
+            if (maxCorr > maxCorrLimit) {
+              this.log(
+                `🛡️ [Quant Q1 Corr Guard] Skipped ${ch.sym} (corr ${(maxCorr * 100).toFixed(0)}% > ${(maxCorrLimit * 100).toFixed(0)}% vs held ${corrSym})`,
+              );
               continue;
             }
           }
