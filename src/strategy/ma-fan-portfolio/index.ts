@@ -2091,6 +2091,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       slotIndex,
       entryTimeMs: slot.entryTime,
       entryPrice: execPrice,
+      signalPrice: refPrice,
       qty: execQty,
       allocatedQuote: actualCost,
       snapshot: entryCand ?? this.radarList.find((r) => r.symbol === symbol),
@@ -2099,7 +2100,9 @@ export class MaFanPortfolioStrategy implements IStrategy {
       survivalObserve,
     });
     this.saveState(true);
-    this.log(`🚀 [Slot ${slotIndex + 1}/${this.getMaxSlots()} ENTER] Bought ${execQty} ${symbol} @ $${execPrice.toFixed(2)} ($${actualCost.toFixed(2)}) | SL $${slPrice.toFixed(2)}`);
+    const slipPct = refPrice > 0 ? ((execPrice - refPrice) / refPrice) * 100 : 0;
+    const slipNote = refPrice > 0 && Math.abs(execPrice - refPrice) > 1e-8 ? ` | Slip ${slipPct >= 0 ? "+" : ""}${slipPct.toFixed(3)}%` : "";
+    this.log(`🚀 [Slot ${slotIndex + 1}/${this.getMaxSlots()} ENTER] Bought ${execQty} ${symbol} @ $${execPrice.toFixed(2)} ($${actualCost.toFixed(2)}) | SL $${slPrice.toFixed(2)}${slipNote}`);
   }
 
   private async executeExitSlot(

@@ -314,7 +314,7 @@ export function computeFeatureBucketKey(
   return `${rsB}:${volB}:${spB}:${rsiB}`;
 }
 
-function normalizeBlockReasonKey(rawReason: string | null | undefined): string {
+export function normalizeBlockReasonKey(rawReason: string | null | undefined): string {
   const first = (rawReason || "OTHER").split(",")[0]?.trim() || "OTHER";
   if (first === "MACRO_SIT_OUT" || first === "SHADOW_BEAR_MACRO" || first === "FILTER_FAIL") {
     return first;
@@ -324,16 +324,17 @@ function normalizeBlockReasonKey(rawReason: string | null | undefined): string {
   }
   if (first.startsWith("FILTER:")) {
     const detail = first.slice("FILTER:".length).trim();
-    if (detail.startsWith("1hRSI")) return "FILTER:1hRSI<40";
-    if (detail.startsWith("VolR")) return "FILTER:VolR<1.3";
-    if (detail.startsWith("RS")) return "FILTER:RS<-1%";
+    if (detail.startsWith("RiskyShadow") || detail.includes("RISKY_SYMBOL")) return "SURVIVAL_GUARD:RISKY_SYMBOL";
+    if (detail.startsWith("1hRSI")) return "FILTER:1hRSI";
+    if (detail.startsWith("VolR")) return "FILTER:VolR";
+    if (detail.startsWith("RS") && (detail.length === 2 || /^RS[\s<>=+-]/i.test(detail))) return "FILTER:RS";
     if (detail.includes("Cooldown")) return "FILTER:Cooldown";
     if (detail.includes("8x16_WeakMom")) return "FILTER:8x16_WeakMom";
-    if (detail.startsWith("GAP_TRAP")) return "FILTER:GAP_TRAP";
-    if (detail.startsWith("HIGH_CORR")) return "FILTER:HIGH_CORR";
-    if (detail.startsWith("OPEN_SESSION_45M")) return "FILTER:OPEN_SESSION_45M";
-    if (detail.startsWith("LOW_SNR_ATR")) return "FILTER:LOW_SNR_ATR";
-    if (detail.startsWith("NEG_EMPIRICAL_EV")) return "FILTER:NEG_EMPIRICAL_EV";
+    if (detail.startsWith("GAP_TRAP") || detail.startsWith("Gap Up Trap")) return "FILTER:GAP_TRAP";
+    if (detail.startsWith("HIGH_CORR") || detail.startsWith("High Corr")) return "FILTER:HIGH_CORR";
+    if (detail.startsWith("OPEN_SESSION_45M") || detail.startsWith("Opening 45m")) return "FILTER:OPEN_SESSION_45M";
+    if (detail.startsWith("LOW_SNR_ATR") || detail.startsWith("Low SNR")) return "FILTER:LOW_SNR_ATR";
+    if (detail.startsWith("NEG_EMPIRICAL_EV") || detail.startsWith("Negative Empirical EV")) return "FILTER:NEG_EMPIRICAL_EV";
     if (detail.includes("Survival")) return `FILTER:${detail}`;
   }
   return first;
@@ -1096,6 +1097,7 @@ export class LearningEngine {
     slotIndex: number;
     entryTimeMs: number;
     entryPrice: number;
+    signalPrice?: number;
     qty: number;
     allocatedQuote: number;
     snapshot?: PortfolioRadarCandidate;
@@ -1113,6 +1115,10 @@ export class LearningEngine {
     if (!pg) return journalUid;
 
     const snap = params.snapshot;
+    const hasSignalPx = typeof params.signalPrice === "number" && params.signalPrice > 0 && params.entryPrice > 0;
+    const entrySlippagePct = hasSignalPx
+      ? Number((((params.entryPrice - params.signalPrice!) / params.signalPrice!) * 100).toFixed(4))
+      : null;
     const rec: LearningJournalRecord = {
       journalUid,
       recordType: "TRADE",
@@ -1135,6 +1141,12 @@ export class LearningEngine {
         macroPass4h: params.macro?.pass4h ?? true,
         macroPass1d: params.macro?.pass1d ?? true,
         breadthAboveEma25Pct: params.macro ? Number(params.macro.breadthAboveEma25Pct.toFixed(1)) : null,
+        ...(hasSignalPx
+          ? {
+              signalPrice: Number(params.signalPrice!.toFixed(6)),
+              entrySlippagePct,
+            }
+          : {}),
         ...(params.survivalObserve
           ? {
               survivalPosture: params.survivalObserve.posture,
@@ -1268,17 +1280,18 @@ export class LearningEngine {
       }
     };
 
+    // Prefer structured keys from extraBlocked before display filterNotes at equal priority
+    if (Array.isArray(params.extraBlocked)) {
+      for (const ex of params.extraBlocked) {
+        consider(ex.candidate, ex.blockReason, ex.barTimeSec);
+      }
+    }
+
     for (const c of params.candidates) {
       if (c.stage === "CROSS_8X16_FAIL_FILTERS") {
         consider(c, c.filterNote ? `FILTER:${c.filterNote}` : "FILTER_FAIL");
       } else if (c.stage === "PULLBACK_READY" && params.macro.isSitOut) {
         consider(c, "MACRO_SIT_OUT");
-      }
-    }
-
-    if (Array.isArray(params.extraBlocked)) {
-      for (const ex of params.extraBlocked) {
-        consider(ex.candidate, ex.blockReason, ex.barTimeSec);
       }
     }
 
@@ -2590,6 +2603,17 @@ export class LearningEngine {
       totalPnlQuote: Number(observedWarnPnl.toFixed(2)),
     };
 
+    const slipSamples = [...closedTrades, ...openTrades]
+      .filter((t) => t.features?.entrySlippagePct !== undefined && t.features?.entrySlippagePct !== null)
+      .map((t) => Number(t.features!.entrySlippagePct))
+      .filter((v) => Number.isFinite(v));
+    const executionAudit = {
+      samples: slipSamples.length,
+      avgEntrySlippagePct:
+        slipSamples.length > 0 ? Number((slipSamples.reduce((a, b) => a + b, 0) / slipSamples.length).toFixed(4)) : null,
+      maxAdverseSlippagePct: slipSamples.length > 0 ? Number(Math.max(...slipSamples).toFixed(4)) : null,
+    };
+
     return {
       postgresActive: true,
       instanceKey: pg.instanceKey,
@@ -2615,6 +2639,7 @@ export class LearningEngine {
       },
       survival: this.lastSurvivalDecision,
       survivalValidation,
+      executionAudit,
       shadowLearning: this.shadowSummary,
       exitReasons: Array.from(byReasonMap.entries()).map(([reason, r]) => ({
         reason,

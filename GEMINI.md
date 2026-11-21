@@ -10170,3 +10170,15 @@ When investigating live production behavior, debugging issues, or analyzing trad
      - ใน `scanAndRunCycle()` + `executeEntrySlot()` + `onPortfolioEntry()`: แม้ `!survival.enforced` บอทจะตรวจสอบว่าตัวที่ซื้อเข้าเงื่อนไขเตือน Survival (`SURVIVAL_OBSERVE:CAPITAL_PRESERVATION`, `SURVIVAL_OBSERVE:RISKY_SYMBOL`, หรือ `SURVIVAL_OBSERVE:<POSTURE>`) และบันทึกลง `trade_learning_journal.features` (`survivalPosture`, `survivalEnforced`, `survivalWouldBlock`) พร้อมสรุปสถิติ `survivalValidation` ใน `/api/learning/report` เพื่อวัดผลจริงว่าคำเตือนของ Survival Guard ช่วยได้จริงหรือไม่
   3. **UI Updates (`public/index.html`, `public/app.js`)**: เพิ่มสวิตช์เปิด-ปิด Survival Guard ใน Settings Modal, แสดงป้าย `Obs • ใช้ X/X` บนการ์ด Learning และแสดงบรรทัด `🧪 ผลไม้จริงที่ Survival เคยเตือน` ใน Learning Report Modal
 - **Version Bump**: **`0.3.1.5`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 350. Canonical Learning Report Block-Reason Grouping & Entry Slippage Audit (`src/learning-engine.ts`, `src/strategy/ma-fan-portfolio/index.ts`, `public/app.js`, v0.3.1.6)
+- **สาเหตุที่ตรวจพบจาก `/api/learning/report` บน Production**:
+  1. `normalizeBlockReasonKey()` (`src/learning-engine.ts`) ไม่ได้จับข้อความ UI เช่น `"Low SNR (...)"`, `"Gap Up Trap (...)"`, `"Opening 45m Guard (...)"`, `"Negative Empirical EV (...)"`, `"High Corr (...)"`, และ `"RiskyShadow"` ส่งผลให้ `FILTER:Low SNR` แตกออกเป็น 8 แถวละ 1 เคส (แทนที่จะรวมเป็น `FILTER:LOW_SNR_ATR` ที่กันแพ้ได้ 8/8 = 100%) รวมถึงป้าย `FILTER:VolR<1.3`, `FILTER:1hRSI<40`, `FILTER:RS<-1%` ที่ฮาร์ดโค้ดค่าตัวเลขเดิมแม้ Auto-Pilot จะปรับ threshold ไปแล้ว
+  2. `recordBlockedSignals()` วน `candidates` ก่อน `extraBlocked` ที่ Priority เท่ากัน (`2`) จึงเผลอเก็บ `FILTER:${c.filterNote}` แทน structured key จาก `extraBlocked` และ `onPortfolioEntry()` ยังไม่เคยเก็บ `signalPrice` เทียบกับราคา Fill จริงเพื่อตรวจสอบ Entry Slippage
+- **การแก้ไขและสถาปัตยกรรมใหม่**:
+  1. **Export & Normalize Canonical Keys (`normalizeBlockReasonKey` & `recordBlockedSignals` in `src/learning-engine.ts`)**: รวมกลุ่ม `FILTER:LOW_SNR_ATR`, `FILTER:GAP_TRAP`, `FILTER:OPEN_SESSION_45M`, `FILTER:NEG_EMPIRICAL_EV`, `FILTER:HIGH_CORR`, `SURVIVAL_GUARD:RISKY_SYMBOL` (ตรวจ `RiskyShadow` ก่อน `RS` เพื่อกันชนกัน), และปรับ `FILTER:1hRSI`, `FILTER:VolR`, `FILTER:RS` ให้ไม่ฮาร์ดโค้ด threshold พร้อมประมวลผล `extraBlocked` ก่อน `candidates`
+  2. **Entry Signal-vs-Fill Slippage Audit (`onPortfolioEntry`, `buildReport`, `executeEntrySlot`)**: ส่ง `signalPrice: refPrice` จาก `executeEntrySlot()` เข้า `onPortfolioEntry()` เพื่อคำนวณ `entrySlippagePct` เก็บใน `trade_learning_journal.features`, Log `| Slip +X.XXX%` เมื่อ Fill ต่างจาก Signal และสรุป `executionAudit` (`samples`, `avgEntrySlippagePct`, `maxAdverseSlippagePct`) ใน `/api/learning/report`
+  3. **Dashboard UI (`public/app.js`)**: ใน `refreshPortfolioLearningCard()` คัด `topSaved` จากกลุ่มที่มี `evaluated >= 3` ก่อนเพื่อไม่ให้เคส 1 ตัวอย่างขึ้นเป็น Top Filter และแสดง `Avg Slip` ในการ์ด `💰 PnL สะสม (Journal)` ของ Learning Report
+- **Version Bump**: **`0.3.1.6`** (`package.json`, `src/version.ts`, `public/index.html`)

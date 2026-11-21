@@ -1624,7 +1624,10 @@
       const adjs = Array.isArray(rep.recentAdjustments) ? rep.recentAdjustments.length : 0;
       const closed = Number(s.closedTrades || 0);
       const breakdown = Array.isArray(bs.breakdown) ? bs.breakdown : [];
-      const topSaved = breakdown.slice().sort((a, b) => (b.savedPct || 0) - (a.savedPct || 0))[0];
+      const significantBreakdown = breakdown.filter((b) => Number(b.evaluated || 0) >= 3);
+      const topSaved = (significantBreakdown.length > 0 ? significantBreakdown : breakdown)
+        .slice()
+        .sort((a, b) => (b.savedPct || 0) - (a.savedPct || 0))[0];
 
       const postureIconMap = {
         NORMAL: "🟢",
@@ -9706,6 +9709,11 @@
       }
 
       const s = rep.summary || {};
+      const ea = rep.executionAudit || null;
+      const slipTxt =
+        ea && ea.samples > 0 && ea.avgEntrySlippagePct != null
+          ? ` • Avg Slip: ${Number(ea.avgEntrySlippagePct) >= 0 ? "+" : ""}${Number(ea.avgEntrySlippagePct).toFixed(3)}% (${ea.samples}t)`
+          : "";
       const winCol = Number(s.winRatePct || 0) >= 50 ? "#4ade80" : "#fbbf24";
       const pnlVal = Number(s.totalPnlQuote || 0);
       const combMaeTxt = s.combinedWinMaeP80Pct != null ? `Combined P80: ${s.combinedWinMaeP80Pct}%` : `WinMAE P80: ${s.winMaeP80Pct != null ? `${s.winMaeP80Pct}%` : "รอข้อมูล"}`;
@@ -9722,7 +9730,7 @@
           <div class="lr-kpi-card">
             <div class="lr-kpi-label">💰 PnL สะสม (Journal)</div>
             <div class="lr-kpi-val" style="color:${pnlVal >= 0 ? "#4ade80" : "#f87171"};">${pnlVal >= 0 ? "+" : ""}$${pnlVal.toFixed(2)}</div>
-            <div class="lr-kpi-sub">เฉลี่ยต่อไม้: ${Number(s.avgPnlPct || 0) >= 0 ? "+" : ""}${Number(s.avgPnlPct || 0).toFixed(2)}%</div>
+            <div class="lr-kpi-sub">เฉลี่ยต่อไม้: ${Number(s.avgPnlPct || 0) >= 0 ? "+" : ""}${Number(s.avgPnlPct || 0).toFixed(2)}%${slipTxt}</div>
           </div>
           <div class="lr-kpi-card">
             <div class="lr-kpi-label">📉 Avg MAE / 📈 Avg MFE</div>
