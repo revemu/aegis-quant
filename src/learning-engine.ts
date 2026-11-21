@@ -1382,7 +1382,8 @@ export class LearningEngine {
     const closedRounds = roundsRes.rounds.filter((r) => r.status === "CLOSED");
     if (closedRounds.length === 0) return { updatedTrades: 0, updatedSymbols: 0 };
 
-    const journalTrades = await pg.loadLearningJournal("TRADE", "CLOSED", 500).catch(() => [] as LearningJournalRecord[]);
+    // Load both OPEN and CLOSED trade rows so externally closed slots (e.g. Alpaca queued fills) also close cleanly
+    const journalTrades = await pg.loadLearningJournal("TRADE", undefined, 500).catch(() => [] as LearningJournalRecord[]);
     const exLower = exchange.toLowerCase();
     const filteredJournal = journalTrades.filter((j) => j.exchange.toLowerCase() === exLower);
     if (filteredJournal.length === 0) return { updatedTrades: 0, updatedSymbols: 0 };
@@ -1416,43 +1417,68 @@ export class LearningEngine {
           .map((r) => ({ r, diff: Math.abs(jEntryMs - normalizeTsMs(r.startTime)) }))
           .filter((x) => x.diff <= 24 * 3_600_000)
           .sort((a, b) => a.diff - b.diff);
-        if (sameDay.length > 0 && Math.abs((j.pnlQuote ?? 0) - sameDay[0]!.r.netPnlQuote) > 0.5) {
+        if (sameDay.length > 0 && (j.status !== "CLOSED" || Math.abs((j.pnlQuote ?? 0) - sameDay[0]!.r.netPnlQuote) > 0.5)) {
           matched = sameDay[0]!.r;
         }
       }
 
       if (!matched) continue;
       const realPnl = Number(matched.netPnlQuote ?? matched.grossPnlQuote ?? 0);
-      const storedPnl = Number(j.pnlQuote ?? 0);
-      if (Math.abs(realPnl - storedPnl) <= 0.25) continue;
+      const storedPnl = j.pnlQuote !== null && j.pnlQuote !== undefined ? Number(j.pnlQuote) : NaN;
+      const wasOpen = j.status !== "CLOSED";
+      if (!wasOpen && Number.isFinite(storedPnl) && Math.abs(realPnl - storedPnl) <= 0.25) continue;
 
       const alloc = Number(j.allocatedQuote || matched.buyCostQuote || 0);
       const nextPnlPct = alloc > 0 ? (realPnl / alloc) * 100 : Number(matched.grossPnlPct || 0);
       const nextHoldMin = matched.durationMs > 0 ? matched.durationMs / 60_000 : Number(j.holdMinutes ?? 0);
-      const nextExitReason =
-        realPnl < -0.5 && j.exitReason === "SL_BREAKEVEN" ? "RECONCILED_SL" : (j.exitReason ?? null);
+      const nextEntryPx = matched.avgBuyPrice > 0 ? matched.avgBuyPrice : j.entryPrice;
+      const nextExitPx = matched.avgSellPrice > 0 ? matched.avgSellPrice : Number(j.exitPrice ?? j.entryPrice);
 
-      await pg
-        .updateLearningJournalTradeFill({
-          journalUid: j.journalUid,
-          entryPrice: matched.avgBuyPrice > 0 ? matched.avgBuyPrice : j.entryPrice,
-          exitPrice: matched.avgSellPrice > 0 ? matched.avgSellPrice : Number(j.exitPrice ?? j.entryPrice),
-          pnlQuote: Number(realPnl.toFixed(4)),
-          pnlPct: Number(nextPnlPct.toFixed(3)),
-          holdMinutes: Number(nextHoldMin.toFixed(2)),
-          exitReason: nextExitReason,
-        })
-        .catch(() => {});
+      if (wasOpen) {
+        const exitMs = matched.endTime ? normalizeTsMs(matched.endTime) : Date.now();
+        await pg
+          .closeLearningTrade({
+            journalUid: j.journalUid,
+            exitTimeMs: exitMs,
+            exitPrice: nextExitPx,
+            pnlQuote: Number(realPnl.toFixed(4)),
+            pnlPct: Number(nextPnlPct.toFixed(3)),
+            maePct: Number(j.maePct ?? 0),
+            mfePct: Number(j.mfePct ?? 0),
+            holdMinutes: Number(nextHoldMin.toFixed(2)),
+            exitReason: j.exitReason || "RECONCILED_ALPACA",
+          })
+          .catch(() => {});
+        j.status = "CLOSED";
+      } else {
+        const nextExitReason =
+          realPnl < -0.5 && j.exitReason === "SL_BREAKEVEN" ? "RECONCILED_SL" : (j.exitReason ?? null);
+        await pg
+          .updateLearningJournalTradeFill({
+            journalUid: j.journalUid,
+            entryPrice: nextEntryPx,
+            exitPrice: nextExitPx,
+            pnlQuote: Number(realPnl.toFixed(4)),
+            pnlPct: Number(nextPnlPct.toFixed(3)),
+            holdMinutes: Number(nextHoldMin.toFixed(2)),
+            exitReason: nextExitReason,
+          })
+          .catch(() => {});
+      }
 
+      j.entryPrice = nextEntryPx;
+      j.exitPrice = nextExitPx;
       j.pnlQuote = realPnl;
       j.pnlPct = nextPnlPct;
       updatedTrades++;
       touchedSymbols.add(j.symbol.toUpperCase());
     }
 
+    // Recompute symbol_learning_state for touched symbols OR any symbol whose cached state diverges from closed TRADE rows
+    const allJournalSyms = new Set(filteredJournal.filter((j) => j.status === "CLOSED").map((j) => j.symbol.toUpperCase()));
     let updatedSymbols = 0;
-    for (const sym of touchedSymbols) {
-      const symTrades = filteredJournal.filter((j) => j.symbol.toUpperCase() === sym);
+    for (const sym of allJournalSyms) {
+      const symTrades = filteredJournal.filter((j) => j.status === "CLOSED" && j.symbol.toUpperCase() === sym);
       let wins = 0;
       let losses = 0;
       let totalPnlQuote = 0;
@@ -1463,13 +1489,20 @@ export class LearningEngine {
         else losses++;
       }
       const prev = this.symbolStates.get(sym);
+      const stateMatches =
+        prev &&
+        prev.wins === wins &&
+        prev.losses === losses &&
+        Math.abs(prev.totalPnlQuote - totalPnlQuote) <= 0.25;
+      if (!touchedSymbols.has(sym) && stateMatches) continue;
+
       const nextState: SymbolLearningStateRecord = {
         symbol: sym,
         consecutiveSl: losses === 0 ? 0 : (prev?.consecutiveSl ?? 0),
         wins,
         losses,
         totalPnlQuote: Number(totalPnlQuote.toFixed(4)),
-        scorePenalty: wins > losses && totalPnlQuote >= 0 ? 0 : (prev?.scorePenalty ?? 0),
+        scorePenalty: wins > losses || totalPnlQuote >= 0 ? 0 : (prev?.scorePenalty ?? 0),
         cooldownUntilMs: losses === 0 ? 0 : (prev?.cooldownUntilMs ?? 0),
         lastReason: prev?.lastReason || "JOURNAL_RECONCILED",
         updatedAt: Date.now(),
@@ -1479,7 +1512,7 @@ export class LearningEngine {
       updatedSymbols++;
     }
 
-    if (updatedTrades > 0) {
+    if (updatedTrades > 0 || updatedSymbols > 0) {
       this.log(`🧹 [Learning Reconcile] Updated ${updatedTrades} journal trade(s) & ${updatedSymbols} symbol state(s) from reconciled fills`);
     }
     return { updatedTrades, updatedSymbols };

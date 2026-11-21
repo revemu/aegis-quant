@@ -1737,8 +1737,12 @@ export class BotDatabase {
         }
       }
 
-      // 4. Auto-heal: Ensure all partial fills sharing the same orderId inherit the bot's action & reason
+      // 4. Auto-heal: Inherit bot metadata onto reconciled tradeId fills & prune duplicate un-tagged rows sharing the same orderId
+      const reconciledOrderIds = new Set<string>();
       for (const o of this.data.orders) {
+        if (o.orderId && o.tradeId) {
+          reconciledOrderIds.add(o.orderId.toString());
+        }
         if (
           o.orderId &&
           o.reason &&
@@ -1757,6 +1761,14 @@ export class BotDatabase {
           botOrdersByOrderId.set(o.orderId.toString(), o);
         }
       }
+
+      this.data.orders = this.data.orders.filter((o) => {
+        if (o.orderId && !o.tradeId && reconciledOrderIds.has(o.orderId.toString())) {
+          purgedCount++;
+          return false;
+        }
+        return true;
+      });
 
       let healedCount = 0;
       for (const o of this.data.orders) {

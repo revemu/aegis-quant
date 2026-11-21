@@ -10141,3 +10141,18 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - เพิ่ม `resetRightPriceScaleAutoScale()` และ `clearChartOverlaysAndSeries()` เพื่อล้างข้อมูล/เส้นกราฟ/Price Lines/Badges เก่าและเปิด `autoScale: true` บนแกนขวาทุกครั้งใน `refreshWorkerDashboard()`, ปุ่ม `#btnFitChart`, `inspectPortfolioSymbol()`, และ `applyCurrentTimeframeCandles()` (รีเซ็ตอัตโนมัติเมื่อสลับสัญลักษณ์/Timeframe หรือช่วงราคาเปลี่ยนเกิน ±25%)
   - อัปเดต `ema4Series..ema200Series` ให้ใช้ `priceFormat` เดียวกับ `candleSeries` ใน `updateChartPrecision()` และเพิ่ม `reqBase === API_BASE` guard ใน `connectSSE()` และ `refreshFrontPageState()`
 - **Version Bump**: **`0.3.1.3`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 348. Alpaca Partial/Queued Exit Fill Reconciliation & Learning Journal OPEN+CLOSED Self-Healing (`src/strategy/ma-fan-portfolio/index.ts`, `src/learning-engine.ts`, v0.3.1.4)
+- **สาเหตุที่ตรวจพบจาก Log สดบน `alpaca_kyne` (`2026-11-20 21:33–21:35`)**:
+  1. ตอนตลาด US เปิด ออเดอร์คิวคัท (`EMERGENCY_CLOSE_ALL`) ยิงซ้ำทุก ~10 วินาทีและสั่ง `cancelAllOpenOrders` แทรกระหว่างที่ Alpaca กำลังแมตช์ `MARKET SELL` จึงเกิดการแบ่งขายซ้อน (`HTTP 403 insufficient qty` / `HTTP 422 fractional orders cannot be sold short`) และ `VOO` ขายไม้สุดท้ายไปได้เพียง `32` จาก `96` หุ้น (`-$682.46`) ขณะที่ `64` หุ้นก่อนหน้าถูกขายจากออเดอร์เก่า
+  2. ใน `executeExitSlot()` ใช้ `closeFullSlot` ปิดทั้ง Slot ทันทีและคำนวณ `realizedProceeds(32 หุ้น) - allocatedCapital(96 หุ้น)` จนบันทึก `VOO` ติดลบหลอก **`-$43,934.11`** เข้า Learning Engine ส่วน `VTI` ถูก `syncOnChainOrders()` ลบออกจาก `this.slots` ทันทีเมื่อ Position เป็น 0 โดยไม่ได้ซิงค์ Fill การขายจาก Alpaca ทำให้ `bot_rounds` และ `trade_learning_journal` ค้างสถานะ `OPEN`/`HOLDING`
+  3. ใน `LearningEngine.reconcileJournalFromOrders()` เดิมโหลดเฉพาะแถวที่ `status = 'CLOSED'` จึงไม่สามารถปิดแถว `OPEN` ที่ปิดไปแล้วบน Exchange (`VTI`) ได้
+- **การแก้ไขและสถาปัตยกรรมใหม่**:
+  1. **Startup Exchange Fill Reconcile (`reconcileAndRunInitialShadow` ใน `src/strategy/ma-fan-portfolio/index.ts`)**: ซิงค์ออเดอร์จริงจาก Exchange (`syncRecentTradesFromExchange("ALL")`) ก่อน `reconcileJournalFromOrders()` ทุกครั้งที่บอทเริ่มทำงานและอัปเดต `realizedPnl` จากรอบที่ปิดสมบูรณ์แล้ว
+  2. **Unified `finalizeClosedPortfolioSlot()` Helper & Smart `syncOnChainOrders()` / `executeExitSlot()` (`src/strategy/ma-fan-portfolio/index.ts`)**:
+     - เมื่อ Position หดตัวจากการแบ่งขายภายนอกหรือเหลือ `0` บน Alpaca จะดึง `syncRecentTradesFromExchange()` และคำนวณ PnL จากรอบที่ปิดสมบูรณ์ใน `getTradeRounds()` แทนตัวเลขค้างเฉพาะไม้สุดท้าย พร้อมปิด `trade_learning_journal` ให้ครบทุกครั้ง
+     - ใน `executeExitSlot()`: ตรวจ `SELL MARKET` ที่เปิดอยู่แล้วแทนการ Cancel ซ้ำซ้อน, อัปเดต `livePos.qty` & `qtyAvailable` ก่อนยิงขาย, เก็บส่วนที่เหลือไว้ขายต่อถ้าบน Alpaca ยังเหลือ Position `> 0`, และซิงค์ `syncOnChainOrders()` ทันทีเมื่อพบ `403`/`422`
+  3. **Upgraded `reconcileJournalFromOrders()` (`src/learning-engine.ts`) & Duplicate Fill Pruning (`src/db.ts`)**: โหลดทั้ง `OPEN` และ `CLOSED` TRADE rows จาก `trade_learning_journal`, ปิดแถว `OPEN` ที่ปิดจบแล้วบน `bot_rounds` ผ่าน `pg.closeLearningTrade()`, ซ่อม `symbol_learning_state` อัตโนมัติทุกตัวที่ยอดไม่ตรงกับ Journal, และใน `syncRecentTradesFromExchange()` (`src/db.ts`) ลบแถวที่ยังไม่มี `tradeId` เมื่อมี fill จากกระดานที่มี `orderId` เดียวกันอยู่แล้วเพื่อกันนับซ้ำใน `calculateTradeRounds()`
+- **Version Bump**: **`0.3.1.4`** (`package.json`, `src/version.ts`, `public/index.html`)

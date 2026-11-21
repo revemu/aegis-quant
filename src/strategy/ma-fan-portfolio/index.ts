@@ -762,8 +762,105 @@ export class MaFanPortfolioStrategy implements IStrategy {
   }
 
   private async reconcileAndRunInitialShadow(): Promise<void> {
+    if (
+      !this.cfg.dryRun &&
+      this.exchange.hasCredentials() &&
+      (this.exchange.exchangeName === "alpaca" || this.exchange.exchangeName === "binance")
+    ) {
+      await this.db.syncRecentTradesFromExchange(this.exchange, "ALL").catch(() => {});
+      const roundsSummary = this.db.getTradeRounds("ALL").summary;
+      if (roundsSummary.closedRounds > 0) {
+        this.realizedPnl = roundsSummary.totalNetPnlQuote;
+        this.tradeRealizedPnl = roundsSummary.totalNetPnlQuote;
+        this.saveState(true);
+      }
+    }
     await this.learning.reconcileJournalFromOrders(this.exchange.exchangeName).catch(() => {});
     await this.runLearningShadowScan(false).catch(() => {});
+  }
+
+  private async finalizeClosedPortfolioSlot(
+    slot: ActivePortfolioSlot,
+    fallbackExitPrice: number,
+    reason: string,
+    fallbackTotalPnl?: number,
+    syncExchangeFills = true,
+  ): Promise<{ exitPrice: number; totalPnlQuote: number }> {
+    if (
+      syncExchangeFills &&
+      !this.cfg.dryRun &&
+      this.exchange.hasCredentials() &&
+      (this.exchange.exchangeName === "alpaca" || this.exchange.exchangeName === "binance")
+    ) {
+      await this.db.syncRecentTradesFromExchange(this.exchange, slot.symbol).catch(() => {});
+    }
+
+    const symRounds = this.db.getTradeRounds(slot.symbol).rounds.filter((r) => r.status === "CLOSED");
+    const matchedRound =
+      symRounds.find((r) => {
+        const sMs = r.startTime < 1e12 ? r.startTime * 1000 : r.startTime;
+        const eMs = (r.endTime || r.startTime) < 1e12 ? (r.endTime || r.startTime) * 1000 : (r.endTime || r.startTime);
+        return slot.entryTime >= sMs - 15 * 60_000 && slot.entryTime <= eMs + 15 * 60_000;
+      }) ||
+      symRounds
+        .map((r) => {
+          const sMs = r.startTime < 1e12 ? r.startTime * 1000 : r.startTime;
+          return { r, diff: Math.abs(slot.entryTime - sMs) };
+        })
+        .filter((x) => x.diff <= 24 * 3_600_000)
+        .sort((a, b) => a.diff - b.diff)[0]?.r;
+
+    const exitPrice =
+      matchedRound && matchedRound.avgSellPrice > 0
+        ? matchedRound.avgSellPrice
+        : (fallbackExitPrice > 0 ? fallbackExitPrice : slot.lastKnownPrice || slot.entryPrice);
+    const totalPnlQuote = matchedRound
+      ? Number(matchedRound.netPnlQuote ?? matchedRound.grossPnlQuote ?? 0)
+      : (fallbackTotalPnl ?? (slot.realizedProceeds - slot.allocatedCapital - slot.entryFeeQuote));
+
+    if (matchedRound) {
+      const roundsSummary = this.db.getTradeRounds("ALL").summary;
+      if (roundsSummary.closedRounds > 0) {
+        this.realizedPnl = roundsSummary.totalNetPnlQuote;
+        this.tradeRealizedPnl = roundsSummary.totalNetPnlQuote;
+      }
+    }
+
+    this.slots = this.slots.filter((s) => s.slotIndex !== slot.slotIndex);
+    if (this.slots.length > 0 && !this.slots.some((s) => s.symbol === this.inspectedSymbol)) {
+      this.inspectedSymbol = this.slots[0]!.symbol;
+      this.cfg.portfolioInspectedSymbol = this.inspectedSymbol;
+    }
+    const st = this.setupStates.get(slot.symbol);
+    if (st) {
+      st.hadBottomFan = false;
+      st.waitingPullback = false;
+      st.bottomLow = Infinity;
+    }
+
+    await this.learning
+      .onPortfolioTradeClosed({
+        journalUid: slot.learningJournalUid,
+        exchange: this.exchange.exchangeName,
+        symbol: slot.symbol,
+        entryTimeMs: slot.entryTime,
+        exitTimeMs: matchedRound?.endTime
+          ? (matchedRound.endTime < 1e12 ? matchedRound.endTime * 1000 : matchedRound.endTime)
+          : Date.now(),
+        entryPrice: matchedRound && matchedRound.avgBuyPrice > 0 ? matchedRound.avgBuyPrice : slot.entryPrice,
+        exitPrice,
+        troughPrice: slot.troughPrice,
+        peakPrice: slot.peakPrice,
+        totalPnlQuote,
+        allocatedQuote: matchedRound && matchedRound.buyCostQuote > 0 ? matchedRound.buyCostQuote : slot.allocatedCapital,
+        exitReason: reason,
+        cfg: this.cfg,
+      })
+      .catch(() => {});
+
+    await this.learning.reconcileJournalFromOrders(this.exchange.exchangeName).catch(() => {});
+    this.emit({ type: "position_flat", data: { symbol: slot.symbol, pnl: totalPnlQuote, reason } });
+    return { exitPrice, totalPnlQuote };
   }
 
   // ── Wallet & Position Sync ─────────────────────────────────────────────────
@@ -821,16 +918,22 @@ export class MaFanPortfolioStrategy implements IStrategy {
         const heldMap = new Map<string, any>(positions.map((p: any) => [p.symbol, p]));
         // Update live qty / price on matching persisted slots, clear closed Alpaca positions, and adopt orphaned ones
         const retainedSlots: ActivePortfolioSlot[] = [];
+        const clearedSlots: ActivePortfolioSlot[] = [];
+        const shrunkSymbols = new Set<string>();
         for (const slot of this.slots) {
           const exPos = heldMap.get(slot.symbol);
           if (exPos && exPos.qty > 0) {
+            if (exPos.qty < slot.qty - 1e-6) {
+              shrunkSymbols.add(slot.symbol);
+            }
             slot.qty = exPos.qty;
             slot.lastKnownPrice = exPos.currentPrice || slot.lastKnownPrice;
             if (slot.entryPrice <= 0 && exPos.avgEntryPrice > 0) slot.entryPrice = exPos.avgEntryPrice;
             retainedSlots.push(slot);
             heldMap.delete(slot.symbol);
           } else {
-            this.log(`🔄 [Portfolio Sync] Slot ${slot.slotIndex + 1} (${slot.symbol}) position is 0 on Alpaca — cleared closed slot`);
+            clearedSlots.push(slot);
+            this.log(`🔄 [Portfolio Sync] Slot ${slot.slotIndex + 1} (${slot.symbol}) position is 0 on Alpaca — clearing closed slot & reconciling fills`);
           }
         }
         this.slots = retainedSlots;
@@ -863,11 +966,23 @@ export class MaFanPortfolioStrategy implements IStrategy {
           });
           this.log(`🔄 [Portfolio Sync] Adopted live Alpaca position into Slot ${slotIndex + 1}: ${sym} (${p.qty} @ $${p.avgEntryPrice})`);
         }
+        for (const sym of shrunkSymbols) {
+          await this.db.syncRecentTradesFromExchange(this.exchange, sym).catch(() => {});
+        }
+        for (const cleared of clearedSlots) {
+          await this.finalizeClosedPortfolioSlot(
+            cleared,
+            cleared.lastKnownPrice || cleared.entryPrice,
+            cleared.pendingExitReason || "ALPACA_SYNC_CLOSED",
+            undefined,
+            true,
+          );
+        }
         if (this.slots.length > 0 && !this.slots.some((s) => s.symbol === this.inspectedSymbol)) {
           this.inspectedSymbol = this.slots[0]!.symbol;
           this.cfg.portfolioInspectedSymbol = this.inspectedSymbol;
         }
-        this.saveState();
+        this.saveState(clearedSlots.length > 0);
       } catch (err) {
         this.log(`⚠️ Failed to sync Alpaca positions: ${(err as Error).message}`);
       }
@@ -1969,6 +2084,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
     let sellQty = Math.min(slot.qty, rawSellQty);
     let execPrice = refPrice;
     let orderId = `sim_sell_${Date.now()}_${slot.slotIndex}`;
+    const isAlpaca = this.exchange.exchangeName === "alpaca";
 
     try {
       const symInfo = await this.exchange.getExchangeInfo(slot.symbol).catch(() => this.symbolInfo);
@@ -1977,20 +2093,76 @@ export class MaFanPortfolioStrategy implements IStrategy {
       if (sellQty <= 0) return false;
 
       if (!this.cfg.dryRun && this.exchange.hasCredentials()) {
-        const isUrgentExit = reason.startsWith("SL_") || reason.startsWith("EMERGENCY") || reason.startsWith("MANUAL") || reason.startsWith("PENDING_EXIT");
-        const isAlpaca = this.exchange.exchangeName === "alpaca";
+        const isUrgentExit =
+          reason.startsWith("SL_") ||
+          reason.startsWith("EMERGENCY") ||
+          reason.startsWith("MANUAL") ||
+          reason.startsWith("PENDING_EXIT");
         const orderType = isAlpaca && isUrgentExit ? "MARKET" : "IOC";
         const floorBuffer = isAlpaca ? 0.997 : 0.998;
+        let preMatchedRes: any = null;
+
         if (isAlpaca && isUrgentExit) {
-          await this.exchange.cancelAllOpenOrders(slot.symbol).catch(() => {});
+          const openOrders = await this.exchange.getOpenOrders(slot.symbol).catch(() => []);
+          const nowSec = Math.floor(Date.now() / 1000);
+          const pendingSellMarket = openOrders.find(
+            (o) =>
+              o.side === "SELL" &&
+              String(o.type || "").toUpperCase() === "MARKET" &&
+              nowSec - Number(o.time || 0) < 30,
+          );
+          if (pendingSellMarket) {
+            await new Promise((r) => setTimeout(r, 500));
+            const refreshed = await this.exchange.getOrder(slot.symbol, pendingSellMarket.orderId).catch(() => null);
+            if (refreshed && refreshed.executedQty > 0 && refreshed.status === "FILLED") {
+              preMatchedRes = refreshed;
+            } else {
+              if (typeof (this.exchange as any).getAllPositions === "function") {
+                const posList = await (this.exchange as any).getAllPositions().catch(() => null);
+                const livePos = Array.isArray(posList) ? posList.find((p: any) => p.symbol === slot.symbol) : undefined;
+                if (Array.isArray(posList) && (!livePos || livePos.qty <= 1e-6)) {
+                  await this.syncOnChainOrders();
+                  return true;
+                }
+              }
+              slot.pendingExitOnOpen = true;
+              slot.pendingExitReason = reason;
+              this.saveState(true);
+              return false;
+            }
+          } else if (openOrders.some((o) => o.side === "SELL")) {
+            await this.exchange.cancelAllOpenOrders(slot.symbol).catch(() => {});
+            await new Promise((r) => setTimeout(r, 250));
+          }
         }
-        const orderRes = await this.exchange.placeOrder({
-          symbol: slot.symbol,
-          side: "SELL",
-          type: orderType,
-          qty: sellQty,
-          price: Number((execPrice * floorBuffer).toFixed(symInfo.pricePrecision || 2)),
-        });
+
+        if (!preMatchedRes && isAlpaca && typeof (this.exchange as any).getAllPositions === "function") {
+          const posList = await (this.exchange as any).getAllPositions().catch(() => null);
+          if (Array.isArray(posList)) {
+            const livePos = posList.find((p: any) => p.symbol === slot.symbol);
+            if (!livePos || livePos.qty <= 1e-6) {
+              await this.syncOnChainOrders();
+              return true;
+            }
+            if (livePos.qty < slot.qty - 1e-6) {
+              await this.db.syncRecentTradesFromExchange(this.exchange, slot.symbol).catch(() => {});
+            }
+            slot.qty = livePos.qty;
+            const availQty = livePos.qtyAvailable > 0 ? Math.min(livePos.qty, livePos.qtyAvailable) : livePos.qty;
+            sellQty = closeFullSlot ? availQty : Math.min(sellQty, availQty);
+            if (sellQty <= 0) return false;
+          }
+        }
+
+        const orderRes =
+          preMatchedRes ||
+          (await this.exchange.placeOrder({
+            symbol: slot.symbol,
+            side: "SELL",
+            type: orderType,
+            qty: sellQty,
+            price: Number((execPrice * floorBuffer).toFixed(symInfo.pricePrecision || 2)),
+          }));
         orderId = String(orderRes.orderId || orderId);
         if (!orderRes.executedQty || orderRes.executedQty <= 0) {
           if (isAlpaca && (orderRes.status === "NEW" || orderRes.status === "PARTIALLY_FILLED" || this.isMarketClosed)) {
@@ -2011,12 +2183,16 @@ export class MaFanPortfolioStrategy implements IStrategy {
         }
       }
     } catch (err) {
-      this.log(`❌ [Slot ${slot.slotIndex + 1} ${slot.symbol}] Exit (${reason}) failed: ${(err as Error).message}`);
+      const msg = (err as Error).message;
+      this.log(`❌ [Slot ${slot.slotIndex + 1} ${slot.symbol}] Exit (${reason}) failed: ${msg}`);
+      if (!this.cfg.dryRun && isAlpaca && (msg.includes("403") || msg.includes("422"))) {
+        await this.syncOnChainOrders().catch(() => {});
+      }
       return false;
     }
 
     const proceeds = sellQty * execPrice;
-    const feePct = this.exchange.exchangeName === "alpaca" || slot.symbol.endsWith("FDUSD") ? 0 : 0.00075;
+    const feePct = isAlpaca || slot.symbol.endsWith("FDUSD") ? 0 : 0.00075;
     const exitFee = proceeds * feePct;
     const origQty = slot.initialQty > 0 ? slot.initialQty : slot.qty;
     const soldShareOfInitial = origQty > 0 ? Math.min(1, sellQty / origQty) : 1;
@@ -2042,8 +2218,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
       id: `mafan_sell_${Date.now()}_${slot.slotIndex}`,
       orderId,
       symbol: slot.symbol,
-      baseAsset: this.exchange.exchangeName === "alpaca" ? slot.symbol : slot.symbol.replace(/(FDUSD|USDT|USDC)$/i, ""),
-      quoteAsset: this.exchange.exchangeName === "alpaca" ? "USD" : (slot.symbol.endsWith("FDUSD") ? "FDUSD" : "USDT"),
+      baseAsset: isAlpaca ? slot.symbol : slot.symbol.replace(/(FDUSD|USDT|USDC)$/i, ""),
+      quoteAsset: isAlpaca ? "USD" : (slot.symbol.endsWith("FDUSD") ? "FDUSD" : "USDT"),
       side: "SELL",
       price: execPrice,
       fillPrice: execPrice,
@@ -2066,35 +2242,18 @@ export class MaFanPortfolioStrategy implements IStrategy {
     this.db.recordEvent(orderRec);
     this.emit({ type: "order", data: orderRec });
 
-    if (closeFullSlot || slot.qty <= 1e-6) {
-      const totalSlotPnl = slot.realizedProceeds - slot.allocatedCapital - slot.entryFeeQuote;
-      void this.learning.onPortfolioTradeClosed({
-        journalUid: slot.learningJournalUid,
-        exchange: this.exchange.exchangeName,
-        symbol: slot.symbol,
-        entryTimeMs: slot.entryTime,
-        exitTimeMs: Date.now(),
-        entryPrice: slot.entryPrice,
-        exitPrice: execPrice,
-        troughPrice: slot.troughPrice,
-        peakPrice: slot.peakPrice,
-        totalPnlQuote: totalSlotPnl,
-        allocatedQuote: slot.allocatedCapital,
-        exitReason: reason,
-        cfg: this.cfg,
-      });
-      this.slots = this.slots.filter((s) => s.slotIndex !== slot.slotIndex);
-      if (this.slots.length > 0 && !this.slots.some((s) => s.symbol === this.inspectedSymbol)) {
-        this.inspectedSymbol = this.slots[0]!.symbol;
-        this.cfg.portfolioInspectedSymbol = this.inspectedSymbol;
-      }
-      const st = this.setupStates.get(slot.symbol);
-      if (st) {
-        st.hadBottomFan = false;
-        st.waitingPullback = false;
-        st.bottomLow = Infinity;
-      }
-      this.emit({ type: "position_flat", data: { symbol: slot.symbol, pnl: legPnl, reason } });
+    const shouldFinalizeSlot = isAlpaca && !this.cfg.dryRun ? slot.qty <= 1e-6 : closeFullSlot || slot.qty <= 1e-6;
+    if (shouldFinalizeSlot) {
+      await this.finalizeClosedPortfolioSlot(
+        slot,
+        execPrice,
+        reason,
+        slot.realizedProceeds - slot.allocatedCapital - slot.entryFeeQuote,
+        !this.cfg.dryRun && isAlpaca,
+      );
+    } else if (closeFullSlot && slot.qty > 1e-6) {
+      slot.pendingExitOnOpen = true;
+      slot.pendingExitReason = reason;
     }
 
     this.saveState(true);
