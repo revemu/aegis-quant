@@ -1644,7 +1644,11 @@
       }
       if (elGrid) {
         const survTxt = surv
-          ? `${postureIcon} ${posture} (${surv.effectiveMaxSlots}/${surv.configuredMaxSlots} • ${Math.round((surv.positionSizeScale ?? 1) * 100)}%)`
+          ? `${postureIcon} ${posture} (${
+              surv.enforced
+                ? `${surv.effectiveMaxSlots}/${surv.configuredMaxSlots} • ${Math.round((surv.positionSizeScale ?? 1) * 100)}%`
+                : `Obs • ใช้ ${surv.configuredMaxSlots}/${surv.configuredMaxSlots}`
+            })`
           : (rep.autoTuneEffective ? "🟢 Active" : "🟡 Observer");
         const shadowTxt = shad && shad.totalSetups > 0
           ? `${shad.totalSetups} setups (${Number(shad.winRatePct || 0).toFixed(0)}% WR)`
@@ -6795,6 +6799,7 @@
       setVal("cfg_portfolioMinRsi1h", data.portfolioMinRsi1h ?? 40);
       setCheck("cfg_portfolioPartialTpAtEma200", data.portfolioPartialTpAtEma200 !== false);
       setCheck("cfg_portfolioLockBreakevenAtEma200", data.portfolioLockBreakevenAtEma200 !== false);
+      setCheck("cfg_portfolioSurvivalGuardEnforced", Boolean(data.portfolioSurvivalGuardEnforced));
 
       const elApBadge = document.getElementById("pfAutoPilotModeBadge");
       const elApParams = document.getElementById("pfAutoPilotActiveParams");
@@ -7154,6 +7159,9 @@
       portfolioLockBreakevenAtEma200: document.getElementById("cfg_portfolioLockBreakevenAtEma200")
         ? Boolean(document.getElementById("cfg_portfolioLockBreakevenAtEma200").checked)
         : true,
+      portfolioSurvivalGuardEnforced: document.getElementById("cfg_portfolioSurvivalGuardEnforced")
+        ? Boolean(document.getElementById("cfg_portfolioSurvivalGuardEnforced").checked)
+        : false,
     };
 
     const newMaColors = {
@@ -9667,16 +9675,23 @@
           const pIconMap = { NORMAL: "🟢", CAUTIOUS: "🟡", DEFENSIVE: "🟠", CAPITAL_PRESERVATION: "🔴" };
           elSurv.className = `lr-survival-banner ${pClassMap[surv.posture] || "posture-normal"}`;
           elSurv.style.display = "flex";
-          const modeLabel = surv.enforced ? "🛡️ ENFORCED (ป้องกันพอร์ตจริง)" : "👁️ OBSERVER (แนะนำเท่านั้น)";
+          const modeLabel = surv.enforced
+            ? "🛡️ ENFORCED (ป้องกันพอร์ตจริง)"
+            : `👁️ OBSERVER (Log เท่านั้น • เทรดเต็ม ${surv.configuredMaxSlots} ช่อง)`;
           const m = surv.metrics || {};
+          const sv = rep.survivalValidation || null;
+          const svHtml =
+            sv && sv.observedBlockedTrades > 0
+              ? `<div style="color:#cbd5e1; font-size:11.5px; margin-top:2px;">🧪 <strong>ผลไม้จริงที่ Survival เคยเตือน:</strong> ${sv.observedBlockedTrades} ไม้ (WR ${Number(sv.winRatePct || 0).toFixed(1)}% • PnL ${Number(sv.totalPnlQuote || 0) >= 0 ? "+" : ""}$${Number(sv.totalPnlQuote || 0).toFixed(2)})</div>`
+              : "";
           elSurv.innerHTML = `
             <div class="lr-survival-top">
               <strong style="font-size:13px; color:#f8fafc;">${pIconMap[surv.posture] || "🟢"} Survival Mode: ${surv.posture}</strong>
               <span class="lr-meta-pill">${modeLabel}</span>
             </div>
             <div class="lr-survival-meta">
-              <span><strong>Slots:</strong> ${surv.effectiveMaxSlots}/${surv.configuredMaxSlots}</span>
-              <span><strong>Size Scale:</strong> ${Math.round((surv.positionSizeScale ?? 1) * 100)}%</span>
+              <span><strong>${surv.enforced ? "Slots:" : "เตือนลด Slots:"}</strong> ${surv.effectiveMaxSlots}/${surv.configuredMaxSlots}</span>
+              <span><strong>Size Scale:</strong> ${surv.enforced ? Math.round((surv.positionSizeScale ?? 1) * 100) : 100}%${surv.enforced ? "" : ` (เตือน ${Math.round((surv.positionSizeScale ?? 1) * 100)}%)`}</span>
               <span><strong>Min RS:</strong> ${Number(surv.minRelStrength24h ?? -1).toFixed(1)}%</span>
               <span><strong>Min 1hRSI:</strong> ${surv.minRsi1h ?? 40}</span>
               <span><strong>Min VolR:</strong> ${Number(surv.minBuyVolRatio12 ?? 1.3).toFixed(1)}</span>
@@ -9685,6 +9700,7 @@
               <span><strong>Streak/DD:</strong> ${m.recentConsecutiveLosses ?? 0}L / ${m.rollingDrawdownPct ?? 0}% DD</span>
             </div>
             <div style="color:#94a3b8; font-size:11.5px;">สาเหตุ: ${(Array.isArray(surv.reasons) ? surv.reasons : []).join(" • ") || "--"}</div>
+            ${svHtml}
           `;
         }
       }

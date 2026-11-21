@@ -458,6 +458,8 @@ export const defaultStrategyConfig = {
   portfolioInspectedSymbol: "",
   /** Bounded Learning Engine Auto-Tuning mode: "all" (autonomous zero-config default), "dry_run_only", or "off". */
   learningAutoTuneMode: "all" as "dry_run_only" | "all" | "off",
+  /** Enforce Survival Guard slot/size/entry blocks (false = observe & log only to evaluate accuracy while verifying execution). */
+  portfolioSurvivalGuardEnforced: false,
 };
 
 /**
@@ -705,6 +707,9 @@ export function loadConfigFromDatabase(): typeof defaultStrategyConfig {
       if (typeof saved.portfolioInspectedSymbol === "string") merged.portfolioInspectedSymbol = saved.portfolioInspectedSymbol.toUpperCase().trim();
       if (saved.learningAutoTuneMode === "dry_run_only" || saved.learningAutoTuneMode === "all" || saved.learningAutoTuneMode === "off") {
         merged.learningAutoTuneMode = saved.learningAutoTuneMode;
+      }
+      if (typeof saved.portfolioSurvivalGuardEnforced === "boolean") {
+        merged.portfolioSurvivalGuardEnforced = saved.portfolioSurvivalGuardEnforced;
       }
       return merged;
     }

@@ -797,7 +797,10 @@ function analyzeTuning(events: TuningEvent[], cur: TuneCfg, costPct = 0): Tuning
   };
 }
 
-export type LearningAutoTuneConfig = Pick<Config, "learningAutoTuneMode" | "dryRun" | "exchange" | "alpacaBaseUrl">;
+export type LearningAutoTuneConfig = Pick<
+  Config,
+  "learningAutoTuneMode" | "portfolioSurvivalGuardEnforced" | "dryRun" | "exchange" | "alpacaBaseUrl"
+>;
 
 type AutoTunableParam = TuningRecommendation["param"];
 
@@ -933,6 +936,10 @@ export class LearningEngine {
       String(cfg.exchange || "").toLowerCase() === "alpaca" &&
       String(cfg.alpacaBaseUrl || "").toLowerCase().includes("paper-api");
     return Boolean(cfg.dryRun || isAlpacaPaper);
+  }
+
+  public isSurvivalGuardEnforced(cfg: LearningAutoTuneConfig): boolean {
+    return Boolean(cfg.portfolioSurvivalGuardEnforced) && this.isAutoTuneAllowed(cfg);
   }
 
   public async ensureSymbolStatesLoaded(): Promise<void> {
@@ -1094,6 +1101,11 @@ export class LearningEngine {
     snapshot?: PortfolioRadarCandidate;
     macro?: PortfolioMacroState;
     score: number;
+    survivalObserve?: {
+      posture: SurvivalPostureLevel;
+      enforced: boolean;
+      wouldBlockReason?: string | null;
+    };
   }): Promise<string> {
     const sym = params.symbol.toUpperCase();
     const journalUid = `trade_${params.entryTimeMs}_${params.slotIndex}_${sym}`;
@@ -1123,6 +1135,13 @@ export class LearningEngine {
         macroPass4h: params.macro?.pass4h ?? true,
         macroPass1d: params.macro?.pass1d ?? true,
         breadthAboveEma25Pct: params.macro ? Number(params.macro.breadthAboveEma25Pct.toFixed(1)) : null,
+        ...(params.survivalObserve
+          ? {
+              survivalPosture: params.survivalObserve.posture,
+              survivalEnforced: params.survivalObserve.enforced,
+              survivalWouldBlock: params.survivalObserve.wouldBlockReason || null,
+            }
+          : {}),
       },
       updatedAt: Date.now(),
     };
@@ -2010,7 +2029,7 @@ export class LearningEngine {
   }): SurvivalGuardDecision {
     const now = Date.now();
     const configuredMaxSlots = Math.max(1, Math.min(5, Number(params.configuredMaxSlots) || 3));
-    const enforced = this.isAutoTuneAllowed(params.cfg);
+    const enforced = this.isSurvivalGuardEnforced(params.cfg);
 
     const closedRounds = this.db
       .getTradeRounds("ALL")
@@ -2171,7 +2190,6 @@ export class LearningEngine {
     const pg = this.getPg();
     if (
       pg &&
-      enforced &&
       this.symbolStatesLoaded &&
       posture !== (this.lastLoggedPosture ?? prevPosture ?? "NORMAL") &&
       now - this.lastPostureLogTs >= POSTURE_LOG_COOLDOWN_MS
@@ -2179,15 +2197,16 @@ export class LearningEngine {
       const oldPosture = this.lastLoggedPosture ?? prevPosture ?? "NORMAL";
       this.lastLoggedPosture = posture;
       this.lastPostureLogTs = now;
-      this.log(`🛡️ [Survival Guard] Posture ${oldPosture} -> ${posture} | MaxSlots ${effectiveMaxSlots}/${configuredMaxSlots}, Size ${(positionSizeScale * 100).toFixed(0)}% (${reasons.join("; ")})`);
+      const modeTag = enforced ? "" : " [Observe-Only]";
+      this.log(`🛡️ [Survival Guard]${modeTag} Posture ${oldPosture} -> ${posture} | MaxSlots ${effectiveMaxSlots}/${configuredMaxSlots}, Size ${(positionSizeScale * 100).toFixed(0)}% (${reasons.join("; ")})`);
       void pg
         .recordLearningAdjustment({
           paramName: "survival_posture",
           oldValue: POSTURE_NUMERIC[oldPosture],
           newValue: POSTURE_NUMERIC[posture],
           sampleSize: Math.max(closedRounds.length, shadow?.totalSetups ?? 0),
-          rationale: `${oldPosture} -> ${posture}: ${reasons.join("; ")}`,
-          applied: true,
+          rationale: `${oldPosture} -> ${posture}${modeTag}: ${reasons.join("; ")}`,
+          applied: enforced,
           createdAt: now,
         })
         .catch(() => {});
@@ -2460,6 +2479,7 @@ export class LearningEngine {
       portfolioQuantSessionGuard: cfg.portfolioQuantSessionGuard !== false,
       portfolioQuantVolTargetedRisk: cfg.portfolioQuantVolTargetedRisk !== false,
       portfolioQuantEmpiricalEv: cfg.portfolioQuantEmpiricalEv !== false,
+      portfolioSurvivalGuardEnforced: Boolean(cfg.portfolioSurvivalGuardEnforced),
     };
 
     const pg = this.getPg();
@@ -2558,11 +2578,24 @@ export class LearningEngine {
         totalPnlQuote: Number(s.totalPnlQuote.toFixed(2)),
       }));
 
+    const observedWarnTrades = closedTrades.filter((t) => Boolean(t.features?.survivalWouldBlock));
+    const observedWarnWins = observedWarnTrades.filter((t) => (t.pnlQuote ?? 0) > 0).length;
+    const observedWarnPnl = observedWarnTrades.reduce((sum, t) => sum + Number(t.pnlQuote ?? 0), 0);
+    const survivalValidation = {
+      observedBlockedTrades: observedWarnTrades.length,
+      wins: observedWarnWins,
+      losses: observedWarnTrades.length - observedWarnWins,
+      winRatePct:
+        observedWarnTrades.length > 0 ? Number(((observedWarnWins / observedWarnTrades.length) * 100).toFixed(1)) : 0,
+      totalPnlQuote: Number(observedWarnPnl.toFixed(2)),
+    };
+
     return {
       postgresActive: true,
       instanceKey: pg.instanceKey,
       autoTuneMode: cfg.learningAutoTuneMode || "all",
       autoTuneEffective: this.isAutoTuneAllowed(cfg),
+      survivalEnforced: this.isSurvivalGuardEnforced(cfg),
       summary: {
         closedTrades: closedTrades.length,
         openTrades: openTrades.length,
@@ -2581,6 +2614,7 @@ export class LearningEngine {
         activeTechnicalParams,
       },
       survival: this.lastSurvivalDecision,
+      survivalValidation,
       shadowLearning: this.shadowSummary,
       exitReasons: Array.from(byReasonMap.entries()).map(([reason, r]) => ({
         reason,

@@ -18,6 +18,7 @@ import {
   isOpeningSession45mBar,
   LearningEngine,
   type SurvivalGuardDecision,
+  type SurvivalPostureLevel,
 } from "../../learning-engine.js";
 export { isGapInducedBar };
 import type { IStrategy, Lot, MarketClockInfo, StrategyContext, StrategyEvent, StrategyType } from "../types.js";
@@ -1453,6 +1454,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
     const q3SessionActive = this.cfg.portfolioQuantSessionGuard !== false;
     const q4VolActive = this.cfg.portfolioQuantVolTargetedRisk !== false;
     const q5EvActive = this.cfg.portfolioQuantEmpiricalEv !== false;
+    const wouldBlockSurvivalMap = new Map<string, string>();
 
     const atrPctBySym = new Map<string, number>();
     const atrVals: number[] = [];
@@ -1571,8 +1573,18 @@ export class MaFanPortfolioStrategy implements IStrategy {
           : Math.min(3, buyVolRatio12) * 20 + Math.max(-5, Math.min(10, relStrength24h)) * 3 - upperSpreadPct * 10;
       const scoreAdj = this.learning.getSymbolScoreAdjustment(sym, this.cfg);
       const onLearningCooldown = this.learning.isSymbolOnCooldown(sym, this.cfg);
-      const shadowRiskyBlocked =
-        survival.enforced && survival.blockRiskySymbols && this.learning.isSymbolShadowRisky(sym, this.cfg);
+      const wouldRiskyShadow = survival.blockRiskySymbols && this.learning.isSymbolShadowRisky(sym, this.cfg);
+      const shadowRiskyBlocked = survival.enforced && wouldRiskyShadow;
+      if (survival.posture === "CAPITAL_PRESERVATION") {
+        wouldBlockSurvivalMap.set(sym, "SURVIVAL_OBSERVE:CAPITAL_PRESERVATION");
+      } else if (wouldRiskyShadow) {
+        wouldBlockSurvivalMap.set(sym, "SURVIVAL_OBSERVE:RISKY_SYMBOL");
+      } else if (
+        survival.posture !== "NORMAL" &&
+        (rsi1h < survival.minRsi1h || buyVolRatio12 < survival.minBuyVolRatio12 || relStrength24h < survival.minRelStrength24h)
+      ) {
+        wouldBlockSurvivalMap.set(sym, `SURVIVAL_OBSERVE:${survival.posture}`);
+      }
 
       const livePx = ind.livePrice || c.close;
       const distanceToEma4Pct = m4 > 0 ? ((livePx - m4) / m4) * 100 : 0;
@@ -1866,7 +1878,21 @@ export class MaFanPortfolioStrategy implements IStrategy {
         const standardSlotAlloc = this.getStandardSlotUnit() * sizeScale * volScale;
         const alloc = Math.min(standardSlotAlloc, availCash);
         if (alloc < 5) break;
-        await this.executeEntrySlot(ch.sym, ch.price, alloc, ch.score, ch.cand);
+        const survWarnReason =
+          wouldBlockSurvivalMap.get(ch.sym) ||
+          (survival.posture === "CAPITAL_PRESERVATION" || this.slots.length >= survival.effectiveMaxSlots
+            ? `SURVIVAL_OBSERVE:${survival.posture}`
+            : null);
+        if (!survival.enforced && survWarnReason) {
+          this.log(
+            `👁️ [Survival Observe] ${ch.sym} would be warned/blocked by ${survWarnReason} — executing normally to gather real trade verification`,
+          );
+        }
+        await this.executeEntrySlot(ch.sym, ch.price, alloc, ch.score, ch.cand, {
+          posture: survival.posture,
+          enforced: survival.enforced,
+          wouldBlockReason: survWarnReason,
+        });
       }
     }
   }
@@ -1947,6 +1973,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
     allocQuote: number,
     score: number,
     entryCand?: PortfolioRadarCandidate,
+    survivalObserve?: { posture: SurvivalPostureLevel; enforced: boolean; wouldBlockReason?: string | null },
   ): Promise<void> {
     const usedIdx = new Set(this.slots.map((s) => s.slotIndex));
     let slotIndex = 0;
@@ -2069,6 +2096,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       snapshot: entryCand ?? this.radarList.find((r) => r.symbol === symbol),
       macro: this.macroState,
       score,
+      survivalObserve,
     });
     this.saveState(true);
     this.log(`🚀 [Slot ${slotIndex + 1}/${this.getMaxSlots()} ENTER] Bought ${execQty} ${symbol} @ $${execPrice.toFixed(2)} ($${actualCost.toFixed(2)}) | SL $${slPrice.toFixed(2)}`);
@@ -2435,8 +2463,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
       const readyCount = this.radarList.filter((r) => r.stage === "PULLBACK_READY").length;
       const waitCount = this.radarList.filter((r) => r.stage === "WAITING_PULLBACK").length;
       const survPrefix =
-        survival?.enforced && survival.posture !== "NORMAL"
-          ? `🛡️ ${survival.posture} (${effMaxSlots} slots • ${(survival.positionSizeScale * 100).toFixed(0)}% size) • `
+        survival && survival.posture !== "NORMAL"
+          ? survival.enforced
+            ? `🛡️ ${survival.posture} (${effMaxSlots} slots • ${(survival.positionSizeScale * 100).toFixed(0)}% size) • `
+            : `👁️ Observe ${survival.posture} • `
           : "";
       const pbLabel = this.cfg.portfolioPullbackMode === "EMA4_TOUCH" ? "EMA4" : "EMA8";
       botActionReason = `${survPrefix}พร้อมเข้า ${readyCount} ตัว • รอย่อ ${pbLabel} ${waitCount} ตัว • MM ${(this.getCapitalUsageRatio() * 100).toFixed(0)}% • Universe ${this.macroState.universeCount} ตัว • ${this.macroState.reason}`;

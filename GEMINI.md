@@ -10156,3 +10156,17 @@ When investigating live production behavior, debugging issues, or analyzing trad
      - ใน `executeExitSlot()`: ตรวจ `SELL MARKET` ที่เปิดอยู่แล้วแทนการ Cancel ซ้ำซ้อน, อัปเดต `livePos.qty` & `qtyAvailable` ก่อนยิงขาย, เก็บส่วนที่เหลือไว้ขายต่อถ้าบน Alpaca ยังเหลือ Position `> 0`, และซิงค์ `syncOnChainOrders()` ทันทีเมื่อพบ `403`/`422`
   3. **Upgraded `reconcileJournalFromOrders()` (`src/learning-engine.ts`) & Duplicate Fill Pruning (`src/db.ts`)**: โหลดทั้ง `OPEN` และ `CLOSED` TRADE rows จาก `trade_learning_journal`, ปิดแถว `OPEN` ที่ปิดจบแล้วบน `bot_rounds` ผ่าน `pg.closeLearningTrade()`, ซ่อม `symbol_learning_state` อัตโนมัติทุกตัวที่ยอดไม่ตรงกับ Journal, และใน `syncRecentTradesFromExchange()` (`src/db.ts`) ลบแถวที่ยังไม่มี `tradeId` เมื่อมี fill จากกระดานที่มี `orderId` เดียวกันอยู่แล้วเพื่อกันนับซ้ำใน `calculateTradeRounds()`
 - **Version Bump**: **`0.3.1.4`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 349. Survival Guard Observe-Only Mode & Real-Trade Validation Tagging (`src/config.ts`, `src/learning-engine.ts`, `src/strategy/ma-fan-portfolio/index.ts`, v0.3.1.5)
+- **สาเหตุและแนวคิด**:
+  - ก่อนหน้านี้เมื่อ `LearningEngine` เข้าสู่โหมด `CAPITAL_PRESERVATION` (`effectiveMaxSlots = 0`, `positionSizeScale = 0`) จากไม้แพ้ 4 รอบติดหรือ Drawdown ระบบจะบล็อกการเปิดไม้ใหม่ทั้งหมด ทำให้พอร์ต Paper/Dry-Run ไม่สามารถออกไม้ทดสอบระบบ Execution/Order Sync/PnL จริง และไม่เพิ่มจำนวน `closedTrades` ได้ ส่วนการปิด `learningAutoTuneMode: "off"` ก็หยุดการ Log เปลี่ยน Posture และไม่บันทึกหลักฐานว่า Survival Guard เตือนแม่นยำหรือไม่
+- **การแก้ไขและสถาปัตยกรรมใหม่**:
+  1. **Config Switch (`portfolioSurvivalGuardEnforced` in `src/config.ts`, default `false`)**: แยกสวิตช์บังคับ Survival Guard ออกจาก `learningAutoTuneMode` โดยมี Toggle ใน Settings UI (`cfg_portfolioSurvivalGuardEnforced`) — ค่าเริ่มต้น `false` (Observe-Only) เพื่อเปิดให้บอทเทรดเต็ม MaxSlots & 100% Size ระหว่างตรวจหาบั๊ก Execution/Calculation ให้ครบก่อน
+  2. **Observe-Only Logging & DB Validation (`src/learning-engine.ts` & `src/strategy/ma-fan-portfolio/index.ts`)**:
+     - `isSurvivalGuardEnforced(cfg)` คืน `true` เฉพาะเมื่อ `cfg.portfolioSurvivalGuardEnforced === true && isAutoTuneAllowed(cfg)`
+     - `evaluateSurvivalPosture()` ยังคง Log `🛡️ [Survival Guard] [Observe-Only] Posture ...` และบันทึก `learning_adjustments` (`applied: enforced`) ทุกครั้งที่ Posture เปลี่ยนแม้ไม่ได้ Enforce
+     - ใน `scanAndRunCycle()` + `executeEntrySlot()` + `onPortfolioEntry()`: แม้ `!survival.enforced` บอทจะตรวจสอบว่าตัวที่ซื้อเข้าเงื่อนไขเตือน Survival (`SURVIVAL_OBSERVE:CAPITAL_PRESERVATION`, `SURVIVAL_OBSERVE:RISKY_SYMBOL`, หรือ `SURVIVAL_OBSERVE:<POSTURE>`) และบันทึกลง `trade_learning_journal.features` (`survivalPosture`, `survivalEnforced`, `survivalWouldBlock`) พร้อมสรุปสถิติ `survivalValidation` ใน `/api/learning/report` เพื่อวัดผลจริงว่าคำเตือนของ Survival Guard ช่วยได้จริงหรือไม่
+  3. **UI Updates (`public/index.html`, `public/app.js`)**: เพิ่มสวิตช์เปิด-ปิด Survival Guard ใน Settings Modal, แสดงป้าย `Obs • ใช้ X/X` บนการ์ด Learning และแสดงบรรทัด `🧪 ผลไม้จริงที่ Survival เคยเตือน` ใน Learning Report Modal
+- **Version Bump**: **`0.3.1.5`** (`package.json`, `src/version.ts`, `public/index.html`)
