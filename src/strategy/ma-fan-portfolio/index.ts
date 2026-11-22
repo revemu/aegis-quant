@@ -747,6 +747,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
       minVolRatio: baseMinVolR,
       minRelStrength: baseMinRs,
       minRsi1h: baseMinRsi1h,
+      maxSlots: this.getMaxSlots(),
+      sitOutMode: this.cfg.portfolioSitOutMode,
       fallbackSnapshots: this.snapshots,
       benchmarkFallback15m: this.benchmark15m,
       force,
@@ -1526,12 +1528,15 @@ export class MaFanPortfolioStrategy implements IStrategy {
           const prevC = ind.c15[idx - 1];
           const prevPrevC = idx >= 2 ? ind.c15[idx - 2] : undefined;
           const postOpenBarGap = Boolean(
-            prevC && prevPrevC && prevC.time - prevPrevC.time > 3600 && isGapInducedBar(prevPrevC, prevC),
+            prevC &&
+              prevPrevC &&
+              prevC.time - prevPrevC.time > 3600 &&
+              isGapInducedBar(prevPrevC, prevC, this.exchange.exchangeName),
           );
           st.waitingPullback = true;
           st.waitFromBarTime = barTime;
           st.pullbackExpiryBarTime = barTime + 12 * 900;
-          st.crossWasGap = isGapInducedBar(prevC, c) || postOpenBarGap;
+          st.crossWasGap = isGapInducedBar(prevC, c, this.exchange.exchangeName) || postOpenBarGap;
           st.pullbackTouched = false;
           st.pullbackLow = Infinity;
         } else if (st.lastCrossWeakBarTime !== barTime) {
@@ -1603,6 +1608,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
             buyVolRatio12,
             distanceToEma200Pct,
             rsi1h,
+            regime: this.macroState.pass4h || this.macroState.pass1d ? "BULL" : "BEAR",
           })
         : { shrunkEvPct: 0, scoreAdj: 0, shouldBlockTrap: false };
       let maxHeldCorr = 0;
@@ -1651,7 +1657,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
         const prevBar = ind.c15[Math.max(0, idx - 1)];
         const curLiveBar = ind.c15[ind.c15.length - 1];
         const curBarOpen = curLiveBar && curLiveBar.time > barTime ? curLiveBar.open : c.open;
-        const curBarGap = isGapInducedBar(prevBar, c);
+        const curBarGap = isGapInducedBar(prevBar, c, this.exchange.exchangeName);
         const isGapBlocked = Boolean(st.crossWasGap || curBarGap);
 
         const touchedEma8 = c.low <= m8 * 1.0015 || livePx <= m8 * 1.0015;
@@ -1823,6 +1829,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
         macro: this.macroState,
         candidates: newRadar,
         extraBlocked,
+        tp1TargetMode: this.cfg.portfolioTp1TargetMode,
       });
     }
     void this.learning.runPeriodicCycle(this.cfg, (patch) => this.updateRuntimeSettings(patch), {
@@ -1835,6 +1842,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
       minVolRatio: baseMinVolR,
       minRelStrength: baseMinRs,
       minRsi1h: baseMinRsi1h,
+      maxSlots: this.getMaxSlots(),
+      sitOutMode: this.cfg.portfolioSitOutMode,
       fallbackSnapshots: this.snapshots,
       benchmarkFallback15m: this.benchmark15m,
     });
@@ -1952,13 +1961,16 @@ export class MaFanPortfolioStrategy implements IStrategy {
           const prevC = ind.c15[idx - 1];
           const prevPrevC = idx >= 2 ? ind.c15[idx - 2] : undefined;
           const postOpenBarGap = Boolean(
-            prevC && prevPrevC && prevC.time - prevPrevC.time > 3600 && isGapInducedBar(prevPrevC, prevC),
+            prevC &&
+              prevPrevC &&
+              prevC.time - prevPrevC.time > 3600 &&
+              isGapInducedBar(prevPrevC, prevC, this.exchange.exchangeName),
           );
           st.waitingPullback = true;
           waitFromIdx = idx;
           st.waitFromBarTime = barTime;
           st.pullbackExpiryBarTime = barTime + 12 * 900;
-          st.crossWasGap = isGapInducedBar(prevC, c) || postOpenBarGap;
+          st.crossWasGap = isGapInducedBar(prevC, c, this.exchange.exchangeName) || postOpenBarGap;
           st.pullbackTouched = false;
           st.pullbackLow = Infinity;
         }

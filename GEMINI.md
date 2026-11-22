@@ -10182,3 +10182,14 @@ When investigating live production behavior, debugging issues, or analyzing trad
   2. **Entry Signal-vs-Fill Slippage Audit (`onPortfolioEntry`, `buildReport`, `executeEntrySlot`)**: ส่ง `signalPrice: refPrice` จาก `executeEntrySlot()` เข้า `onPortfolioEntry()` เพื่อคำนวณ `entrySlippagePct` เก็บใน `trade_learning_journal.features`, Log `| Slip +X.XXX%` เมื่อ Fill ต่างจาก Signal และสรุป `executionAudit` (`samples`, `avgEntrySlippagePct`, `maxAdverseSlippagePct`) ใน `/api/learning/report`
   3. **Dashboard UI (`public/app.js`)**: ใน `refreshPortfolioLearningCard()` คัด `topSaved` จากกลุ่มที่มี `evaluated >= 3` ก่อนเพื่อไม่ให้เคส 1 ตัวอย่างขึ้นเป็น Top Filter และแสดง `Avg Slip` ในการ์ด `💰 PnL สะสม (Journal)` ของ Learning Report
 - **Version Bump**: **`0.3.1.6`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 351. Full Learning Engine Upgrade — TP1 Counterfactual Parity, Exchange-Aware Gap Filter, Post-Exit Audit, Session/Regime Bayes & Portfolio Shadow Replay (`src/pg-store.ts`, `src/learning-engine.ts`, `src/strategy/ma-fan-portfolio/index.ts`, `public/app.js`, v0.3.1.7)
+- **ทั้ง 5 ด้านที่เพิ่มเพื่อยกระดับระบบเรียนรู้**:
+  1. **TP1-Parity Blocked Counterfactuals (`recordBlockedSignals`, `evaluatePendingBlockedSignals`)**: บันทึก `tp1TargetMode` และ `distTp1Pct` ตามโหมด TP1 ปัจจุบัน (`EMA25`/`EMA75`/`EMA200`) ลง `trade_learning_journal.features` และใช้จำลองเฉลย 4 ชม. ให้ตรงกับกลยุทธ์จริงแทน `distEma200Pct` ตายตัว
+  2. **Exchange-Aware `isGapInducedBar(..., exchange)`**: แยกเกณฑ์ Gap ระหว่างหุ้น US (`alpaca`: gapOpen `>= 0.5%` / closeJump `>= 0.9%`, overnight `>= 0.35%`/`0.65%`) กับ Crypto 24 ชม. (ตั้งเกณฑ์พุ่งหลอกสูงขึ้น `gapOpen >= 0.8%` / `jumpClose >= 2.8%`) เพื่อไม่ให้ไปบล็อกแท่ง Breakout ปกติบน Binance
+  3. **Post-Exit Tracking (`evaluatePostExitTrades`, `postExitAudit`, `pg.updateLearningJournalFeatures`)**: ติดตามแท่ง 15m ต่ออีก 4 ชม. (16 แท่ง) หลังไม้จริงปิด เพื่อวัด **Stop-Hunt Rate** (`STOP_HUNT`: ชน SL แล้วดีดกลับเหนือทุน) และ **Early-TP Regret** (`EARLY_TP`: ปิดกำไรแล้ววิ่งต่อ `>= +1.5%`)
+  4. **Session / Time-of-Day Buckets & Regime-Split Empirical Bayes (`getSessionBucketLabel`, `sessionStats`, `regimeFeatureBucketEv`)**: แยกสถิติตามช่วงเวลา (`US_OPEN_1H`/`US_MIDDAY`/`US_POWER_HOUR` และ `ASIA_00_08`/`EUROPE_08_14`/`US_OVERLAP_14_21`/`LATE_US_21_00`) และแยก Regime `BULL`/`BEAR` ใน Empirical Bayes prior ของ `getEmpiricalBayesEvAdjustment()`
+  5. **Portfolio-Aware Top-K Slot Shadow Replay & Breadth/Sit-Out OOS Analysis (`simulatePortfolioShadowReplay`, `evaluateBreadthSitOutOos`)**: จำลองจัดสรร Slot แข่งขันกันจริงแบบ Causal (เลือก Top Score ตาม `maxSlots`, วัด Win Rate, Profit Factor, Max Drawdown, `skippedSlotFull`) และเทียบ 5 นโยบาย `Breadth/Sit-Out` แบบ Chronological 70/30 OOS Test พร้อมแสดงผลบน Learning Report UI
+- **Version Bump**: **`0.3.1.7`** (`package.json`, `src/version.ts`, `public/index.html`)

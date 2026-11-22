@@ -1025,6 +1025,21 @@ export class PgStore {
     `;
   }
 
+  public async updateLearningJournalFeatures(
+    journalUid: string,
+    features: Record<string, any>,
+  ): Promise<void> {
+    if (this.closed) return;
+    await this.sql`
+      UPDATE trade_learning_journal
+      SET
+        features_json = ${JSON.stringify(features || {})}::jsonb,
+        updated_at = ${Date.now()}
+      WHERE instance_key = ${this.instanceKey}
+        AND journal_uid = ${journalUid}
+    `;
+  }
+
   public async loadLearningJournal(
     recordType: "TRADE" | "BLOCKED_SIGNAL",
     status?: string,

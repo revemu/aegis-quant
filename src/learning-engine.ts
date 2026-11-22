@@ -72,8 +72,55 @@ export interface ShadowLearningSummary {
   riskyWhipsawSymbols: ShadowSymbolProfile[];
   bySymbol: Record<string, ShadowSymbolProfile>;
   featureBucketEv?: Record<string, { setups: number; winRatePct: number; avgPnlPct: number }>;
+  regimeFeatureBucketEv?: Record<string, { setups: number; winRatePct: number; avgPnlPct: number }>;
+  sessionStats?: Record<string, { setups: number; winRatePct: number; avgPnlPct: number }>;
   openingSessionStats?: { setups: number; winRatePct: number; avgPnlPct: number };
+  portfolioSim?: ShadowPortfolioReplaySummary | null;
+  breadthSitOutAnalysis?: BreadthSitOutAnalysis | null;
   tuning?: TuningAnalysis | null;
+}
+
+export interface ShadowPortfolioReplaySummary {
+  maxSlots: number;
+  trades: number;
+  wins: number;
+  losses: number;
+  winRatePct: number;
+  avgPnlPct: number;
+  totalPnlPct: number;
+  profitFactor: number;
+  maxDrawdownPct: number;
+  skippedSlotFull: number;
+}
+
+export interface BreadthSitOutModeResult {
+  mode: string;
+  label: string;
+  trainTrades: number;
+  testTrades: number;
+  testWinRatePct: number;
+  testAvgPnlPct: number;
+  testTotalPnlPct: number;
+  testProfitFactor: number;
+}
+
+export interface BreadthSitOutAnalysis {
+  currentMode: string;
+  bestMode: string;
+  bestLabel: string;
+  testSetupsTotal: number;
+  verdict: string;
+  modes: BreadthSitOutModeResult[];
+}
+
+export interface PostExitAuditSummary {
+  evaluated: number;
+  stopHuntCount: number;
+  stopHuntRatePct: number;
+  earlyTpCount: number;
+  earlyTpRatePct: number;
+  avgPostSlReboundPct: number | null;
+  avgPostTpExtraRunPct: number | null;
 }
 
 export type SurvivalPostureLevel = "NORMAL" | "CAUTIOUS" | "DEFENSIVE" | "CAPITAL_PRESERVATION";
@@ -107,6 +154,8 @@ export interface ShadowWalkForwardContext {
   minVolRatio?: number;
   minRelStrength?: number;
   minRsi1h?: number;
+  maxSlots?: number;
+  sitOutMode?: string;
   exchange: string;
   symbols: string[];
   benchmarkSymbol: string;
@@ -148,13 +197,17 @@ function normalizeTsMs(ts: number): number {
 
 /**
  * Detects whether `curBar` opened or jumped on an abnormal gap relative to `prevBar`
- * (overnight/session market opens > 1h apart or sharp intraday opening spikes).
+ * (US equities overnight/open gaps vs parabolic blow-off bars on 24/7 crypto).
  */
-export function isGapInducedBar(prevBar: Candle | undefined, curBar: Candle): boolean {
+export function isGapInducedBar(prevBar: Candle | undefined, curBar: Candle, exchange = "alpaca"): boolean {
   if (!prevBar || prevBar.close <= 0) return false;
   const gapOpenPct = ((curBar.open - prevBar.close) / prevBar.close) * 100;
   const jumpClosePct = ((curBar.close - prevBar.close) / prevBar.close) * 100;
   const isOvernightSession = curBar.time - prevBar.time > 3600;
+  if ((exchange || "alpaca").toLowerCase() !== "alpaca") {
+    if (isOvernightSession && (gapOpenPct >= 0.8 || jumpClosePct >= 1.5)) return true;
+    return gapOpenPct >= 0.8 || jumpClosePct >= 2.8;
+  }
   if (isOvernightSession && (gapOpenPct >= 0.35 || jumpClosePct >= 0.65)) return true;
   return gapOpenPct >= 0.5 || jumpClosePct >= 0.9;
 }
@@ -299,6 +352,41 @@ export function isOpeningSession45mBar(
 }
 
 /**
+ * Classifies a timestamp into a market-session time bucket (DST-aware ET sessions for Alpaca,
+ * UTC liquidity sessions for 24/7 Crypto).
+ */
+export function getSessionBucketLabel(barTimeSec: number, exchange = "alpaca"): string {
+  if (!Number.isFinite(barTimeSec) || barTimeSec <= 0) return "UNKNOWN";
+  if ((exchange || "").toLowerCase() === "alpaca") {
+    const hb = Math.floor(barTimeSec / 3600);
+    let cached = nyOpenBucketCache.get(hb);
+    if (!cached) {
+      const parts = nyOpenFmt.formatToParts(new Date(hb * 3600 * 1000));
+      let wd = "";
+      let hr = 0;
+      let mn = 0;
+      for (const p of parts) {
+        if (p.type === "weekday") wd = p.value;
+        else if (p.type === "hour") hr = Number(p.value) % 24;
+        else if (p.type === "minute") mn = Number(p.value) || 0;
+      }
+      cached = { isWeekday: wd !== "Sun" && wd !== "Sat", baseMin: hr * 60 + mn };
+      if (nyOpenBucketCache.size > 10_000) nyOpenBucketCache.clear();
+      nyOpenBucketCache.set(hb, cached);
+    }
+    const mins = cached.baseMin + Math.floor((barTimeSec - hb * 3600) / 60);
+    if (mins < 630) return "US_OPEN_1H";
+    if (mins < 870) return "US_MIDDAY";
+    return "US_POWER_HOUR";
+  }
+  const h = new Date(barTimeSec * 1000).getUTCHours();
+  if (h < 8) return "ASIA_00_08";
+  if (h < 14) return "EUROPE_08_14";
+  if (h < 21) return "US_OVERLAP_14_21";
+  return "LATE_US_21_00";
+}
+
+/**
  * Quant Q5: Discretize multi-factor setup features for Empirical Bayes expected-value shrinkage.
  */
 export function computeFeatureBucketKey(
@@ -400,7 +488,7 @@ function simulateMaFanCounterfactual(
   slTriggerPct: number,
   futureBars: Array<{ high: number; low: number; close: number }>,
   costPct = 0,
-): { finalRet: number; maePct: number; mfePct: number; verdict: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL" } {
+): { finalRet: number; maePct: number; mfePct: number; exitBarsHeld: number; verdict: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL" } {
   const tp1Pct = Number.isFinite(distTargetPct) && distTargetPct > 0
     ? Math.max(0.8, Math.min(distTargetPct, 8.0))
     : 2.0;
@@ -410,8 +498,10 @@ function simulateMaFanCounterfactual(
   let maxHigh = entryPrice;
   let tp1Hit = false;
   let finalRet: number | null = null;
+  let exitBarsHeld = futureBars.length;
 
-  for (const b of futureBars) {
+  for (let i = 0; i < futureBars.length; i++) {
+    const b = futureBars[i]!;
     if (b.low < minLow) minLow = b.low;
     if (b.high > maxHigh) maxHigh = b.high;
     const lowPct = ((b.low - entryPrice) / entryPrice) * 100;
@@ -420,6 +510,7 @@ function simulateMaFanCounterfactual(
     if (!tp1Hit) {
       if (lowPct <= slTriggerPct) {
         finalRet = slTriggerPct;
+        exitBarsHeld = i + 1;
         break;
       }
       if (highPct >= tp1Pct) {
@@ -427,6 +518,7 @@ function simulateMaFanCounterfactual(
       }
     } else if (lowPct <= beLockPct) {
       finalRet = 0.5 * tp1Pct + 0.5 * beLockPct;
+      exitBarsHeld = i + 1;
       break;
     }
   }
@@ -442,7 +534,148 @@ function simulateMaFanCounterfactual(
   const mfePct = ((maxHigh - entryPrice) / entryPrice) * 100;
   const verdict: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL" =
     netRet >= 0.35 ? "WOULD_WIN" : netRet <= -0.35 ? "WOULD_LOSE" : "NEUTRAL";
-  return { finalRet: netRet, maePct, mfePct, verdict };
+  return { finalRet: netRet, maePct, mfePct, exitBarsHeld, verdict };
+}
+
+export interface ShadowReplaySetupInput {
+  symbol: string;
+  entryTimeSec: number;
+  exitTimeSec: number;
+  score: number;
+  pnlPct: number;
+  isBearMacro: boolean;
+  breadthPct: number;
+}
+
+/**
+ * Simulates causal Top-K concurrent slot allocation & equity curve across competing portfolio candidates.
+ */
+export function simulatePortfolioShadowReplay(
+  setups: ShadowReplaySetupInput[],
+  maxSlots = 3,
+): ShadowPortfolioReplaySummary {
+  const capSlots = Math.max(1, Math.min(5, Math.round(maxSlots || 3)));
+  const ordered = setups
+    .slice()
+    .sort((a, b) => a.entryTimeSec - b.entryTimeSec || b.score - a.score);
+
+  let activeSlots: Array<{ symbol: string; exitTimeSec: number }> = [];
+  let trades = 0;
+  let wins = 0;
+  let winSum = 0;
+  let lossAbs = 0;
+  let pnlSum = 0;
+  let skippedSlotFull = 0;
+  let equity = 100;
+  let peak = 100;
+  let maxDd = 0;
+
+  for (const s of ordered) {
+    activeSlots = activeSlots.filter((sl) => sl.exitTimeSec > s.entryTimeSec);
+    if (activeSlots.some((sl) => sl.symbol === s.symbol)) continue;
+    if (activeSlots.length >= capSlots) {
+      skippedSlotFull++;
+      continue;
+    }
+    activeSlots.push({ symbol: s.symbol, exitTimeSec: Math.max(s.exitTimeSec, s.entryTimeSec + 900) });
+    trades++;
+    pnlSum += s.pnlPct;
+    if (s.pnlPct > 0) {
+      wins++;
+      winSum += s.pnlPct;
+    } else {
+      lossAbs += Math.abs(s.pnlPct);
+    }
+    equity *= 1 + (s.pnlPct / 100) / capSlots;
+    if (equity > peak) peak = equity;
+    const dd = peak > 0 ? ((peak - equity) / peak) * 100 : 0;
+    if (dd > maxDd) maxDd = dd;
+  }
+
+  return {
+    maxSlots: capSlots,
+    trades,
+    wins,
+    losses: trades - wins,
+    winRatePct: trades > 0 ? Number(((wins / trades) * 100).toFixed(1)) : 0,
+    avgPnlPct: trades > 0 ? Number((pnlSum / trades).toFixed(2)) : 0,
+    totalPnlPct: Number(pnlSum.toFixed(2)),
+    profitFactor: lossAbs > 0 ? Number((winSum / lossAbs).toFixed(2)) : winSum > 0 ? 99 : 0,
+    maxDrawdownPct: Number(maxDd.toFixed(2)),
+    skippedSlotFull,
+  };
+}
+
+/**
+ * Evaluates 5 chronological 70/30 Train/OOS-Test Breadth/Macro Sit-Out policies on shadow setups.
+ */
+export function evaluateBreadthSitOutOos(
+  setups: ShadowReplaySetupInput[],
+  currentSitOutMode = "dual",
+): BreadthSitOutAnalysis {
+  const sorted = setups.slice().sort((a, b) => a.entryTimeSec - b.entryTimeSec);
+  const splitIdx = Math.floor(sorted.length * 0.7);
+  const trainSetups = sorted.slice(0, splitIdx);
+  const testSetups = sorted.slice(splitIdx);
+
+  const defs: Array<{ mode: string; label: string; allow: (s: ShadowReplaySetupInput) => boolean }> = [
+    { mode: "off", label: "Sit-Out OFF", allow: () => true },
+    { mode: "breadth_20", label: "Bear & Breadth < 20%", allow: (s) => !(s.isBearMacro && s.breadthPct < 20) },
+    { mode: "breadth_35", label: "Bear & Breadth < 35%", allow: (s) => !(s.isBearMacro && s.breadthPct < 35) },
+    { mode: "breadth_50", label: "Bear & Breadth < 50%", allow: (s) => !(s.isBearMacro && s.breadthPct < 50) },
+    { mode: "dual", label: "Dual 4H+1D Bear", allow: (s) => !s.isBearMacro },
+  ];
+
+  const modes: BreadthSitOutModeResult[] = defs.map((d) => {
+    const tr = trainSetups.filter(d.allow);
+    const te = testSetups.filter(d.allow);
+    let wins = 0;
+    let winSum = 0;
+    let lossAbs = 0;
+    let pnlSum = 0;
+    for (const item of te) {
+      pnlSum += item.pnlPct;
+      if (item.pnlPct > 0) {
+        wins++;
+        winSum += item.pnlPct;
+      } else {
+        lossAbs += Math.abs(item.pnlPct);
+      }
+    }
+    return {
+      mode: d.mode,
+      label: d.label,
+      trainTrades: tr.length,
+      testTrades: te.length,
+      testWinRatePct: te.length > 0 ? Number(((wins / te.length) * 100).toFixed(1)) : 0,
+      testAvgPnlPct: te.length > 0 ? Number((pnlSum / te.length).toFixed(2)) : 0,
+      testTotalPnlPct: Number(pnlSum.toFixed(2)),
+      testProfitFactor: lossAbs > 0 ? Number((winSum / lossAbs).toFixed(2)) : winSum > 0 ? 99 : 0,
+    };
+  });
+
+  const eligible = modes.filter((m) => m.testTrades >= 5);
+  const ranked = (eligible.length > 0 ? eligible : modes).slice().sort(
+    (a, b) => b.testAvgPnlPct - a.testAvgPnlPct || b.testProfitFactor - a.testProfitFactor,
+  );
+  const best = ranked[0] || modes[0]!;
+  const curNorm = currentSitOutMode === "off" || currentSitOutMode === "dual" ? currentSitOutMode : "dual";
+  const curRes = modes.find((m) => m.mode === curNorm) || modes[modes.length - 1]!;
+  const verdict =
+    testSetups.length < 5
+      ? `รอตัวอย่าง OOS เพิ่ม (มี ${testSetups.length} setups)`
+      : best.mode === curNorm
+        ? `โหมดปัจจุบัน (${curRes.label}) ให้ผลเฉลี่ย OOS ดีสุดแล้ว (${best.testAvgPnlPct >= 0 ? "+" : ""}${best.testAvgPnlPct}%/ไม้, PF ${best.testProfitFactor})`
+        : `${best.label} ทำ OOS เฉลี่ย ${best.testAvgPnlPct >= 0 ? "+" : ""}${best.testAvgPnlPct}%/ไม้ (PF ${best.testProfitFactor}, ${best.testTrades} ไม้) vs ${curRes.label} (${curRes.testAvgPnlPct >= 0 ? "+" : ""}${curRes.testAvgPnlPct}%/ไม้)`;
+
+  return {
+    currentMode: currentSitOutMode,
+    bestMode: best.mode,
+    bestLabel: best.label,
+    testSetupsTotal: testSetups.length,
+    verdict,
+    modes,
+  };
 }
 
 type TpModeName = "EMA25" | "EMA75" | "EMA200";
@@ -1018,7 +1251,13 @@ export class LearningEngine {
    */
   public getEmpiricalBayesEvAdjustment(
     symbol: string,
-    features: { rs24h: number; buyVolRatio12: number; distanceToEma200Pct: number; rsi1h: number },
+    features: {
+      rs24h: number;
+      buyVolRatio12: number;
+      distanceToEma200Pct: number;
+      rsi1h: number;
+      regime?: "BULL" | "BEAR";
+    },
   ): { shrunkEvPct: number; scoreAdj: number; shouldBlockTrap: boolean } {
     const sym = String(symbol || "").toUpperCase();
     const symProf = this.shadowSummary?.bySymbol?.[sym];
@@ -1032,8 +1271,15 @@ export class LearningEngine {
       features.distanceToEma200Pct,
       features.rsi1h,
     );
+    const regimeKey = features.regime ? `${features.regime}:${bucketKey}` : null;
+    const regimeBucket = regimeKey ? this.shadowSummary?.regimeFeatureBucketEv?.[regimeKey] : undefined;
     const bucket = this.shadowSummary?.featureBucketEv?.[bucketKey];
-    const priorMean = bucket && bucket.setups >= 4 ? bucket.avgPnlPct : 0.05;
+    const priorMean =
+      regimeBucket && regimeBucket.setups >= 5
+        ? regimeBucket.avgPnlPct
+        : bucket && bucket.setups >= 4
+          ? bucket.avgPnlPct
+          : 0.05;
 
     const shrunkEvPct = (n * symMean + 5 * priorMean) / (n + 5);
     const shouldBlockTrap = n >= 3 && shrunkEvPct < -0.18 && symWr < 45;
@@ -1115,6 +1361,9 @@ export class LearningEngine {
     if (!pg) return journalUid;
 
     const snap = params.snapshot;
+    const entryBarSec = Math.floor(params.entryTimeMs / 1000);
+    const sessionBucket = getSessionBucketLabel(entryBarSec, params.exchange);
+    const marketRegime = (params.macro?.pass4h ?? true) || (params.macro?.pass1d ?? true) ? "BULL" : "BEAR";
     const hasSignalPx = typeof params.signalPrice === "number" && params.signalPrice > 0 && params.entryPrice > 0;
     const entrySlippagePct = hasSignalPx
       ? Number((((params.entryPrice - params.signalPrice!) / params.signalPrice!) * 100).toFixed(4))
@@ -1140,6 +1389,8 @@ export class LearningEngine {
         distEma200Pct: snap ? Number(snap.distanceToEma200Pct.toFixed(3)) : null,
         macroPass4h: params.macro?.pass4h ?? true,
         macroPass1d: params.macro?.pass1d ?? true,
+        marketRegime,
+        sessionBucket,
         breadthAboveEma25Pct: params.macro ? Number(params.macro.breadthAboveEma25Pct.toFixed(1)) : null,
         ...(hasSignalPx
           ? {
@@ -1264,6 +1515,7 @@ export class LearningEngine {
     macro: PortfolioMacroState;
     candidates: PortfolioRadarCandidate[];
     extraBlocked?: Array<{ candidate: PortfolioRadarCandidate; blockReason: string; barTimeSec?: number }>;
+    tp1TargetMode?: string;
   }): Promise<void> {
     const pg = this.getPg();
     if (!pg) return;
@@ -1305,6 +1557,15 @@ export class LearningEngine {
       this.recordedBlockedKeys.add(barSymKey);
 
       const c = item.cand;
+      const tpMode = normalizeTpMode(params.tp1TargetMode);
+      const distTp1Pct =
+        tpMode === "EMA25" && c.ema25 > 0
+          ? ((c.ema25 - c.price) / c.price) * 100
+          : tpMode === "EMA75" && c.ema75 > 0
+            ? ((c.ema75 - c.price) / c.price) * 100
+            : c.distanceToEma200Pct;
+      const sessionBucket = getSessionBucketLabel(item.barSec, params.exchange);
+      const marketRegime = params.macro.pass4h || params.macro.pass1d ? "BULL" : "BEAR";
       entries.push({
         journalUid: `blocked_${item.barSec}_${c.symbol.toUpperCase()}`,
         recordType: "BLOCKED_SIGNAL",
@@ -1323,6 +1584,10 @@ export class LearningEngine {
           relStrength24h: Number(c.relStrength24h.toFixed(2)),
           upperSpreadPct: Number(c.upperSpreadPct.toFixed(3)),
           distEma200Pct: Number(c.distanceToEma200Pct.toFixed(3)),
+          tp1TargetMode: tpMode,
+          distTp1Pct: Number(distTp1Pct.toFixed(3)),
+          sessionBucket,
+          marketRegime,
           macroPass4h: params.macro.pass4h,
           macroPass1d: params.macro.pass1d,
           isSitOut: params.macro.isSitOut,
@@ -1376,8 +1641,11 @@ export class LearningEngine {
       const futureBars = bars.filter((b) => b.time > barStartSec).slice(0, 16);
       if (futureBars.length < 8 || p.entryPrice <= 0) continue;
 
-      const distEma200Pct = Number(p.features?.distEma200Pct);
-      const sim = simulateMaFanCounterfactual(p.entryPrice, distEma200Pct, slTriggerPct, futureBars, costPct);
+      const distTargetPct =
+        p.features?.distTp1Pct !== undefined && Number.isFinite(Number(p.features.distTp1Pct))
+          ? Number(p.features.distTp1Pct)
+          : Number(p.features?.distEma200Pct);
+      const sim = simulateMaFanCounterfactual(p.entryPrice, distTargetPct, slTriggerPct, futureBars, costPct);
 
       updates.push({
         journalUid: p.journalUid,
@@ -1396,6 +1664,70 @@ export class LearningEngine {
       this.refreshBlockedTrapCache(evaluated);
     }
     return updates.length;
+  }
+
+  /**
+   * Level 2 Upgrade: Track 4h forward market action after live closed trades exit
+   * to measure Stop-Hunt rate (SL followed by rebound above entry) and Early-TP regret.
+   */
+  public async evaluatePostExitTrades(exchange: string): Promise<number> {
+    const pg = this.getPg();
+    if (!pg) return 0;
+
+    const cutoffMs = Date.now() - BLOCKED_EVAL_HORIZON_MS;
+    const closedTrades = await pg.loadLearningJournal("TRADE", "CLOSED", 100).catch(() => [] as LearningJournalRecord[]);
+    const pending = closedTrades.filter(
+      (t) =>
+        Boolean(t.exitTimeMs && t.exitTimeMs <= cutoffMs) &&
+        Boolean(t.exitPrice && t.exitPrice > 0) &&
+        !t.features?.postExitEvaluated,
+    );
+    if (pending.length === 0) return 0;
+
+    const syms = Array.from(new Set(pending.map((t) => t.symbol.toUpperCase())));
+    const candleMap = await pg.loadMarketCandlesBatch(exchange, syms, "15m", 240).catch(() => new Map());
+    const isAlpaca = exchange.toLowerCase() === "alpaca";
+    let evaluatedCount = 0;
+
+    for (const t of pending) {
+      let bars: Candle[] = candleMap.get(t.symbol.toUpperCase()) || [];
+      if (isAlpaca) {
+        bars = bars.filter((b) => isUsRegularTradingHoursBar(b.time, "15m"));
+      }
+      const exitSec = Math.floor(Number(t.exitTimeMs) / 1000);
+      const futureBars = bars.filter((b) => b.time > exitSec).slice(0, 16);
+      if (futureBars.length < 6 || !t.exitPrice || t.exitPrice <= 0) continue;
+
+      const maxHigh = Math.max(...futureBars.map((b) => b.high));
+      const minLow = Math.min(...futureBars.map((b) => b.low));
+      const lastClose = futureBars[futureBars.length - 1]!.close;
+      const postExitMaxMovePct = Number((((maxHigh - t.exitPrice) / t.exitPrice) * 100).toFixed(3));
+      const postExitMinMovePct = Number((((minLow - t.exitPrice) / t.exitPrice) * 100).toFixed(3));
+      const postExitEndMovePct = Number((((lastClose - t.exitPrice) / t.exitPrice) * 100).toFixed(3));
+
+      const pnl = Number(t.pnlQuote ?? 0);
+      const isLoss = pnl < -0.05 || String(t.exitReason || "").includes("SL_");
+      const isWin = pnl > 0.05;
+      let postExitVerdict: "STOP_HUNT" | "EARLY_TP" | "GOOD_EXIT" = "GOOD_EXIT";
+      if (isLoss && t.entryPrice > 0 && (maxHigh >= t.entryPrice * 1.005 || (postExitMaxMovePct >= 1.5 && maxHigh >= t.entryPrice))) {
+        postExitVerdict = "STOP_HUNT";
+      } else if (isWin && postExitMaxMovePct >= 1.5) {
+        postExitVerdict = "EARLY_TP";
+      }
+
+      const nextFeatures = {
+        ...(t.features || {}),
+        postExitEvaluated: true,
+        postExitBars: futureBars.length,
+        postExitMaxMovePct,
+        postExitMinMovePct,
+        postExitEndMovePct,
+        postExitVerdict,
+      };
+      await pg.updateLearningJournalFeatures(t.journalUid, nextFeatures).catch(() => {});
+      evaluatedCount++;
+    }
+    return evaluatedCount;
   }
 
   /**
@@ -1673,6 +2005,9 @@ export class LearningEngine {
       const tuningEvents: TuningEvent[] = [];
       const winMaeAbs: number[] = [];
       const featureBucketAcc = new Map<string, { setups: number; wins: number; sumPnl: number }>();
+      const regimeBucketAcc = new Map<string, { setups: number; wins: number; sumPnl: number }>();
+      const sessionAcc = new Map<string, { setups: number; wins: number; sumPnl: number }>();
+      const primaryReplaySetups: ShadowReplaySetupInput[] = [];
       const openSessionAcc = { setups: 0, wins: 0, sumPnl: 0 };
 
       let totalSetups = 0;
@@ -1736,7 +2071,7 @@ export class LearningEngine {
           const limitP = coin.m4[prev]!;
           const limitP8 = coin.m8[prev]!;
           const touchedEma4 = limitP > 0 && coin.m8[prev]! >= coin.m16[prev]! && c.low <= limitP * 1.001;
-          const curBarGap = isGapInducedBar(prevBar, c);
+          const curBarGap = isGapInducedBar(prevBar, c, ex);
           const ema8HoldOk =
             limitP8 > 0 &&
             coin.m8[prev]! >= coin.m16[prev]! &&
@@ -1854,7 +2189,8 @@ export class LearningEngine {
                 }
 
                 const bStats = breadthByTime.get(prevBar.time);
-                if (bStats && bStats.total >= 5 && (bStats.above25 / bStats.total) * 100 < 30) {
+                const barBreadthPct = bStats && bStats.total >= 5 ? (bStats.above25 / bStats.total) * 100 : 50;
+                if (bStats && bStats.total >= 5 && barBreadthPct < 30) {
                   lowBreadthSetups++;
                   if (isWin) lowBreadthWins++;
                   lowBreadthPnlSum += sim.finalRet;
@@ -1866,6 +2202,33 @@ export class LearningEngine {
                 if (isWin) fb.wins++;
                 fb.sumPnl += sim.finalRet;
                 featureBucketAcc.set(bKey, fb);
+
+                const regKey = `${benchInfo?.isBear ? "BEAR" : "BULL"}:${bKey}`;
+                const rfb = regimeBucketAcc.get(regKey) || { setups: 0, wins: 0, sumPnl: 0 };
+                rfb.setups++;
+                if (isWin) rfb.wins++;
+                rfb.sumPnl += sim.finalRet;
+                regimeBucketAcc.set(regKey, rfb);
+
+                const sessKey = getSessionBucketLabel(c.time, ex);
+                const ss = sessionAcc.get(sessKey) || { setups: 0, wins: 0, sumPnl: 0 };
+                ss.setups++;
+                if (isWin) ss.wins++;
+                ss.sumPnl += sim.finalRet;
+                sessionAcc.set(sessKey, ss);
+
+                const upSpread = coin.m200[prev]! > 0 ? ((coin.m200[prev]! - coin.m75[prev]!) / coin.m200[prev]!) * 100 : 0;
+                const candScore = Math.min(3, volR) * 20 + Math.max(-5, Math.min(10, rs24)) * 3 - upSpread * 10;
+                const exitBar = futureBars[Math.min(futureBars.length - 1, Math.max(0, sim.exitBarsHeld - 1))];
+                primaryReplaySetups.push({
+                  symbol: coin.symbol,
+                  entryTimeSec: c.time,
+                  exitTimeSec: exitBar ? exitBar.time : c.time + 900,
+                  score: candScore,
+                  pnlPct: sim.finalRet,
+                  isBearMacro: Boolean(benchInfo?.isBear),
+                  breadthPct: barBreadthPct,
+                });
 
                 if (isOpeningSession45mBar(coin.c15, idx, ex, false)) {
                   openSessionAcc.setups++;
@@ -1902,9 +2265,9 @@ export class LearningEngine {
             if (rsiOk && macdOk) {
               const prevPrevBar = idx >= 2 ? coin.c15[idx - 2] : undefined;
               const postOpenBarGap = Boolean(
-                prevBar && prevPrevBar && prevBar.time - prevPrevBar.time > 3600 && isGapInducedBar(prevPrevBar, prevBar),
+                prevBar && prevPrevBar && prevBar.time - prevPrevBar.time > 3600 && isGapInducedBar(prevPrevBar, prevBar, ex),
               );
-              const crossGap = isGapInducedBar(prevBar, c) || postOpenBarGap;
+              const crossGap = isGapInducedBar(prevBar, c, ex) || postOpenBarGap;
               if (!waitingPullback && hadBottomFan) {
                 waitingPullback = true;
                 waitFromIdx = idx;
@@ -1976,14 +2339,25 @@ export class LearningEngine {
         portfolioTp1TargetMode: baseTpMode,
         portfolioPullbackMode: basePullbackMode,
       } as Config);
-      const featureBucketEv: Record<string, { setups: number; winRatePct: number; avgPnlPct: number }> = {};
-      for (const [k, st] of featureBucketAcc.entries()) {
-        featureBucketEv[k] = {
-          setups: st.setups,
-          winRatePct: st.setups > 0 ? Number(((st.wins / st.setups) * 100).toFixed(1)) : 0,
-          avgPnlPct: st.setups > 0 ? Number((st.sumPnl / st.setups).toFixed(3)) : 0,
-        };
-      }
+      const toBucketStatsRecord = (acc: Map<string, { setups: number; wins: number; sumPnl: number }>) => {
+        const out: Record<string, { setups: number; winRatePct: number; avgPnlPct: number }> = {};
+        for (const [k, st] of acc.entries()) {
+          out[k] = {
+            setups: st.setups,
+            winRatePct: st.setups > 0 ? Number(((st.wins / st.setups) * 100).toFixed(1)) : 0,
+            avgPnlPct: st.setups > 0 ? Number((st.sumPnl / st.setups).toFixed(3)) : 0,
+          };
+        }
+        return out;
+      };
+      const featureBucketEv = toBucketStatsRecord(featureBucketAcc);
+      const regimeFeatureBucketEv = toBucketStatsRecord(regimeBucketAcc);
+      const sessionStats = toBucketStatsRecord(sessionAcc);
+      const portfolioSim = simulatePortfolioShadowReplay(
+        primaryReplaySetups,
+        Math.max(1, Math.min(5, Number(opts.maxSlots) || 3)),
+      );
+      const breadthSitOutAnalysis = evaluateBreadthSitOutOos(primaryReplaySetups, opts.sitOutMode || "dual");
       const openingSessionStats = {
         setups: openSessionAcc.setups,
         winRatePct: openSessionAcc.setups > 0 ? Number(((openSessionAcc.wins / openSessionAcc.setups) * 100).toFixed(1)) : 0,
@@ -2013,7 +2387,11 @@ export class LearningEngine {
         riskyWhipsawSymbols,
         bySymbol,
         featureBucketEv,
+        regimeFeatureBucketEv,
+        sessionStats,
         openingSessionStats,
+        portfolioSim,
+        breadthSitOutAnalysis,
         tuning: analyzeTuning(tuningEvents, initTuneCfg, costPct),
       };
 
@@ -2460,6 +2838,7 @@ export class LearningEngine {
       await this.ensureSymbolStatesLoaded();
       if (pg) {
         await this.evaluatePendingBlockedSignals(cfg.exchange || "binance", cfg.portfolioDisasterSlPct || 3.5);
+        await this.evaluatePostExitTrades(cfg.exchange || "binance").catch(() => {});
       }
 
       if (shadowContext && now - this.lastShadowRunTs >= SHADOW_REFRESH_INTERVAL_MS) {
@@ -2614,6 +2993,29 @@ export class LearningEngine {
       maxAdverseSlippagePct: slipSamples.length > 0 ? Number(Math.max(...slipSamples).toFixed(4)) : null,
     };
 
+    const postEvalTrades = closedTrades.filter((t) => Boolean(t.features?.postExitEvaluated));
+    const postLossTrades = postEvalTrades.filter(
+      (t) => Number(t.pnlQuote ?? 0) < -0.05 || String(t.exitReason || "").includes("SL_"),
+    );
+    const postWinTrades = postEvalTrades.filter((t) => Number(t.pnlQuote ?? 0) > 0.05);
+    const stopHuntTrades = postLossTrades.filter((t) => t.features?.postExitVerdict === "STOP_HUNT");
+    const earlyTpTrades = postWinTrades.filter((t) => t.features?.postExitVerdict === "EARLY_TP");
+    const avgPostField = (arr: LearningJournalRecord[], key: string) => {
+      const vals = arr.map((t) => Number(t.features?.[key])).filter((v) => Number.isFinite(v));
+      return vals.length > 0 ? Number((vals.reduce((a, b) => a + b, 0) / vals.length).toFixed(2)) : null;
+    };
+    const postExitAudit: PostExitAuditSummary = {
+      evaluated: postEvalTrades.length,
+      stopHuntCount: stopHuntTrades.length,
+      stopHuntRatePct:
+        postLossTrades.length > 0 ? Number(((stopHuntTrades.length / postLossTrades.length) * 100).toFixed(1)) : 0,
+      earlyTpCount: earlyTpTrades.length,
+      earlyTpRatePct:
+        postWinTrades.length > 0 ? Number(((earlyTpTrades.length / postWinTrades.length) * 100).toFixed(1)) : 0,
+      avgPostSlReboundPct: avgPostField(postLossTrades, "postExitMaxMovePct"),
+      avgPostTpExtraRunPct: avgPostField(postWinTrades, "postExitMaxMovePct"),
+    };
+
     return {
       postgresActive: true,
       instanceKey: pg.instanceKey,
@@ -2640,6 +3042,7 @@ export class LearningEngine {
       survival: this.lastSurvivalDecision,
       survivalValidation,
       executionAudit,
+      postExitAudit,
       shadowLearning: this.shadowSummary,
       exitReasons: Array.from(byReasonMap.entries()).map(([reason, r]) => ({
         reason,

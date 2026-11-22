@@ -9710,9 +9710,14 @@
 
       const s = rep.summary || {};
       const ea = rep.executionAudit || null;
+      const pe = rep.postExitAudit || null;
       const slipTxt =
         ea && ea.samples > 0 && ea.avgEntrySlippagePct != null
           ? ` • Avg Slip: ${Number(ea.avgEntrySlippagePct) >= 0 ? "+" : ""}${Number(ea.avgEntrySlippagePct).toFixed(3)}% (${ea.samples}t)`
+          : "";
+      const postExitTxt =
+        pe && pe.evaluated > 0
+          ? ` • Stop-Hunt ${Number(pe.stopHuntRatePct || 0).toFixed(1)}% / Early-TP ${Number(pe.earlyTpRatePct || 0).toFixed(1)}% (${pe.evaluated}t)`
           : "";
       const winCol = Number(s.winRatePct || 0) >= 50 ? "#4ade80" : "#fbbf24";
       const pnlVal = Number(s.totalPnlQuote || 0);
@@ -9735,7 +9740,7 @@
           <div class="lr-kpi-card">
             <div class="lr-kpi-label">📉 Avg MAE / 📈 Avg MFE</div>
             <div class="lr-kpi-val" style="font-size:15px;"><span style="color:#f87171;">${Number(s.avgMaePct || 0).toFixed(2)}%</span> / <span style="color:#4ade80;">+${Number(s.avgMfePct || 0).toFixed(2)}%</span></div>
-            <div class="lr-kpi-sub">${combMaeTxt}</div>
+            <div class="lr-kpi-sub">${combMaeTxt}${postExitTxt}</div>
           </div>
           <div class="lr-kpi-card">
             <div class="lr-kpi-label">🛡️ Disaster SL ปัจจุบัน</div>
@@ -9780,6 +9785,31 @@
               <div class="lr-kpi-val" style="color:${brCol};">${Number(shad.lowBreadthAvgPnlPct || 0) >= 0 ? "+" : ""}${Number(shad.lowBreadthAvgPnlPct || 0).toFixed(2)}%</div>
               <div class="lr-kpi-sub">${shad.lowBreadthSetups || 0} setups (WR ${Number(shad.lowBreadthWinRatePct || 0).toFixed(0)}%)</div>
             </div>
+            ${(() => {
+              const ps = shad.portfolioSim;
+              if (!ps || !ps.trades) return "";
+              const psCol = Number(ps.winRatePct || 0) >= 50 ? "#4ade80" : "#fbbf24";
+              return `<div class="lr-kpi-card">
+                <div class="lr-kpi-label">📦 Portfolio Replay (${ps.maxSlots} Slots)</div>
+                <div class="lr-kpi-val" style="color:${psCol};">${Number(ps.winRatePct || 0).toFixed(1)}%</div>
+                <div class="lr-kpi-sub">${ps.trades} ไม้ • PF ${ps.profitFactor ?? "--"} • DD ${Number(ps.maxDrawdownPct || 0).toFixed(2)}% (skip ${ps.skippedSlotFull || 0})</div>
+              </div>`;
+            })()}
+            ${(() => {
+              const ss = shad.sessionStats;
+              if (!ss || Object.keys(ss).length === 0) return "";
+              const chips = Object.entries(ss)
+                .map(([k, v]) => {
+                  const avg = Number(v?.avgPnlPct || 0);
+                  const col = avg >= 0 ? "#86efac" : "#fca5a5";
+                  return `<span style="padding:2px 6px; border-radius:4px; background:rgba(148,163,184,0.1); color:${col};">${k}: ${v?.setups || 0}t • WR ${Number(v?.winRatePct || 0).toFixed(0)}% (${avg >= 0 ? "+" : ""}${avg.toFixed(2)}%)</span>`;
+                })
+                .join(" ");
+              return `<div class="lr-kpi-card" style="grid-column:1/-1;">
+                <div class="lr-kpi-label">🕒 Session Performance (ตามช่วงเวลา)</div>
+                <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;">${chips}</div>
+              </div>`;
+            })()}
           `;
         }
       }
@@ -9856,7 +9886,15 @@
                  <div style="font-size:11px; color:#cbd5e1;">Test เดิม: ${fmtM(tun.baselineTest)}</div>
                  <div style="font-size:11px; color:#cbd5e1;">Test หลังรวม: ${fmtM(tun.combined.test)}</div>
                </div>` : "";
-          elTuneBox.innerHTML = `${activeStrip}${recHtml}${comb}<div style="font-size:10.5px; color:#64748b;">${tun.note || ""}</div>`;
+          const bsa = shad?.breadthSitOutAnalysis;
+          const bsaHtml =
+            bsa && Number(bsa.testSetupsTotal || 0) >= 5
+              ? `<div class="lr-list-item" style="flex-direction:column; align-items:flex-start; gap:3px; border-color:rgba(56,189,248,0.35);">
+                   <strong style="color:#7dd3fc;">🧭 Breadth/Sit-Out OOS: แนะนำ ${bsa.bestLabel}</strong>
+                   <div style="font-size:11px; color:#cbd5e1;">${bsa.verdict}</div>
+                 </div>`
+              : "";
+          elTuneBox.innerHTML = `${activeStrip}${recHtml}${comb}${bsaHtml}<div style="font-size:10.5px; color:#64748b;">${tun.note || ""}</div>`;
         }
       }
 
