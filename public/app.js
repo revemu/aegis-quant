@@ -9810,6 +9810,47 @@
                 <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;">${chips}</div>
               </div>`;
             })()}
+            ${(() => {
+              const of = shad.observeFactors;
+              if (!of) return "";
+              const renderChips = (map) => {
+                if (!map || typeof map !== "object") return '<span style="color:#64748b;">--</span>';
+                const entries = Object.entries(map);
+                if (entries.length === 0) return '<span style="color:#64748b;">--</span>';
+                return entries
+                  .map(([k, v]) => {
+                    const avg = Number(v?.avgPnlPct || 0);
+                    const col = avg >= 0 ? "#86efac" : "#fca5a5";
+                    return `<span style="padding:2px 6px; border-radius:4px; background:rgba(148,163,184,0.1); color:${col};">${k}: ${v?.setups || 0}t • WR ${Number(v?.winRatePct || 0).toFixed(0)}% (${avg >= 0 ? "+" : ""}${avg.toFixed(2)}%)</span>`;
+                  })
+                  .join(" ");
+              };
+              const tdHtml = Array.isArray(of.timeDecay)
+                ? of.timeDecay
+                    .filter((cp) => Number(cp?.stillOpenCount || 0) > 0)
+                    .map((cp) => {
+                      const sCol = Number(cp.staleAvgFinalPnlPct || 0) >= 0 ? "#86efac" : "#fca5a5";
+                      const hCol = Number(cp.healthyAvgFinalPnlPct || 0) >= 0 ? "#86efac" : "#fca5a5";
+                      return `<span style="padding:2px 6px; border-radius:4px; background:rgba(148,163,184,0.1); color:#cbd5e1;"><strong>${cp.label}</strong> • <span style="color:${sCol};">Stale(&lt;0.3%): ${cp.staleCount}t WR ${Number(cp.staleEventuallyWinPct || 0).toFixed(0)}% (${Number(cp.staleAvgFinalPnlPct || 0) >= 0 ? "+" : ""}${Number(cp.staleAvgFinalPnlPct || 0).toFixed(2)}%)</span> vs <span style="color:${hCol};">Healthy: WR ${Number(cp.healthyEventuallyWinPct || 0).toFixed(0)}%</span></span>`;
+                    })
+                    .join(" ")
+                : "";
+              return `
+                <div class="lr-kpi-card" style="grid-column:1/-1;">
+                  <div class="lr-kpi-label">🎯 Score / Overextension / Upper Wick (Observe-Only)</div>
+                  <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Score:</strong> ${renderChips(of.scoreBuckets)}</div>
+                  <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Bottom Dist:</strong> ${renderChips(of.overextensionBuckets)}</div>
+                  <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Upper Wick:</strong> ${renderChips(of.upperWickBuckets)}</div>
+                </div>
+                ${tdHtml ? `<div class="lr-kpi-card" style="grid-column:1/-1;"><div class="lr-kpi-label">⏱️ Time-Decay (ถือแช่แล้วรอดกี่ %)</div><div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;">${tdHtml}</div></div>` : ""}
+                <div class="lr-kpi-card" style="grid-column:1/-1;">
+                  <div class="lr-kpi-label">🌊 Breadth Velocity / Concurrency / Macro &amp; Shock Events</div>
+                  <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Breadth 4h:</strong> ${renderChips(of.breadthVelocityBuckets)}</div>
+                  <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Concurrent:</strong> ${renderChips(of.concurrencyBuckets)}</div>
+                  <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Events:</strong> ${renderChips(of.eventBuckets)}</div>
+                </div>
+              `;
+            })()}
           `;
         }
       }

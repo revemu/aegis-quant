@@ -10193,3 +10193,19 @@ When investigating live production behavior, debugging issues, or analyzing trad
   4. **Session / Time-of-Day Buckets & Regime-Split Empirical Bayes (`getSessionBucketLabel`, `sessionStats`, `regimeFeatureBucketEv`)**: แยกสถิติตามช่วงเวลา (`US_OPEN_1H`/`US_MIDDAY`/`US_POWER_HOUR` และ `ASIA_00_08`/`EUROPE_08_14`/`US_OVERLAP_14_21`/`LATE_US_21_00`) และแยก Regime `BULL`/`BEAR` ใน Empirical Bayes prior ของ `getEmpiricalBayesEvAdjustment()`
   5. **Portfolio-Aware Top-K Slot Shadow Replay & Breadth/Sit-Out OOS Analysis (`simulatePortfolioShadowReplay`, `evaluateBreadthSitOutOos`)**: จำลองจัดสรร Slot แข่งขันกันจริงแบบ Causal (เลือก Top Score ตาม `maxSlots`, วัด Win Rate, Profit Factor, Max Drawdown, `skippedSlotFull`) และเทียบ 5 นโยบาย `Breadth/Sit-Out` แบบ Chronological 70/30 OOS Test พร้อมแสดงผลบน Learning Report UI
 - **Version Bump**: **`0.3.1.7`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 352. Observe-Only Learning Factors — Score/Overextension, Time-Decay, Breadth Velocity, Concurrency & Macro/Earnings/Shock Calendar (`src/event-calendar.ts`, `src/learning-engine.ts`, `src/strategy/ma-fan-portfolio/index.ts`, `public/app.js`, v0.3.1.8)
+- **หลักการออกแบบ**: เพิ่มการเก็บข้อมูลและวิเคราะห์ในโหมด **Observe-Only 100%** (ไม่เปลี่ยนกฎซื้อ-ขายหรือฟิลเตอร์ใดๆ ของบอท) เพื่อสะสมสถิติให้เห็นจุดทำกำไร/จุดเสียก่อนตัดสินใจจูนในอนาคต
+- **สิ่งที่เพิ่มเข้ามา (`5` ปัจจัย)**:
+  1. **Macro Calendar, Earnings Cache & Causal 24h Shock Proxy (`src/event-calendar.ts`)**:
+     - `getMacroEventContext(barTimeSec)`: ตรวจจับกำหนดการ **FOMC** (14:00 ET), **CPI** (08:30 ET) และ **NFP** (ศุกร์แรกของเดือน 08:30 ET) ล่วงหน้าแบบ Zero-Lookahead โดยแบ่งเป็น `MACRO_WINDOW:<EVENT>` (`±60` นาที) และ `MACRO_DAY:<EVENT>`
+     - `detectRecentShock24h(c15, endIdx, curAtrPct)`: ตรวจจับรอยข่าวด่วนในแท่งเทียนย้อนหลัง 24 ชม. แบบ Causal (`rangePct >= max(2.2%, 3.5x ATR)` หรือ `bodyPct >= max(1.6%, 3.0x ATR)`) ติดแท็ก `NEWS_SHOCK_24H`
+     - `earningsCalendar`: แคชปฏิทินงบรายตัวจาก Nasdaq Calendar API แบบ Non-blocking (TTL 12 ชม., fail silent) ติดแท็ก `EARNINGS_TODAY` / `EARNINGS_TOMORROW` สำหรับ Alpaca
+  2. **Score Calibration & Overextension (`scoreBuckets`, `overextensionBuckets`, `upperWickBuckets`)**: เก็บ `Score` แยกช่วง (`<30`, `30-50`, `50-70`, `>=70`), ระยะห่างจากเหว `distFromBottomLowPct` (`FRESH <1.5%`, `MID 1.5-3.5%`, `EXTENDED >=3.5%`), ไส้เทียนบน `upperWickRatioPct` และ `atrPct`
+  3. **Time-in-Trade / Time-Decay (`timeDecay` ใน `simulateMaFanCounterfactual` & `computeObserveFactorsFromSetups`)**: วัดผลที่แท่ง `4` (1h), `8` (2h), `16` (4h) เทียบอัตราชนะสุดท้ายระหว่างไม้ที่ซึม (`< +0.3%` Stale) กับไม้ที่วิ่งปกติ (`>= +0.3%` Healthy)
+  4. **Breadth Velocity & Benchmark 4h Slope (`breadthVelocityBuckets`, `benchSlope4hBuckets`)**: เก็บ `breadthDelta4h` (เทียบ 4 ชม. ก่อนหน้า) และ `benchmarkRet4h` ทั้งใน Shadow Walk-Forward และพอร์ตสด (`breadthHistory` ใน `MaFanPortfolioStrategy`)
+  5. **Concurrent Signals Count (`concurrencyBuckets`)**: นับจำนวนตัวที่พร้อมเข้าพร้อมกันในแท่งเดียวกัน (`ISOLATED 1-2`, `MODERATE 3-5`, `SURGE >=6`) เพื่อแยก Dead-Cat Bounce ออกจาก Setup คัดเฉพาะตัว
+- **การแสดงผลบนแดชบอร์ด (`public/app.js`)**: เพิ่มการ์ดแสดง `Score / Overextension / Upper Wick`, `Time-Decay`, และ `Breadth Velocity / Concurrency / Macro & Shock Events` ในหน้า Learning Report Modal
+- **Version Bump**: **`0.3.1.8`** (`package.json`, `src/version.ts`, `public/index.html`)

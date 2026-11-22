@@ -11,6 +11,7 @@ import { AlpacaPortfolioWsClient } from "../../exchange/alpaca/ws.js";
 import type { Candle } from "../../market-structure.js";
 import type { AtrSource } from "../../types.js";
 import { BotDatabase, getDatabase, type PortfolioSlotRecord, type UnifiedOrderRecord } from "../../db.js";
+import { detectRecentShock24h, earningsCalendar, getMacroEventContext } from "../../event-calendar.js";
 import {
   calcCandleAtrPct14,
   calcRollingReturnCorrelation,
@@ -120,6 +121,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
   private universeFetchPromise: Promise<void> | null = null;
   private latestSurvival: SurvivalGuardDecision | null = null;
   private initialLearningBootstrapDone: boolean = false;
+  private breadthHistory: Array<{ timeMs: number; breadthPct: number }> = [];
 
   // Real-time Alpaca WebSocket hybrid stream (<= 30 symbols) & live chart sync
   private alpacaWs?: AlpacaPortfolioWsClient;
@@ -1421,6 +1423,27 @@ export class MaFanPortfolioStrategy implements IStrategy {
           ? this.walletQuoteTotal
           : (this.cashBalance > 0 ? this.cashBalance : this.getEffectiveBudgetCap()) + openHeldValue;
     const configuredMaxSlots = this.getMaxSlots();
+    const nowObsMs = Date.now();
+    if (this.macroState.universeCount > 0) {
+      const lastHist = this.breadthHistory[this.breadthHistory.length - 1];
+      if (!lastHist || nowObsMs - lastHist.timeMs >= 5 * 60_000) {
+        this.breadthHistory.push({ timeMs: nowObsMs, breadthPct: this.macroState.breadthAboveEma25Pct });
+        this.breadthHistory = this.breadthHistory.filter((h) => nowObsMs - h.timeMs <= 6 * 3_600_000);
+      }
+    }
+    const breadthSample4h = this.breadthHistory.find((h) => nowObsMs - h.timeMs >= 3.5 * 3_600_000);
+    const liveBreadthDelta4h = breadthSample4h ? this.macroState.breadthAboveEma25Pct - breadthSample4h.breadthPct : 0;
+    let liveBenchmarkRet4h = 0;
+    const closedBench = this.benchmark15m.filter((b) => b.isClosed !== false);
+    if (closedBench.length > 16) {
+      const bEnd = closedBench[closedBench.length - 1]!;
+      const bRef = closedBench[Math.max(0, closedBench.length - 17)]!;
+      if (bRef.open > 0) liveBenchmarkRet4h = ((bEnd.close - bRef.open) / bRef.open) * 100;
+    }
+    if (this.exchange.exchangeName === "alpaca") {
+      void earningsCalendar.refreshForAroundDate(nowObsMs).catch(() => {});
+    }
+
     const survival = this.learning.evaluateSurvivalPosture({
       cfg: this.cfg,
       macro: this.macroState,
@@ -1849,6 +1872,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
     });
 
     if (canExecute && freeSlots > 0 && sizeScale > 0 && !sitOutEval.isSitOut && entryCandidates.length > 0) {
+      const concurrentReadyCount = entryCandidates.length;
       for (const ch of entryCandidates) {
         if (this.slots.length >= effectiveMaxSlots) break;
 
@@ -1897,11 +1921,41 @@ export class MaFanPortfolioStrategy implements IStrategy {
             `👁️ [Survival Observe] ${ch.sym} would be warned/blocked by ${survWarnReason} — executing normally to gather real trade verification`,
           );
         }
-        await this.executeEntrySlot(ch.sym, ch.price, alloc, ch.score, ch.cand, {
-          posture: survival.posture,
-          enforced: survival.enforced,
-          wouldBlockReason: survWarnReason,
-        });
+        const chInd = this.snapshots.get(ch.sym);
+        const chSetup = this.setupStates.get(ch.sym);
+        const chClosedBar = chInd ? chInd.c15[chInd.lastClosedIdx] : undefined;
+        const distFromBottomLowPct =
+          chSetup && Number.isFinite(chSetup.bottomLow) && chSetup.bottomLow > 0
+            ? ((ch.price - chSetup.bottomLow) / chSetup.bottomLow) * 100
+            : undefined;
+        const upperWickRatioPct =
+          chClosedBar && chClosedBar.high > chClosedBar.low
+            ? ((chClosedBar.high - Math.max(chClosedBar.open, chClosedBar.close)) / (chClosedBar.high - chClosedBar.low)) * 100
+            : 0;
+        const barTimeSec = chClosedBar?.time || Math.floor(Date.now() / 1000);
+        await this.executeEntrySlot(
+          ch.sym,
+          ch.price,
+          alloc,
+          ch.score,
+          ch.cand,
+          {
+            posture: survival.posture,
+            enforced: survival.enforced,
+            wouldBlockReason: survWarnReason,
+          },
+          {
+            distFromBottomLowPct,
+            upperWickRatioPct,
+            atrPct: chAtrPct,
+            breadthDelta4h: liveBreadthDelta4h,
+            benchmarkRet4h: liveBenchmarkRet4h,
+            concurrentSignalsCount: concurrentReadyCount,
+            macroEventTag: getMacroEventContext(barTimeSec).tag,
+            earningsTag: isAlpaca ? earningsCalendar.getEarningsTag(ch.sym) : null,
+            hasShock24h: chInd ? detectRecentShock24h(chInd.c15, chInd.lastClosedIdx, chAtrPct) : false,
+          },
+        );
       }
     }
   }
@@ -1986,6 +2040,17 @@ export class MaFanPortfolioStrategy implements IStrategy {
     score: number,
     entryCand?: PortfolioRadarCandidate,
     survivalObserve?: { posture: SurvivalPostureLevel; enforced: boolean; wouldBlockReason?: string | null },
+    observeContext?: {
+      distFromBottomLowPct?: number;
+      upperWickRatioPct?: number;
+      atrPct?: number;
+      breadthDelta4h?: number;
+      benchmarkRet4h?: number;
+      concurrentSignalsCount?: number;
+      macroEventTag?: string | null;
+      earningsTag?: string | null;
+      hasShock24h?: boolean;
+    },
   ): Promise<void> {
     const usedIdx = new Set(this.slots.map((s) => s.slotIndex));
     let slotIndex = 0;
@@ -2110,6 +2175,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       macro: this.macroState,
       score,
       survivalObserve,
+      observeContext,
     });
     this.saveState(true);
     const slipPct = refPrice > 0 ? ((execPrice - refPrice) / refPrice) * 100 : 0;

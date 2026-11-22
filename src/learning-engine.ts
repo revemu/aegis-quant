@@ -14,6 +14,7 @@
 
 import type { Config } from "./config.js";
 import type { BotDatabase } from "./db.js";
+import { detectRecentShock24h, getMacroEventContext } from "./event-calendar.js";
 import { isUsRegularTradingHoursBar } from "./exchange/alpaca/feed.js";
 import type { Candle } from "./market-structure.js";
 import type {
@@ -77,7 +78,36 @@ export interface ShadowLearningSummary {
   openingSessionStats?: { setups: number; winRatePct: number; avgPnlPct: number };
   portfolioSim?: ShadowPortfolioReplaySummary | null;
   breadthSitOutAnalysis?: BreadthSitOutAnalysis | null;
+  observeFactors?: ShadowObserveFactorsSummary | null;
   tuning?: TuningAnalysis | null;
+}
+
+export interface BucketMetric {
+  setups: number;
+  winRatePct: number;
+  avgPnlPct: number;
+}
+
+export interface TimeDecayCheckpoint {
+  bars: number;
+  label: string;
+  stillOpenCount: number;
+  staleCount: number;
+  staleEventuallyWinPct: number;
+  staleAvgFinalPnlPct: number;
+  healthyEventuallyWinPct: number;
+  healthyAvgFinalPnlPct: number;
+}
+
+export interface ShadowObserveFactorsSummary {
+  scoreBuckets: Record<string, BucketMetric>;
+  overextensionBuckets: Record<string, BucketMetric>;
+  upperWickBuckets: Record<string, BucketMetric>;
+  timeDecay: TimeDecayCheckpoint[];
+  breadthVelocityBuckets: Record<string, BucketMetric>;
+  benchSlope4hBuckets: Record<string, BucketMetric>;
+  concurrencyBuckets: Record<string, BucketMetric>;
+  eventBuckets: Record<string, BucketMetric>;
 }
 
 export interface ShadowPortfolioReplaySummary {
@@ -488,7 +518,14 @@ function simulateMaFanCounterfactual(
   slTriggerPct: number,
   futureBars: Array<{ high: number; low: number; close: number }>,
   costPct = 0,
-): { finalRet: number; maePct: number; mfePct: number; exitBarsHeld: number; verdict: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL" } {
+): {
+  finalRet: number;
+  maePct: number;
+  mfePct: number;
+  exitBarsHeld: number;
+  checkpointRetPct: Record<number, number | null>;
+  verdict: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL";
+} {
   const tp1Pct = Number.isFinite(distTargetPct) && distTargetPct > 0
     ? Math.max(0.8, Math.min(distTargetPct, 8.0))
     : 2.0;
@@ -529,12 +566,166 @@ function simulateMaFanCounterfactual(
     finalRet = tp1Hit ? 0.5 * tp1Pct + 0.5 * closeRetPct : closeRetPct;
   }
 
-  const netRet = finalRet - Math.max(0, costPct);
+  const netCost = Math.max(0, costPct);
+  const checkpointRetPct: Record<number, number | null> = {};
+  for (const cp of [4, 8, 16]) {
+    if (futureBars.length >= cp && exitBarsHeld > cp) {
+      const cpClose = futureBars[cp - 1]!.close;
+      checkpointRetPct[cp] = ((cpClose - entryPrice) / entryPrice) * 100 - netCost;
+    } else {
+      checkpointRetPct[cp] = null;
+    }
+  }
+
+  const netRet = finalRet - netCost;
   const maePct = ((minLow - entryPrice) / entryPrice) * 100;
   const mfePct = ((maxHigh - entryPrice) / entryPrice) * 100;
   const verdict: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL" =
     netRet >= 0.35 ? "WOULD_WIN" : netRet <= -0.35 ? "WOULD_LOSE" : "NEUTRAL";
-  return { finalRet: netRet, maePct, mfePct, exitBarsHeld, verdict };
+  return { finalRet: netRet, maePct, mfePct, exitBarsHeld, checkpointRetPct, verdict };
+}
+
+export interface ObserveSetupInput {
+  entryTimeSec: number;
+  score: number;
+  pnlPct: number;
+  distFromBottomLowPct: number;
+  upperWickRatioPct: number;
+  breadthDelta4h: number;
+  benchmarkRet4h: number;
+  macroEventInWindow: boolean;
+  macroEventDay: boolean;
+  hasShock24h: boolean;
+  checkpointRetPct?: Record<number, number | null>;
+}
+
+/**
+ * Aggregates Observe-Only learning analytics across Shadow/Replay setups (zero gating side effects).
+ */
+export function computeObserveFactorsFromSetups(setups: ObserveSetupInput[]): ShadowObserveFactorsSummary {
+  const tally = () => new Map<string, { setups: number; wins: number; sumPnl: number }>();
+  const bump = (map: Map<string, { setups: number; wins: number; sumPnl: number }>, key: string, pnlPct: number) => {
+    const cur = map.get(key) || { setups: 0, wins: 0, sumPnl: 0 };
+    cur.setups++;
+    if (pnlPct > 0) cur.wins++;
+    cur.sumPnl += pnlPct;
+    map.set(key, cur);
+  };
+  const toRec = (map: Map<string, { setups: number; wins: number; sumPnl: number }>, order?: string[]) => {
+    const out: Record<string, BucketMetric> = {};
+    const keys = order ? [...order.filter((k) => map.has(k)), ...Array.from(map.keys()).filter((k) => !order.includes(k))] : Array.from(map.keys());
+    for (const k of keys) {
+      const st = map.get(k)!;
+      out[k] = {
+        setups: st.setups,
+        winRatePct: st.setups > 0 ? Number(((st.wins / st.setups) * 100).toFixed(1)) : 0,
+        avgPnlPct: st.setups > 0 ? Number((st.sumPnl / st.setups).toFixed(3)) : 0,
+      };
+    }
+    return out;
+  };
+
+  const concurCounts = new Map<number, number>();
+  for (const s of setups) {
+    concurCounts.set(s.entryTimeSec, (concurCounts.get(s.entryTimeSec) || 0) + 1);
+  }
+
+  const scoreMap = tally();
+  const overMap = tally();
+  const wickMap = tally();
+  const breadthMap = tally();
+  const benchMap = tally();
+  const concMap = tally();
+  const eventMap = tally();
+
+  for (const s of setups) {
+    const scoreKey = s.score < 30 ? "<30" : s.score < 50 ? "30-50" : s.score < 70 ? "50-70" : ">=70";
+    bump(scoreMap, scoreKey, s.pnlPct);
+
+    const overKey =
+      s.distFromBottomLowPct < 1.5
+        ? "FRESH (<1.5%)"
+        : s.distFromBottomLowPct < 3.5
+          ? "MID (1.5-3.5%)"
+          : "EXTENDED (>=3.5%)";
+    bump(overMap, overKey, s.pnlPct);
+
+    const wickKey =
+      s.upperWickRatioPct < 30
+        ? "CLEAN (<30%)"
+        : s.upperWickRatioPct < 50
+          ? "MODERATE (30-50%)"
+          : "HEAVY_WICK (>=50%)";
+    bump(wickMap, wickKey, s.pnlPct);
+
+    const brKey = s.breadthDelta4h > 5 ? "RISING (>+5pp)" : s.breadthDelta4h < -5 ? "FALLING (<-5pp)" : "FLAT (-5..+5pp)";
+    bump(breadthMap, brKey, s.pnlPct);
+
+    const b4Key =
+      s.benchmarkRet4h > 0.5 ? "BENCH_UP (>+0.5%)" : s.benchmarkRet4h < -0.5 ? "BENCH_DUMP (<-0.5%)" : "BENCH_FLAT (-0.5..+0.5%)";
+    bump(benchMap, b4Key, s.pnlPct);
+
+    const cCnt = concurCounts.get(s.entryTimeSec) || 1;
+    const cKey = cCnt <= 2 ? "ISOLATED (1-2)" : cCnt <= 5 ? "MODERATE (3-5)" : "SURGE (>=6)";
+    bump(concMap, cKey, s.pnlPct);
+
+    if (s.macroEventInWindow) bump(eventMap, "MACRO_EVENT_WINDOW", s.pnlPct);
+    else if (s.macroEventDay) bump(eventMap, "MACRO_EVENT_DAY", s.pnlPct);
+    if (s.hasShock24h) bump(eventMap, "NEWS_SHOCK_24H", s.pnlPct);
+    if (!s.macroEventInWindow && !s.macroEventDay && !s.hasShock24h) {
+      bump(eventMap, "NORMAL_DAY", s.pnlPct);
+    }
+  }
+
+  const cpDefs = [
+    { bars: 4, label: "1h (4 bars)" },
+    { bars: 8, label: "2h (8 bars)" },
+    { bars: 16, label: "4h (16 bars)" },
+  ];
+  const timeDecay: TimeDecayCheckpoint[] = cpDefs.map((cp) => {
+    let stillOpenCount = 0;
+    let staleCount = 0;
+    let staleWins = 0;
+    let staleSum = 0;
+    let healthyCount = 0;
+    let healthyWins = 0;
+    let healthySum = 0;
+    for (const s of setups) {
+      const cpRet = s.checkpointRetPct?.[cp.bars];
+      if (cpRet === null || cpRet === undefined || !Number.isFinite(cpRet)) continue;
+      stillOpenCount++;
+      if (cpRet < 0.3) {
+        staleCount++;
+        if (s.pnlPct > 0) staleWins++;
+        staleSum += s.pnlPct;
+      } else {
+        healthyCount++;
+        if (s.pnlPct > 0) healthyWins++;
+        healthySum += s.pnlPct;
+      }
+    }
+    return {
+      bars: cp.bars,
+      label: cp.label,
+      stillOpenCount,
+      staleCount,
+      staleEventuallyWinPct: staleCount > 0 ? Number(((staleWins / staleCount) * 100).toFixed(1)) : 0,
+      staleAvgFinalPnlPct: staleCount > 0 ? Number((staleSum / staleCount).toFixed(3)) : 0,
+      healthyEventuallyWinPct: healthyCount > 0 ? Number(((healthyWins / healthyCount) * 100).toFixed(1)) : 0,
+      healthyAvgFinalPnlPct: healthyCount > 0 ? Number((healthySum / healthyCount).toFixed(3)) : 0,
+    };
+  });
+
+  return {
+    scoreBuckets: toRec(scoreMap, ["<30", "30-50", "50-70", ">=70"]),
+    overextensionBuckets: toRec(overMap, ["FRESH (<1.5%)", "MID (1.5-3.5%)", "EXTENDED (>=3.5%)"]),
+    upperWickBuckets: toRec(wickMap, ["CLEAN (<30%)", "MODERATE (30-50%)", "HEAVY_WICK (>=50%)"]),
+    timeDecay,
+    breadthVelocityBuckets: toRec(breadthMap, ["RISING (>+5pp)", "FLAT (-5..+5pp)", "FALLING (<-5pp)"]),
+    benchSlope4hBuckets: toRec(benchMap, ["BENCH_UP (>+0.5%)", "BENCH_FLAT (-0.5..+0.5%)", "BENCH_DUMP (<-0.5%)"]),
+    concurrencyBuckets: toRec(concMap, ["ISOLATED (1-2)", "MODERATE (3-5)", "SURGE (>=6)"]),
+    eventBuckets: toRec(eventMap, ["NORMAL_DAY", "MACRO_EVENT_DAY", "MACRO_EVENT_WINDOW", "NEWS_SHOCK_24H"]),
+  };
 }
 
 export interface ShadowReplaySetupInput {
@@ -1354,6 +1545,17 @@ export class LearningEngine {
       enforced: boolean;
       wouldBlockReason?: string | null;
     };
+    observeContext?: {
+      distFromBottomLowPct?: number;
+      upperWickRatioPct?: number;
+      atrPct?: number;
+      breadthDelta4h?: number;
+      benchmarkRet4h?: number;
+      concurrentSignalsCount?: number;
+      macroEventTag?: string | null;
+      earningsTag?: string | null;
+      hasShock24h?: boolean;
+    };
   }): Promise<string> {
     const sym = params.symbol.toUpperCase();
     const journalUid = `trade_${params.entryTimeMs}_${params.slotIndex}_${sym}`;
@@ -1364,6 +1566,8 @@ export class LearningEngine {
     const entryBarSec = Math.floor(params.entryTimeMs / 1000);
     const sessionBucket = getSessionBucketLabel(entryBarSec, params.exchange);
     const marketRegime = (params.macro?.pass4h ?? true) || (params.macro?.pass1d ?? true) ? "BULL" : "BEAR";
+    const oc = params.observeContext;
+    const macroEventTag = oc?.macroEventTag !== undefined ? oc.macroEventTag : getMacroEventContext(entryBarSec).tag;
     const hasSignalPx = typeof params.signalPrice === "number" && params.signalPrice > 0 && params.entryPrice > 0;
     const entrySlippagePct = hasSignalPx
       ? Number((((params.entryPrice - params.signalPrice!) / params.signalPrice!) * 100).toFixed(4))
@@ -1391,7 +1595,30 @@ export class LearningEngine {
         macroPass1d: params.macro?.pass1d ?? true,
         marketRegime,
         sessionBucket,
+        macroEventTag: macroEventTag || null,
+        earningsTag: oc?.earningsTag || null,
         breadthAboveEma25Pct: params.macro ? Number(params.macro.breadthAboveEma25Pct.toFixed(1)) : null,
+        ...(oc
+          ? {
+              ...(Number.isFinite(Number(oc.distFromBottomLowPct))
+                ? { distFromBottomLowPct: Number(Number(oc.distFromBottomLowPct).toFixed(3)) }
+                : {}),
+              ...(Number.isFinite(Number(oc.upperWickRatioPct))
+                ? { upperWickRatioPct: Number(Number(oc.upperWickRatioPct).toFixed(2)) }
+                : {}),
+              ...(Number.isFinite(Number(oc.atrPct)) ? { atrPct: Number(Number(oc.atrPct).toFixed(3)) } : {}),
+              ...(Number.isFinite(Number(oc.breadthDelta4h))
+                ? { breadthDelta4h: Number(Number(oc.breadthDelta4h).toFixed(2)) }
+                : {}),
+              ...(Number.isFinite(Number(oc.benchmarkRet4h))
+                ? { benchmarkRet4h: Number(Number(oc.benchmarkRet4h).toFixed(2)) }
+                : {}),
+              ...(Number.isFinite(Number(oc.concurrentSignalsCount))
+                ? { concurrentSignalsCount: Math.round(Number(oc.concurrentSignalsCount)) }
+                : {}),
+              ...(typeof oc.hasShock24h === "boolean" ? { hasShock24h: oc.hasShock24h } : {}),
+            }
+          : {}),
         ...(hasSignalPx
           ? {
               signalPrice: Number(params.signalPrice!.toFixed(6)),
@@ -1566,6 +1793,7 @@ export class LearningEngine {
             : c.distanceToEma200Pct;
       const sessionBucket = getSessionBucketLabel(item.barSec, params.exchange);
       const marketRegime = params.macro.pass4h || params.macro.pass1d ? "BULL" : "BEAR";
+      const macroEventTag = getMacroEventContext(item.barSec).tag;
       entries.push({
         journalUid: `blocked_${item.barSec}_${c.symbol.toUpperCase()}`,
         recordType: "BLOCKED_SIGNAL",
@@ -1588,6 +1816,7 @@ export class LearningEngine {
           distTp1Pct: Number(distTp1Pct.toFixed(3)),
           sessionBucket,
           marketRegime,
+          macroEventTag,
           macroPass4h: params.macro.pass4h,
           macroPass1d: params.macro.pass1d,
           isSitOut: params.macro.isSitOut,
@@ -1929,15 +2158,18 @@ export class LearningEngine {
 
       // Build benchmark regime series & time-indexed universe breadth
       const bench15 = getBars(benchSym, "15m");
-      const benchStateByTime = new Map<number, { ret24h: number; isBear: boolean }>();
+      const benchStateByTime = new Map<number, { ret24h: number; ret4h: number; isBear: boolean }>();
       if (bench15.length >= 200) {
         const benchCloses = bench15.map((c) => c.close);
         const benchM200 = calcEMA(benchCloses, 200);
         for (let i = 200; i < bench15.length; i++) {
           const ref24 = bench15[Math.max(0, i - 96)]!.open;
+          const ref4 = bench15[Math.max(0, i - 16)]!.open;
           const ret24h = ref24 > 0 ? ((bench15[i]!.close - ref24) / ref24) * 100 : 0;
+          const ret4h = ref4 > 0 ? ((bench15[i]!.close - ref4) / ref4) * 100 : 0;
           benchStateByTime.set(bench15[i]!.time, {
             ret24h,
+            ret4h,
             isBear: bench15[i]!.close < benchM200[i]!,
           });
         }
@@ -2008,6 +2240,7 @@ export class LearningEngine {
       const regimeBucketAcc = new Map<string, { setups: number; wins: number; sumPnl: number }>();
       const sessionAcc = new Map<string, { setups: number; wins: number; sumPnl: number }>();
       const primaryReplaySetups: ShadowReplaySetupInput[] = [];
+      const observeSetupRecords: ObserveSetupInput[] = [];
       const openSessionAcc = { setups: 0, wins: 0, sumPnl: 0 };
 
       let totalSetups = 0;
@@ -2032,6 +2265,7 @@ export class LearningEngine {
         let waitingPullback = false;
         let waitFromIdx = -1;
         let crossWasGap = false;
+        let bottomLow = Infinity;
         let lastEntryIdx = -999;
 
         // Independent raw setup state machine strictly for filter what-if analysis
@@ -2190,6 +2424,15 @@ export class LearningEngine {
 
                 const bStats = breadthByTime.get(prevBar.time);
                 const barBreadthPct = bStats && bStats.total >= 5 ? (bStats.above25 / bStats.total) * 100 : 50;
+                const prevBStats = breadthByTime.get(coin.c15[Math.max(0, prev - 16)]!.time);
+                const prevBreadthPct = prevBStats && prevBStats.total >= 5 ? (prevBStats.above25 / prevBStats.total) * 100 : barBreadthPct;
+                const breadthDelta4h = barBreadthPct - prevBreadthPct;
+                const benchmarkRet4h = benchInfo?.ret4h ?? 0;
+                const distFromBottomLowPct = Number.isFinite(bottomLow) && bottomLow > 0 ? ((simEntryPrice - bottomLow) / bottomLow) * 100 : 0;
+                const upperWickRatioPct = c.high > c.low ? ((c.high - Math.max(c.open, c.close)) / (c.high - c.low)) * 100 : 0;
+                const macroEv = getMacroEventContext(c.time);
+                const hasShock24h = detectRecentShock24h(coin.c15, prev, curAtrPct);
+                bottomLow = Infinity;
                 if (bStats && bStats.total >= 5 && barBreadthPct < 30) {
                   lowBreadthSetups++;
                   if (isWin) lowBreadthWins++;
@@ -2229,6 +2472,19 @@ export class LearningEngine {
                   isBearMacro: Boolean(benchInfo?.isBear),
                   breadthPct: barBreadthPct,
                 });
+                observeSetupRecords.push({
+                  entryTimeSec: c.time,
+                  score: candScore,
+                  pnlPct: sim.finalRet,
+                  distFromBottomLowPct,
+                  upperWickRatioPct,
+                  breadthDelta4h,
+                  benchmarkRet4h,
+                  macroEventInWindow: macroEv.inWindow,
+                  macroEventDay: macroEv.isEventDay,
+                  hasShock24h,
+                  checkpointRetPct: sim.checkpointRetPct,
+                });
 
                 if (isOpeningSession45mBar(coin.c15, idx, ex, false)) {
                   openSessionAcc.setups++;
@@ -2248,11 +2504,13 @@ export class LearningEngine {
           if (isBottomFan) {
             hadBottomFan = true;
             fanStartIdx = idx;
+            bottomLow = Math.min(bottomLow, c.low);
             rawHadBottomFan = true;
             rawFanStartIdx = idx;
           }
           if (hadBottomFan && idx - fanStartIdx > 20 && !waitingPullback) {
             hadBottomFan = false;
+            bottomLow = Infinity;
           }
           if (rawHadBottomFan && idx - rawFanStartIdx > 20 && !rawWaitingPullback) {
             rawHadBottomFan = false;
@@ -2358,6 +2616,7 @@ export class LearningEngine {
         Math.max(1, Math.min(5, Number(opts.maxSlots) || 3)),
       );
       const breadthSitOutAnalysis = evaluateBreadthSitOutOos(primaryReplaySetups, opts.sitOutMode || "dual");
+      const observeFactors = computeObserveFactorsFromSetups(observeSetupRecords);
       const openingSessionStats = {
         setups: openSessionAcc.setups,
         winRatePct: openSessionAcc.setups > 0 ? Number(((openSessionAcc.wins / openSessionAcc.setups) * 100).toFixed(1)) : 0,
@@ -2392,6 +2651,7 @@ export class LearningEngine {
         openingSessionStats,
         portfolioSim,
         breadthSitOutAnalysis,
+        observeFactors,
         tuning: analyzeTuning(tuningEvents, initTuneCfg, costPct),
       };
 
