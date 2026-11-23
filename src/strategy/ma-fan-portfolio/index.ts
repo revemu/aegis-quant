@@ -15,6 +15,8 @@ import { detectRecentShock24h, earningsCalendar, getMacroEventContext } from "..
 import {
   calcCandleAtrPct14,
   calcRollingReturnCorrelation,
+  computeDailyMacroRegimeAt,
+  computeUsdStrength5dAt,
   isGapInducedBar,
   isOpeningSession45mBar,
   LearningEngine,
@@ -99,6 +101,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
   private benchmark1d: Candle[] = [];
   private benchmark15m: Candle[] = [];
   private benchmarkSymbol: string = "SPY";
+  private usdProxySymbol: string = "UUP";
+  private usdProxy1d: Candle[] = [];
   private macroState: PortfolioMacroState = {
     benchmarkSymbol: "SPY",
     benchmarkPrice: 0,
@@ -753,6 +757,9 @@ export class MaFanPortfolioStrategy implements IStrategy {
       sitOutMode: this.cfg.portfolioSitOutMode,
       fallbackSnapshots: this.snapshots,
       benchmarkFallback15m: this.benchmark15m,
+      benchmarkFallback1d: this.benchmark1d,
+      usdProxySymbol: this.usdProxySymbol,
+      usdProxyFallback1d: this.usdProxy1d,
       force,
     });
     await this.learning.applyAutonomousTuning(this.cfg, (patch) => this.updateRuntimeSettings(patch)).catch(() => {});
@@ -1158,6 +1165,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
         c4h: this.benchmark4h,
         c1d: this.benchmark1d,
         c15: this.benchmark15m,
+        usd1d: this.usdProxy1d,
       },
       pgStore: this.db.getPgStore(),
       log: (m) => this.log(m),
@@ -1167,6 +1175,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
     this.benchmark4h = res.benchmark4h;
     this.benchmark1d = res.benchmark1d;
     this.benchmark15m = res.benchmark15m;
+    this.usdProxySymbol = res.usdProxySymbol;
+    this.usdProxy1d = res.usdProxy1d;
 
     for (const [sym, ind] of res.snapshots.entries()) {
       const wsTickAt = this.alpacaWs?.getSymbolLastTickAt(sym) || 0;
@@ -1440,6 +1450,16 @@ export class MaFanPortfolioStrategy implements IStrategy {
       const bRef = closedBench[Math.max(0, closedBench.length - 17)]!;
       if (bRef.open > 0) liveBenchmarkRet4h = ((bEnd.close - bRef.open) / bRef.open) * 100;
     }
+    const closedBench1d = this.benchmark1d.filter((b) => b.isClosed !== false);
+    const liveMacro1d =
+      closedBench1d.length > 0
+        ? computeDailyMacroRegimeAt(closedBench1d, closedBench1d.length - 1, this.exchange.exchangeName)
+        : null;
+    const closedUsd1d = this.usdProxy1d.filter((b) => b.isClosed !== false);
+    const liveUsdRet5dPct =
+      closedUsd1d.length > 0
+        ? computeUsdStrength5dAt(closedUsd1d, closedUsd1d.length - 1, this.exchange.exchangeName !== "alpaca")
+        : null;
     if (this.exchange.exchangeName === "alpaca") {
       void earningsCalendar.refreshForAroundDate(nowObsMs).catch(() => {});
     }
@@ -1869,6 +1889,9 @@ export class MaFanPortfolioStrategy implements IStrategy {
       sitOutMode: this.cfg.portfolioSitOutMode,
       fallbackSnapshots: this.snapshots,
       benchmarkFallback15m: this.benchmark15m,
+      benchmarkFallback1d: this.benchmark1d,
+      usdProxySymbol: this.usdProxySymbol,
+      usdProxyFallback1d: this.usdProxy1d,
     });
 
     if (canExecute && freeSlots > 0 && sizeScale > 0 && !sitOutEval.isSitOut && entryCandidates.length > 0) {
@@ -1954,6 +1977,9 @@ export class MaFanPortfolioStrategy implements IStrategy {
             macroEventTag: getMacroEventContext(barTimeSec).tag,
             earningsTag: isAlpaca ? earningsCalendar.getEarningsTag(ch.sym) : null,
             hasShock24h: chInd ? detectRecentShock24h(chInd.c15, chInd.lastClosedIdx, chAtrPct) : false,
+            mayerMultiple: liveMacro1d?.mayerMultiple ?? null,
+            macroRiskIndex: liveMacro1d?.macroRiskIndex ?? null,
+            usdRet5dPct: liveUsdRet5dPct ?? null,
           },
         );
       }
@@ -2050,6 +2076,9 @@ export class MaFanPortfolioStrategy implements IStrategy {
       macroEventTag?: string | null;
       earningsTag?: string | null;
       hasShock24h?: boolean;
+      mayerMultiple?: number | null;
+      macroRiskIndex?: number | null;
+      usdRet5dPct?: number | null;
     },
   ): Promise<void> {
     const usedIdx = new Set(this.slots.map((s) => s.slotIndex));

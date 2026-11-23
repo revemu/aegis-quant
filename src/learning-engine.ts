@@ -99,6 +99,20 @@ export interface TimeDecayCheckpoint {
   healthyAvgFinalPnlPct: number;
 }
 
+export interface LatestMacroRegimeSnapshot {
+  benchmarkSymbol: string;
+  asOfTimeSec: number | null;
+  mayerMultiple: number | null;
+  mayerZone: string | null;
+  macroRiskIndex: number | null;
+  macroRiskZone: string | null;
+  drawdown180dPct: number | null;
+  dailyAtr14Pct: number | null;
+  usdProxySymbol: string;
+  usdRet5dPct: number | null;
+  usdZone: string | null;
+}
+
 export interface ShadowObserveFactorsSummary {
   scoreBuckets: Record<string, BucketMetric>;
   overextensionBuckets: Record<string, BucketMetric>;
@@ -108,6 +122,10 @@ export interface ShadowObserveFactorsSummary {
   benchSlope4hBuckets: Record<string, BucketMetric>;
   concurrencyBuckets: Record<string, BucketMetric>;
   eventBuckets: Record<string, BucketMetric>;
+  mayerBuckets?: Record<string, BucketMetric>;
+  macroRiskBuckets?: Record<string, BucketMetric>;
+  usdStrengthBuckets?: Record<string, BucketMetric>;
+  latestMacroRegime?: LatestMacroRegimeSnapshot | null;
 }
 
 export interface ShadowPortfolioReplaySummary {
@@ -192,6 +210,9 @@ export interface ShadowWalkForwardContext {
   slPct: number;
   fallbackSnapshots?: Map<string, { c15: Candle[]; c1h: Candle[] }>;
   benchmarkFallback15m?: Candle[];
+  benchmarkFallback1d?: Candle[];
+  usdProxySymbol?: string;
+  usdProxyFallback1d?: Candle[];
   force?: boolean;
 }
 
@@ -585,6 +606,137 @@ function simulateMaFanCounterfactual(
   return { finalRet: netRet, maePct, mfePct, exitBarsHeld, checkpointRetPct, verdict };
 }
 
+export function classifyMayerZone(mayerMultiple: number | null): string | null {
+  if (mayerMultiple === null || !Number.isFinite(mayerMultiple)) return null;
+  if (mayerMultiple < 0.9) return "DEEP_BEAR (<0.9)";
+  if (mayerMultiple < 1.0) return "BELOW_200D (0.9-1.0)";
+  if (mayerMultiple < 1.25) return "HEALTHY_BULL (1.0-1.25)";
+  return "OVERHEATED (>=1.25)";
+}
+
+export function classifyMacroRiskZone(macroRiskIndex: number | null): string | null {
+  if (macroRiskIndex === null || !Number.isFinite(macroRiskIndex)) return null;
+  if (macroRiskIndex < 35) return "CALM (<35)";
+  if (macroRiskIndex < 65) return "ELEVATED (35-65)";
+  return "HIGH (>=65)";
+}
+
+export function classifyUsdZone(usdRet5dPct: number | null): string | null {
+  if (usdRet5dPct === null || !Number.isFinite(usdRet5dPct)) return null;
+  if (usdRet5dPct < -0.5) return "USD_WEAK (<-0.5%)";
+  if (usdRet5dPct > 0.5) return "USD_SURGE (>+0.5%)";
+  return "USD_FLAT (-0.5..+0.5%)";
+}
+
+export interface DailyMacroRegimePoint {
+  mayerMultiple: number | null;
+  macroRiskIndex: number | null;
+  drawdown180dPct: number | null;
+  dailyAtr14Pct: number | null;
+}
+
+/**
+ * Strictly causal 1D macro regime metrics up to daily bar `dIdx`:
+ * - Mayer Multiple = Close / 200 DMA (null when < 200 daily bars)
+ * - Macro Risk Index (0..100) = 40% 180D Drawdown + 30% 200 DMA Stretch + 30% 14D Daily ATR% Vol
+ */
+export function computeDailyMacroRegimeAt(
+  c1d: Candle[],
+  dIdx: number,
+  exchange = "alpaca",
+): DailyMacroRegimePoint {
+  if (!c1d || dIdx < 0 || dIdx >= c1d.length) {
+    return { mayerMultiple: null, macroRiskIndex: null, drawdown180dPct: null, dailyAtr14Pct: null };
+  }
+  const curClose = c1d[dIdx]!.close;
+  if (!Number.isFinite(curClose) || curClose <= 0) {
+    return { mayerMultiple: null, macroRiskIndex: null, drawdown180dPct: null, dailyAtr14Pct: null };
+  }
+
+  let mayerMultiple: number | null = null;
+  if (dIdx >= 199) {
+    let sum200 = 0;
+    for (let k = dIdx - 199; k <= dIdx; k++) {
+      sum200 += c1d[k]!.close;
+    }
+    const sma200 = sum200 / 200;
+    if (Number.isFinite(sma200) && sma200 > 0) {
+      mayerMultiple = Number((curClose / sma200).toFixed(4));
+    }
+  }
+
+  let peak180 = curClose;
+  const ddStart = Math.max(0, dIdx - 179);
+  for (let k = ddStart; k <= dIdx; k++) {
+    const hi = Math.max(c1d[k]!.high || 0, c1d[k]!.close || 0);
+    if (hi > peak180) peak180 = hi;
+  }
+  const ddAbsPct = peak180 > 0 ? Math.max(0, ((peak180 - curClose) / peak180) * 100) : 0;
+  const drawdown180dPct = Number((-ddAbsPct).toFixed(2));
+
+  if (dIdx < 14) {
+    return {
+      mayerMultiple,
+      macroRiskIndex: null,
+      drawdown180dPct,
+      dailyAtr14Pct: null,
+    };
+  }
+
+  const dailyAtr14Pct = Number(calcCandleAtrPct14(c1d, dIdx).toFixed(3));
+  const isAlpaca = (exchange || "alpaca").toLowerCase() === "alpaca";
+
+  const ddMax = isAlpaca ? 20 : 40;
+  const ddPts = clamp(ddAbsPct / ddMax, 0, 1) * 40;
+
+  let stretchPts = 0;
+  if (mayerMultiple !== null) {
+    let stretchNorm = 0;
+    if (mayerMultiple < 1.0) {
+      stretchNorm = clamp((1.0 - mayerMultiple) / (isAlpaca ? 0.15 : 0.35), 0, 1);
+    } else {
+      const heatFloor = isAlpaca ? 1.15 : 1.5;
+      const heatSpan = isAlpaca ? 0.2 : 0.8;
+      if (mayerMultiple > heatFloor) {
+        stretchNorm = clamp((mayerMultiple - heatFloor) / heatSpan, 0, 1);
+      }
+    }
+    stretchPts = stretchNorm * 30;
+  }
+
+  const volFloor = isAlpaca ? 0.7 : 1.8;
+  const volSpan = isAlpaca ? 2.0 : 5.0;
+  const volPts = clamp((dailyAtr14Pct - volFloor) / volSpan, 0, 1) * 30;
+
+  const rawRisk = mayerMultiple !== null ? ddPts + stretchPts + volPts : ((ddPts + volPts) * 100) / 70;
+  const macroRiskIndex = Number(clamp(rawRisk, 0, 100).toFixed(1));
+
+  return {
+    mayerMultiple,
+    macroRiskIndex,
+    drawdown180dPct,
+    dailyAtr14Pct,
+  };
+}
+
+/**
+ * Strictly causal 5-day USD strength proxy (% return).
+ * - Alpaca `UUP` (`invert=false`): positive => stronger USD
+ * - Binance `EURUSDT` (`invert=true`): inverted to USD/EUR so positive => stronger USD
+ */
+export function computeUsdStrength5dAt(
+  usd1d: Candle[],
+  uIdx: number,
+  invert: boolean,
+): number | null {
+  if (!usd1d || uIdx < 5 || uIdx >= usd1d.length) return null;
+  const cur = usd1d[uIdx]?.close ?? 0;
+  const prev = usd1d[uIdx - 5]?.close ?? 0;
+  if (!Number.isFinite(cur) || !Number.isFinite(prev) || cur <= 0 || prev <= 0) return null;
+  const retPct = invert ? ((prev / cur) - 1) * 100 : ((cur - prev) / prev) * 100;
+  return Number.isFinite(retPct) ? Number(retPct.toFixed(3)) : null;
+}
+
 export interface ObserveSetupInput {
   entryTimeSec: number;
   score: number;
@@ -596,6 +748,9 @@ export interface ObserveSetupInput {
   macroEventInWindow: boolean;
   macroEventDay: boolean;
   hasShock24h: boolean;
+  mayerMultiple?: number | null;
+  macroRiskIndex?: number | null;
+  usdRet5dPct?: number | null;
   checkpointRetPct?: Record<number, number | null>;
 }
 
@@ -637,6 +792,9 @@ export function computeObserveFactorsFromSetups(setups: ObserveSetupInput[]): Sh
   const benchMap = tally();
   const concMap = tally();
   const eventMap = tally();
+  const mayerMap = tally();
+  const macroRiskMap = tally();
+  const usdMap = tally();
 
   for (const s of setups) {
     const scoreKey = s.score < 30 ? "<30" : s.score < 50 ? "30-50" : s.score < 70 ? "50-70" : ">=70";
@@ -675,6 +833,15 @@ export function computeObserveFactorsFromSetups(setups: ObserveSetupInput[]): Sh
     if (!s.macroEventInWindow && !s.macroEventDay && !s.hasShock24h) {
       bump(eventMap, "NORMAL_DAY", s.pnlPct);
     }
+
+    const mayerZone = classifyMayerZone(s.mayerMultiple ?? null);
+    if (mayerZone) bump(mayerMap, mayerZone, s.pnlPct);
+
+    const macroRiskZone = classifyMacroRiskZone(s.macroRiskIndex ?? null);
+    if (macroRiskZone) bump(macroRiskMap, macroRiskZone, s.pnlPct);
+
+    const usdZone = classifyUsdZone(s.usdRet5dPct ?? null);
+    if (usdZone) bump(usdMap, usdZone, s.pnlPct);
   }
 
   const cpDefs = [
@@ -725,6 +892,9 @@ export function computeObserveFactorsFromSetups(setups: ObserveSetupInput[]): Sh
     benchSlope4hBuckets: toRec(benchMap, ["BENCH_UP (>+0.5%)", "BENCH_FLAT (-0.5..+0.5%)", "BENCH_DUMP (<-0.5%)"]),
     concurrencyBuckets: toRec(concMap, ["ISOLATED (1-2)", "MODERATE (3-5)", "SURGE (>=6)"]),
     eventBuckets: toRec(eventMap, ["NORMAL_DAY", "MACRO_EVENT_DAY", "MACRO_EVENT_WINDOW", "NEWS_SHOCK_24H"]),
+    mayerBuckets: toRec(mayerMap, ["DEEP_BEAR (<0.9)", "BELOW_200D (0.9-1.0)", "HEALTHY_BULL (1.0-1.25)", "OVERHEATED (>=1.25)"]),
+    macroRiskBuckets: toRec(macroRiskMap, ["CALM (<35)", "ELEVATED (35-65)", "HIGH (>=65)"]),
+    usdStrengthBuckets: toRec(usdMap, ["USD_WEAK (<-0.5%)", "USD_FLAT (-0.5..+0.5%)", "USD_SURGE (>+0.5%)"]),
   };
 }
 
@@ -1555,6 +1725,9 @@ export class LearningEngine {
       macroEventTag?: string | null;
       earningsTag?: string | null;
       hasShock24h?: boolean;
+      mayerMultiple?: number | null;
+      macroRiskIndex?: number | null;
+      usdRet5dPct?: number | null;
     };
   }): Promise<string> {
     const sym = params.symbol.toUpperCase();
@@ -1617,6 +1790,15 @@ export class LearningEngine {
                 ? { concurrentSignalsCount: Math.round(Number(oc.concurrentSignalsCount)) }
                 : {}),
               ...(typeof oc.hasShock24h === "boolean" ? { hasShock24h: oc.hasShock24h } : {}),
+              ...(typeof oc.mayerMultiple === "number" && Number.isFinite(oc.mayerMultiple)
+                ? { mayerMultiple: Number(oc.mayerMultiple.toFixed(4)) }
+                : {}),
+              ...(typeof oc.macroRiskIndex === "number" && Number.isFinite(oc.macroRiskIndex)
+                ? { macroRiskIndex: Number(oc.macroRiskIndex.toFixed(1)) }
+                : {}),
+              ...(typeof oc.usdRet5dPct === "number" && Number.isFinite(oc.usdRet5dPct)
+                ? { usdRet5dPct: Number(oc.usdRet5dPct.toFixed(3)) }
+                : {}),
             }
           : {}),
         ...(hasSignalPx
@@ -2133,6 +2315,7 @@ export class LearningEngine {
       const isAlpaca = ex === "alpaca";
       const pg = this.getPg();
       const benchSym = (opts.benchmarkSymbol || (isAlpaca ? "SPY" : "BTCUSDT")).toUpperCase();
+      const usdSym = (opts.usdProxySymbol || (isAlpaca ? "UUP" : "EURUSDT")).toUpperCase();
       const allNeed15m = Array.from(new Set([benchSym, ...cleanSymbols]));
 
       const pg15m = pg
@@ -2141,6 +2324,20 @@ export class LearningEngine {
       const pg1h = pg
         ? await pg.loadMarketCandlesBatch(ex, cleanSymbols, "1h", 700).catch(() => new Map<string, Candle[]>())
         : new Map<string, Candle[]>();
+      const pg1d = pg
+        ? await pg.loadMarketCandlesBatch(ex, Array.from(new Set([benchSym, usdSym])), "1d", 320).catch(() => new Map<string, Candle[]>())
+        : new Map<string, Candle[]>();
+
+      const pickClosedDaily = (dbBars: Candle[] | undefined, fbBars: Candle[] | undefined): Candle[] => {
+        const dbClosed = (dbBars || []).filter((c) => c.isClosed !== false);
+        const fbClosed = (fbBars || []).filter((c) => c.isClosed !== false);
+        const chosen = dbClosed.length >= fbClosed.length ? dbClosed : fbClosed;
+        return chosen.slice().sort((a, b) => a.time - b.time);
+      };
+      const bench1d = pickClosedDaily(pg1d.get(benchSym), opts.benchmarkFallback1d);
+      const usd1d = pickClosedDaily(pg1d.get(usdSym), opts.usdProxyFallback1d);
+      const bench1dRegimes = bench1d.map((_, dIdx) => computeDailyMacroRegimeAt(bench1d, dIdx, ex));
+      const usd1dRets = usd1d.map((_, uIdx) => computeUsdStrength5dAt(usd1d, uIdx, !isAlpaca));
 
       const getBars = (sym: string, tf: "15m" | "1h"): Candle[] => {
         const dbBars = (tf === "15m" ? pg15m.get(sym) : pg1h.get(sym)) || [];
@@ -2276,6 +2473,8 @@ export class LearningEngine {
         let rawCrossWasGap = false;
 
         let p1 = -1;
+        let p1d = -1;
+        let pUsd = -1;
 
         let sTrades = 0;
         let sWins = 0;
@@ -2289,6 +2488,12 @@ export class LearningEngine {
           const c = coin.c15[idx]!;
           while (p1 + 1 < coin.c1h.length && coin.c1h[p1 + 1]!.time + 3600 <= c.time) {
             p1++;
+          }
+          while (p1d + 1 < bench1d.length && bench1d[p1d + 1]!.time + 86400 <= c.time) {
+            p1d++;
+          }
+          while (pUsd + 1 < usd1d.length && usd1d[pUsd + 1]!.time + 86400 <= c.time) {
+            pUsd++;
           }
 
           if (waitingPullback && (idx - waitFromIdx >= 12 || coin.m8[idx]! < coin.m16[idx]!)) {
@@ -2472,6 +2677,8 @@ export class LearningEngine {
                   isBearMacro: Boolean(benchInfo?.isBear),
                   breadthPct: barBreadthPct,
                 });
+                const dMacro = p1d >= 0 ? bench1dRegimes[p1d] : undefined;
+                const dUsdRet = pUsd >= 0 ? usd1dRets[pUsd] : null;
                 observeSetupRecords.push({
                   entryTimeSec: c.time,
                   score: candScore,
@@ -2483,6 +2690,9 @@ export class LearningEngine {
                   macroEventInWindow: macroEv.inWindow,
                   macroEventDay: macroEv.isEventDay,
                   hasShock24h,
+                  mayerMultiple: dMacro?.mayerMultiple ?? null,
+                  macroRiskIndex: dMacro?.macroRiskIndex ?? null,
+                  usdRet5dPct: dUsdRet ?? null,
                   checkpointRetPct: sim.checkpointRetPct,
                 });
 
@@ -2617,6 +2827,21 @@ export class LearningEngine {
       );
       const breadthSitOutAnalysis = evaluateBreadthSitOutOos(primaryReplaySetups, opts.sitOutMode || "dual");
       const observeFactors = computeObserveFactorsFromSetups(observeSetupRecords);
+      const latestBench = bench1d.length > 0 ? bench1dRegimes[bench1d.length - 1] : undefined;
+      const latestUsd = usd1d.length > 0 ? usd1dRets[usd1d.length - 1] : null;
+      observeFactors.latestMacroRegime = {
+        benchmarkSymbol: benchSym,
+        asOfTimeSec: bench1d.length > 0 ? bench1d[bench1d.length - 1]!.time : null,
+        mayerMultiple: latestBench?.mayerMultiple ?? null,
+        mayerZone: classifyMayerZone(latestBench?.mayerMultiple ?? null),
+        macroRiskIndex: latestBench?.macroRiskIndex ?? null,
+        macroRiskZone: classifyMacroRiskZone(latestBench?.macroRiskIndex ?? null),
+        drawdown180dPct: latestBench?.drawdown180dPct ?? null,
+        dailyAtr14Pct: latestBench?.dailyAtr14Pct ?? null,
+        usdProxySymbol: usdSym,
+        usdRet5dPct: latestUsd ?? null,
+        usdZone: classifyUsdZone(latestUsd ?? null),
+      };
       const openingSessionStats = {
         setups: openSessionAcc.setups,
         winRatePct: openSessionAcc.setups > 0 ? Number(((openSessionAcc.wins / openSessionAcc.setups) * 100).toFixed(1)) : 0,

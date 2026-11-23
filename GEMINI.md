@@ -10209,3 +10209,21 @@ When investigating live production behavior, debugging issues, or analyzing trad
   5. **Concurrent Signals Count (`concurrencyBuckets`)**: นับจำนวนตัวที่พร้อมเข้าพร้อมกันในแท่งเดียวกัน (`ISOLATED 1-2`, `MODERATE 3-5`, `SURGE >=6`) เพื่อแยก Dead-Cat Bounce ออกจาก Setup คัดเฉพาะตัว
 - **การแสดงผลบนแดชบอร์ด (`public/app.js`)**: เพิ่มการ์ดแสดง `Score / Overextension / Upper Wick`, `Time-Decay`, และ `Breadth Velocity / Concurrency / Macro & Shock Events` ในหน้า Learning Report Modal
 - **Version Bump**: **`0.3.1.8`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 353. Causal 1D Macro Regime Observe-Only Factors — Mayer Multiple, Macro Risk Index & USD Strength Proxy (`src/strategy/ma-fan-portfolio/universe.ts`, `src/learning-engine.ts`, `src/strategy/ma-fan-portfolio/index.ts`, `public/app.js`, v0.3.1.9)
+- **หลักการออกแบบ**: ต่อยอดจากแนวคิดแผนเทรด `cointh.com/plan` โดยคำนวณเอง 100% จากข้อมูล Exchange ที่บอทเชื่อมอยู่ (`Alpaca` และ `Binance`) และแคชใน PostgreSQL `market_candles` แบบ **Strictly Causal / Zero Look-Ahead** ในโหมด **Observe-Only 100%** (ไม่แก้กฎซื้อ/ขายหรือฟิลเตอร์ใดๆ)
+- **สิ่งที่เพิ่มเข้ามา (`3` ปัจจัย 1D Macro Regime)**:
+  1. **ขยาย Data Feed `1D` (`src/strategy/ma-fan-portfolio/universe.ts`)**:
+     - ขยายดึงแท่ง `1d` ของ Benchmark (`SPY` บน Alpaca / `BTCUSDT` บน Binance) จาก `60` เป็น `260` แท่งเพื่อรองรับ 200 DMA และดึง USD Proxy `1d` (`UUP` บน Alpaca / `EURUSDT` บน Binance) `120` แท่งแบบ non-blocking (`.catch(() => [])`)
+  2. **Pure Causal 1D Macro Helpers (`src/learning-engine.ts`)**:
+     - `computeDailyMacroRegimeAt(c1d, dIdx, exchange)`:
+       - **Mayer Multiple (`Close / 200 DMA`)**: คืนค่า `null` เมื่อแท่ง `1d` สะสมไม่ถึง `200` แท่ง แยกโซน `DEEP_BEAR (<0.9)`, `BELOW_200D (0.9-1.0)`, `HEALTHY_BULL (1.0-1.25)`, `OVERHEATED (>=1.25)`
+       - **Composite Macro Risk Index (`0–100`)**: คะแนนความเปราะบางตลาด 1D ถ่วงน้ำหนัก 40% `180D Drawdown` + 30% `200 DMA Stretch/Break` + 30% `14D Daily ATR% Vol` (ปรับสเกลแยก Equities/Crypto) แยกโซน `CALM (<35)`, `ELEVATED (35-65)`, `HIGH (>=65)`
+     - `computeUsdStrength5dAt(usd1d, uIdx, invert)`: วัดผลตอบแทนดอลลาร์ 5 วันจาก `UUP` (`invert=false`) หรือกลับด้าน `EURUSDT` เป็น `USD/EUR` (`invert=true`) แยกโซน `USD_WEAK (<-0.5%)`, `USD_FLAT (-0.5..+0.5%)`, `USD_SURGE (>+0.5%)`
+  3. **Shadow Walk-Forward + Live Trade Journal Integration (`src/learning-engine.ts`, `src/strategy/ma-fan-portfolio/index.ts`)**:
+     - ใน `runShadowWalkForward`: จัดแนวแท่ง `1d` กับ `15m` แบบ Zero Look-Ahead ด้วยเงื่อนไข `c1d.time + 86400 <= c15.time` ผ่านพอยน์เตอร์ `p1d`/`pUsd` พร้อมสรุป `mayerBuckets`, `macroRiskBuckets`, `usdStrengthBuckets` และ `latestMacroRegime` เข้า `observeFactors`
+     - ใน `MaFanPortfolioStrategy` & `onPortfolioEntry`: บันทึก `mayerMultiple`, `macroRiskIndex`, `usdRet5dPct` (เฉพาะค่าตัวเลขที่ใช้งานได้จริง ไม่แปลง `null` เป็น `0`) ลง `features` ของตาราง `trade_learning_journal` เมื่อเปิดไม้จริง
+- **การแสดงผลบนแดชบอร์ด (`public/app.js`)**: เพิ่มการ์ด **`🌐 Macro Regime 1D — Mayer / Risk Index / USD Proxy (Observe-Only)`** แสดงค่า 1D ล่าสุดคู่กับสถิติ Shadow WR/Avg PnL ของแต่ละโซนในหน้า Learning Report Modal
+- **Version Bump**: **`0.3.1.9`** (`package.json`, `src/version.ts`, `public/index.html`)

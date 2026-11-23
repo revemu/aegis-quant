@@ -157,6 +157,8 @@ export interface UniverseFetchResult {
   benchmark4h: Candle[];
   benchmark1d: Candle[];
   benchmark15m: Candle[];
+  usdProxySymbol: string;
+  usdProxy1d: Candle[];
 }
 
 export async function fetchPortfolioUniverseAndBenchmark(opts: {
@@ -165,7 +167,7 @@ export async function fetchPortfolioUniverseAndBenchmark(opts: {
   alpacaCreds: { apiKey: string; apiSecret: string; dataUrl: string };
   existingLivePrices?: Map<string, number>;
   existingCandles?: Map<string, { c15: Candle[]; c1h: Candle[] }>;
-  existingBenchmarkCandles?: { c4h?: Candle[]; c1d?: Candle[]; c15?: Candle[] };
+  existingBenchmarkCandles?: { c4h?: Candle[]; c1d?: Candle[]; c15?: Candle[]; usd1d?: Candle[] };
   pgStore?: PgStore | null;
   log?: (msg: string) => void;
 }): Promise<UniverseFetchResult> {
@@ -299,7 +301,7 @@ export async function fetchPortfolioUniverseAndBenchmark(opts: {
       return mergeCandles(prev, incoming, targetLimit);
     };
 
-    const [bars15Map, bars1hMap, snapMap, spy4h, spy1d] = await Promise.all([
+    const [bars15Map, bars1hMap, snapMap, spy4h, spy1d, uup1d] = await Promise.all([
       fetchAlpacaBatchCached("15m", 260),
       fetchAlpacaBatchCached("1h", 120),
       fetchAlpacaMultiSnapshots({
@@ -307,7 +309,8 @@ export async function fetchPortfolioUniverseAndBenchmark(opts: {
         ...opts.alpacaCreds,
       }),
       fetchAlpacaSingleCached("SPY", "4h", 120, opts.existingBenchmarkCandles?.c4h),
-      fetchAlpacaSingleCached("SPY", "1d", 60, opts.existingBenchmarkCandles?.c1d),
+      fetchAlpacaSingleCached("SPY", "1d", 260, opts.existingBenchmarkCandles?.c1d),
+      fetchAlpacaSingleCached("UUP", "1d", 120, opts.existingBenchmarkCandles?.usd1d).catch(() => [] as Candle[]),
     ]);
 
     if (pg && upsertItems.length > 0) {
@@ -333,6 +336,8 @@ export async function fetchPortfolioUniverseAndBenchmark(opts: {
       benchmark4h: spy4h,
       benchmark1d: spy1d,
       benchmark15m: bars15Map.get("SPY") || [],
+      usdProxySymbol: "UUP",
+      usdProxy1d: uup1d,
     };
   }
 
@@ -384,18 +389,19 @@ export async function fetchPortfolioUniverseAndBenchmark(opts: {
     preloadBinanceBatch(symbols, "1h", 120),
   ]);
 
-  const loadBench = async (tf: "15m" | "4h" | "1d", limit: number, mem?: Candle[]): Promise<Candle[]> => {
+  const loadBinSeries = async (sym: string, tf: "15m" | "4h" | "1d", limit: number, mem?: Candle[]): Promise<Candle[]> => {
     let prev = mem && mem.length >= limit ? mem : [];
     if (prev.length < limit && pg) {
-      prev = await pg.loadMarketCandles("binance", benchSym, tf, limit).catch(() => [] as Candle[]);
+      prev = await pg.loadMarketCandles("binance", sym, tf, limit).catch(() => [] as Candle[]);
     }
-    return fetchBinanceIncremental(benchSym, tf, limit, prev);
+    return fetchBinanceIncremental(sym, tf, limit, prev);
   };
 
-  const [bench15, bench4h, bench1d] = await Promise.all([
-    loadBench("15m", 260, opts.existingBenchmarkCandles?.c15),
-    loadBench("4h", 120, opts.existingBenchmarkCandles?.c4h),
-    loadBench("1d", 60, opts.existingBenchmarkCandles?.c1d),
+  const [bench15, bench4h, bench1d, eur1d] = await Promise.all([
+    loadBinSeries(benchSym, "15m", 260, opts.existingBenchmarkCandles?.c15),
+    loadBinSeries(benchSym, "4h", 120, opts.existingBenchmarkCandles?.c4h),
+    loadBinSeries(benchSym, "1d", 260, opts.existingBenchmarkCandles?.c1d),
+    loadBinSeries("EURUSDT", "1d", 120, opts.existingBenchmarkCandles?.usd1d).catch(() => [] as Candle[]),
   ]);
 
   const snapshots = new Map<string, SymbolIndicatorSnapshot>();
@@ -428,6 +434,8 @@ export async function fetchPortfolioUniverseAndBenchmark(opts: {
     benchmark4h: bench4h,
     benchmark1d: bench1d,
     benchmark15m: bench15,
+    usdProxySymbol: "EURUSDT",
+    usdProxy1d: eur1d,
   };
 }
 

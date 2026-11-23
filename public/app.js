@@ -9849,6 +9849,38 @@
                   <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Concurrent:</strong> ${renderChips(of.concurrencyBuckets)}</div>
                   <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Events:</strong> ${renderChips(of.eventBuckets)}</div>
                 </div>
+                ${(() => {
+                  const mr = of.latestMacroRegime;
+                  const hasBuckets =
+                    (of.mayerBuckets && Object.keys(of.mayerBuckets).length > 0) ||
+                    (of.macroRiskBuckets && Object.keys(of.macroRiskBuckets).length > 0) ||
+                    (of.usdStrengthBuckets && Object.keys(of.usdStrengthBuckets).length > 0);
+                  if (!mr && !hasBuckets) return "";
+                  const badge = (txt, bg, col) =>
+                    `<span style="padding:2px 6px; border-radius:4px; background:${bg}; color:${col}; font-weight:600;">${txt}</span>`;
+                  let nowLine = "";
+                  if (mr) {
+                    const mVal = mr.mayerMultiple != null ? `${Number(mr.mayerMultiple).toFixed(2)}x` : "--";
+                    const mZone = mr.mayerZone ? ` (${mr.mayerZone})` : "";
+                    const mCol = mr.mayerZone?.startsWith("HEALTHY") ? "#86efac" : mr.mayerZone?.startsWith("DEEP_BEAR") ? "#fca5a5" : "#fbbf24";
+                    const rVal = mr.macroRiskIndex != null ? `${Number(mr.macroRiskIndex).toFixed(1)}/100` : "--";
+                    const rZone = mr.macroRiskZone ? ` (${mr.macroRiskZone})` : "";
+                    const rCol = mr.macroRiskZone?.startsWith("CALM") ? "#86efac" : mr.macroRiskZone?.startsWith("HIGH") ? "#fca5a5" : "#fbbf24";
+                    const ddTxt = mr.drawdown180dPct != null ? ` • DD180 ${Number(mr.drawdown180dPct).toFixed(1)}%` : "";
+                    const uVal = mr.usdRet5dPct != null ? `${Number(mr.usdRet5dPct) >= 0 ? "+" : ""}${Number(mr.usdRet5dPct).toFixed(2)}%` : "--";
+                    const uCol = mr.usdZone?.startsWith("USD_WEAK") ? "#86efac" : mr.usdZone?.startsWith("USD_SURGE") ? "#fca5a5" : "#cbd5e1";
+                    nowLine = `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px; align-items:center;"><strong>Live 1D (${mr.benchmarkSymbol || "BENCH"}):</strong> ${badge(`Mayer ${mVal}${mZone}`, "rgba(148,163,184,0.12)", mCol)} ${badge(`Risk ${rVal}${rZone}${ddTxt}`, "rgba(148,163,184,0.12)", rCol)} ${badge(`USD (${mr.usdProxySymbol || "PROXY"}) 5D ${uVal}`, "rgba(148,163,184,0.12)", uCol)}</div>`;
+                  }
+                  return `
+                    <div class="lr-kpi-card" style="grid-column:1/-1;">
+                      <div class="lr-kpi-label">🌐 Macro Regime 1D — Mayer / Risk Index / USD Proxy (Observe-Only)</div>
+                      ${nowLine}
+                      <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Mayer 200D:</strong> ${renderChips(of.mayerBuckets)}</div>
+                      <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Risk Index:</strong> ${renderChips(of.macroRiskBuckets)}</div>
+                      <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>USD 5D:</strong> ${renderChips(of.usdStrengthBuckets)}</div>
+                    </div>
+                  `;
+                })()}
               `;
             })()}
           `;
