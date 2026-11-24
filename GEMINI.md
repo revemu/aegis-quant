@@ -10260,3 +10260,22 @@ When investigating live production behavior, debugging issues, or analyzing trad
      - เพิ่ม **Min Room to EMA200 Gate** (`FILTER:LOW_ROOM_200`) เมื่อ `portfolioMinRoomToEma200Pct > 0` และซิงค์ `slot.stopLossPrice` ตาม SL ปัจจุบันก่อน BE/TP1
   3. [`src/learning-engine.ts`](file:///c:/Sites/github/dynamic-grid-bn/src/learning-engine.ts): รองรับ `tp1FloorPct` (default `1.2%`) ใน `simulateMaFanCounterfactual`, เพิ่มค่า SL Candidates `[2.0, 2.25, ...]` และลดเพดานล่าง `recSlPct` เป็น `2.0%` พร้อม Normalize `FILTER:LOW_ROOM_200`
 - **Version Bump**: **`0.3.1.11`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 356. Live V3/V4 Production Calibration & Observe-Only Alpha Microstructure Telemetry (`src/pg-store.ts`, `src/learning-engine.ts`, `src/strategy/ma-fan-portfolio/*`, `public/app.js`, v0.3.1.12)
+- **Live Production Config Calibration (OOS-Verified)**:
+  - `alpaca_kyne` -> **`V3`**: `portfolioTp1TargetMode="EMA200"`, `portfolioTp1MinGainPct=1.2`, `portfolioDisasterSlPct=2.0`, `portfolioStaleExitBars=16`, `portfolioStaleExitMaxGainPct=0.3`, `portfolioRunnerTrailPct=0`, `portfolioMinRoomToEma200Pct=0`.
+  - `binance_dry` -> **`V4`**: `portfolioTp1TargetMode="EMA200"`, `portfolioTp1MinGainPct=1.5`, `portfolioDisasterSlPct=2.25`, `portfolioStaleExitBars=16`, `portfolioStaleExitMaxGainPct=0.3`, `portfolioRunnerTrailPct=1.2`, `portfolioMinRoomToEma200Pct=1.8`.
+- **Observe-Only Alpha Microstructure & Positioning Telemetry (`0%` change to trading execution/filtering rules)**:
+  1. [`src/market-structure/types.ts`](file:///c:/Sites/github/dynamic-grid-bn/src/market-structure/types.ts) & [`src/pg-store.ts`](file:///c:/Sites/github/dynamic-grid-bn/src/pg-store.ts): เพิ่ม `quoteVolume`, `takerBuyQuoteVolume` บน `Candle` และเพิ่มคอลัมน์ `quote_volume`, `taker_buy_quote` ในตาราง `market_candles` (ใช้ `COALESCE` บน `ON CONFLICT` เพื่อป้องกันข้อมูล Taker Volume สูญหายเมื่อ Feed อื่นอัปเดตเฉพาะ OHLCV)
+  2. [`src/strategy/ma-fan-portfolio/universe.ts`](file:///c:/Sites/github/dynamic-grid-bn/src/strategy/ma-fan-portfolio/universe.ts):
+     - อ่านค่า `quoteVolume` (`k[7]`) และ `takerBuyQuoteVolume` (`k[10]`) จาก Binance Spot Klines พร้อม Backfill ครั้งเดียวสำหรับแท่งเก่าที่ยังขาดข้อมูล Taker Volume
+     - เพิ่ม `BinanceDerivativesCache` (`binanceDerivativesCache`) ดึง Binance USDT-M Futures `/fapi/v1/fundingRate` และ `/futures/data/openInterestHist` (`1h`) รอบละ 15 นาทีแบบ Best-Effort (Observe-Only)
+  3. [`src/learning-engine.ts`](file:///c:/Sites/github/dynamic-grid-bn/src/learning-engine.ts): เพิ่มตัวช่วย Zero-Lookahead และตัวแบ่งโซน:
+     - `computeIntradayVwapDistPctAt` / `classifyVwapZone` (Anchored NY Day VWAP% สำหรับหุ้นสหรัฐ Alpaca)
+     - `computeTrueTakerBuyPct12At` / `classifyTakerBuyZone` (Trailing 3h Spot Taker Buy% สำหรับ Binance)
+     - `lookupCausalFundingBpsAt` / `classifyFundingZone` (`timeMs <= barMs`) และ `lookupCausalOiDelta4hPctAt` / `classifyOiDeltaZone` (`timeMs + 3600_000 <= barMs`)
+     - รวมผลสถิติเข้า `ShadowObserveFactorsSummary` (`vwapBuckets`, `takerBuyBuckets`, `fundingBuckets`, `oiDeltaBuckets`) และบันทึกค่าจริงเข้า `trade_learning_journal.features` ใน `onPortfolioEntry`
+  4. [`src/strategy/ma-fan-portfolio/index.ts`](file:///c:/Sites/github/dynamic-grid-bn/src/strategy/ma-fan-portfolio/index.ts) & [`public/app.js`](file:///c:/Sites/github/dynamic-grid-bn/public/app.js): เชื่อม `binanceDerivativesCache`, Live/Shadow Observe Telemetry และเพิ่มการ์ด **`⚡ Alpha Flow & Positioning (VWAP / Taker Buy / Funding / OI — Observe-Only)`** ใน Learning Report Modal
+- **Version Bump**: **`0.3.1.12`** (`package.json`, `src/version.ts`, `public/index.html`)

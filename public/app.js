@@ -9881,6 +9881,22 @@
                     </div>
                   `;
                 })()}
+                ${(() => {
+                  const hasVwap = of.vwapBuckets && Object.keys(of.vwapBuckets).length > 0;
+                  const hasTaker = of.takerBuyBuckets && Object.keys(of.takerBuyBuckets).length > 0;
+                  const hasFunding = of.fundingBuckets && Object.keys(of.fundingBuckets).length > 0;
+                  const hasOi = of.oiDeltaBuckets && Object.keys(of.oiDeltaBuckets).length > 0;
+                  if (!hasVwap && !hasTaker && !hasFunding && !hasOi) return "";
+                  return `
+                    <div class="lr-kpi-card" style="grid-column:1/-1;">
+                      <div class="lr-kpi-label">⚡ Alpha Flow &amp; Positioning (VWAP / Taker Buy / Funding / OI — Observe-Only)</div>
+                      ${hasVwap ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Intraday VWAP:</strong> ${renderChips(of.vwapBuckets)}</div>` : ""}
+                      ${hasTaker ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>True Taker Buy 3h:</strong> ${renderChips(of.takerBuyBuckets)}</div>` : ""}
+                      ${hasFunding ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Funding Rate:</strong> ${renderChips(of.fundingBuckets)}</div>` : ""}
+                      ${hasOi ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>OI 4h Delta:</strong> ${renderChips(of.oiDeltaBuckets)}</div>` : ""}
+                    </div>
+                  `;
+                })()}
               `;
             })()}
           `;

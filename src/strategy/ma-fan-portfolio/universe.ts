@@ -5,6 +5,7 @@ import { calcMACD, calcRSI } from "../ma-fan/exhaustion.js";
 import { fetchAlpacaBars, fetchAlpacaMultiBars, fetchAlpacaMultiSnapshots, intervalToSeconds, isUsRegularTradingHoursBar, normalizeStockSymbol } from "../../exchange/alpaca/feed.js";
 import { getActiveBinanceTradingSymbols } from "../../exchange/binance/client.js";
 import { STABLE_TOKENS } from "../../backtest-service.js";
+import { lookupCausalFundingBpsAt, lookupCausalOiDelta4hPctAt } from "../../learning-engine.js";
 import { isSyntheticOrStock } from "../../pair-rotator.js";
 import { filterChangedCandles, mergeCandles, type PgStore } from "../../pg-store.js";
 import type { SymbolIndicatorSnapshot } from "./types.js";
@@ -80,6 +81,8 @@ async function fetchBinanceKlinesSimple(
       low: Number(k[3]),
       close: Number(k[4]),
       volume: Number(k[5] ?? 0),
+      quoteVolume: Number(k[7] ?? 0),
+      takerBuyQuoteVolume: Number(k[10] ?? 0),
       isClosed: Number(k[6]) < nowMs,
     }))
     .filter((c) => Number.isFinite(c.time) && Number.isFinite(c.close) && c.close > 0);
@@ -376,7 +379,10 @@ export async function fetchPortfolioUniverseAndBenchmark(opts: {
     const ivSec = intervalToSeconds(tf);
     const nowSec = Math.floor(Date.now() / 1000);
     const lastT = prev.length >= targetLimit ? prev[prev.length - 1]?.time || 0 : 0;
-    const canIncremental = lastT > 0 && nowSec - lastT < ivSec * 800;
+    const recentSample = prev.slice(-Math.min(prev.length, 200));
+    const takerPopulated = recentSample.filter((c) => typeof c.quoteVolume === "number" && Number.isFinite(c.quoteVolume)).length;
+    const hasTakerData = recentSample.length > 0 && takerPopulated >= Math.floor(recentSample.length * 0.8);
+    const canIncremental = lastT > 0 && hasTakerData && nowSec - lastT < ivSec * 800;
     const startTimeMs = canIncremental ? Math.max(1, (lastT - ivSec * 3) * 1000) : undefined;
     const fetchLimit = canIncremental ? Math.min(1000, Math.max(5, Math.ceil((nowSec - lastT) / ivSec) + 5)) : targetLimit;
     const incoming = await fetchBinanceKlinesSimple(sym, tf, fetchLimit, baseUrl, startTimeMs);
@@ -504,3 +510,125 @@ export function evaluateBenchmarkSitOut(opts: {
     reason,
   };
 }
+
+export interface FundingRatePoint {
+  timeMs: number;
+  fundingRateBps: number;
+}
+
+export interface OpenInterestPoint {
+  timeMs: number;
+  openInterestValueUsd: number;
+}
+
+/**
+ * Best-effort public Binance USDT-M Futures cache for Funding Rate & Open Interest History (Observe-Only).
+ */
+export class BinanceDerivativesCache {
+  private fundingMap = new Map<string, FundingRatePoint[]>();
+  private oiMap = new Map<string, OpenInterestPoint[]>();
+  private lastFetchMs = new Map<string, number>();
+  private refreshInFlight: Promise<void> | null = null;
+  private readonly refreshIntervalMs = 15 * 60 * 1000;
+
+  public getFundingMap(): Map<string, FundingRatePoint[]> {
+    return this.fundingMap;
+  }
+
+  public getOiMap(): Map<string, OpenInterestPoint[]> {
+    return this.oiMap;
+  }
+
+  public getLatestAt(
+    symbol: string,
+    barTimeSec: number,
+  ): { fundingRateBps: number | null; oiDelta4hPct: number | null } {
+    const sym = symbol.toUpperCase().trim();
+    return {
+      fundingRateBps: lookupCausalFundingBpsAt(this.fundingMap.get(sym), barTimeSec),
+      oiDelta4hPct: lookupCausalOiDelta4hPctAt(this.oiMap.get(sym), barTimeSec),
+    };
+  }
+
+  public async refreshSymbols(symbols: string[], opts?: { force?: boolean; limit?: number }): Promise<void> {
+    if (this.refreshInFlight) {
+      await this.refreshInFlight;
+      return;
+    }
+    const clean = Array.from(new Set(symbols.map((s) => s.toUpperCase().trim()).filter((s) => s.endsWith("USDT"))));
+    const now = Date.now();
+    const due = clean.filter((sym) => opts?.force || now - (this.lastFetchMs.get(sym) ?? 0) >= this.refreshIntervalMs);
+    if (due.length === 0) return;
+
+    const lim = Math.max(24, Math.min(500, Math.round(opts?.limit ?? 200)));
+    this.refreshInFlight = (async () => {
+      try {
+        const batchSize = 4;
+        for (let i = 0; i < due.length; i += batchSize) {
+          const chunk = due.slice(i, i + batchSize);
+          await Promise.all(
+            chunk.map(async (sym) => {
+              this.lastFetchMs.set(sym, Date.now());
+              try {
+                const [fRes, oRes] = await Promise.all([
+                  fetch(`https://fapi.binance.com/fapi/v1/fundingRate?symbol=${encodeURIComponent(sym)}&limit=${lim}`, {
+                    signal: AbortSignal.timeout(6000),
+                  }).catch(() => null),
+                  fetch(
+                    `https://fapi.binance.com/futures/data/openInterestHist?symbol=${encodeURIComponent(sym)}&period=1h&limit=${lim}`,
+                    { signal: AbortSignal.timeout(6000) },
+                  ).catch(() => null),
+                ]);
+
+                if (fRes && fRes.ok) {
+                  const fRaw = (await fRes.json()) as Array<{ fundingTime?: number | string; fundingRate?: number | string }>;
+                  if (Array.isArray(fRaw)) {
+                    const parsed: FundingRatePoint[] = fRaw
+                      .map((r) => ({
+                        timeMs: Number(r.fundingTime),
+                        fundingRateBps: Number(r.fundingRate) * 10000,
+                      }))
+                      .filter((p) => Number.isFinite(p.timeMs) && p.timeMs > 0 && Number.isFinite(p.fundingRateBps))
+                      .sort((a, b) => a.timeMs - b.timeMs);
+                    if (parsed.length > 0) this.fundingMap.set(sym, parsed);
+                  }
+                }
+
+                if (oRes && oRes.ok) {
+                  const oRaw = (await oRes.json()) as Array<{
+                    timestamp?: number | string;
+                    sumOpenInterestValue?: number | string;
+                  }>;
+                  if (Array.isArray(oRaw)) {
+                    const parsed: OpenInterestPoint[] = oRaw
+                      .map((r) => ({
+                        timeMs: Number(r.timestamp),
+                        openInterestValueUsd: Number(r.sumOpenInterestValue),
+                      }))
+                      .filter(
+                        (p) =>
+                          Number.isFinite(p.timeMs) &&
+                          p.timeMs > 0 &&
+                          Number.isFinite(p.openInterestValueUsd) &&
+                          p.openInterestValueUsd > 0,
+                      )
+                      .sort((a, b) => a.timeMs - b.timeMs);
+                    if (parsed.length > 0) this.oiMap.set(sym, parsed);
+                  }
+                }
+              } catch {
+                // Best-effort observe-only enrichment; non-perp spot pairs cleanly skip
+              }
+            }),
+          );
+        }
+      } finally {
+        this.refreshInFlight = null;
+      }
+    })();
+
+    await this.refreshInFlight;
+  }
+}
+
+export const binanceDerivativesCache = new BinanceDerivativesCache();

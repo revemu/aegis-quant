@@ -55,6 +55,12 @@ export function filterChangedCandles(existing: Candle[], incoming: Candle[]): Ca
       prev.low !== c.low ||
       prev.close !== c.close ||
       (prev.volume ?? 0) !== (c.volume ?? 0) ||
+      (c.quoteVolume != null &&
+        Number.isFinite(c.quoteVolume) &&
+        (prev.quoteVolume ?? null) !== c.quoteVolume) ||
+      (c.takerBuyQuoteVolume != null &&
+        Number.isFinite(c.takerBuyQuoteVolume) &&
+        (prev.takerBuyQuoteVolume ?? null) !== c.takerBuyQuoteVolume) ||
       (prev.isClosed !== false) !== (c.isClosed !== false)
     ) {
       changed.push({ ...c, time: t });
@@ -242,10 +248,22 @@ export class PgStore {
         low DOUBLE PRECISION NOT NULL,
         close DOUBLE PRECISION NOT NULL,
         volume DOUBLE PRECISION NOT NULL DEFAULT 0,
+        quote_volume DOUBLE PRECISION,
+        taker_buy_quote DOUBLE PRECISION,
         is_closed BOOLEAN NOT NULL DEFAULT TRUE,
         updated_at BIGINT NOT NULL,
         PRIMARY KEY (exchange, symbol, timeframe, time_sec)
       )
+    `;
+
+    await this.sql`
+      ALTER TABLE market_candles
+      ADD COLUMN IF NOT EXISTS quote_volume DOUBLE PRECISION
+    `;
+
+    await this.sql`
+      ALTER TABLE market_candles
+      ADD COLUMN IF NOT EXISTS taker_buy_quote DOUBLE PRECISION
     `;
 
     await this.sql`
@@ -725,6 +743,8 @@ export class PgStore {
       low: number;
       close: number;
       volume: number;
+      quote_volume: number | null;
+      taker_buy_quote: number | null;
       is_closed: boolean;
     };
 
@@ -738,6 +758,8 @@ export class PgStore {
           low,
           close,
           volume,
+          quote_volume,
+          taker_buy_quote,
           is_closed,
           ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY time_sec DESC) AS rn
         FROM market_candles
@@ -745,7 +767,7 @@ export class PgStore {
           AND timeframe = ${tf}
           AND symbol IN ${this.sql(cleanSyms)}
       )
-      SELECT symbol, time_sec, open, high, low, close, volume, is_closed
+      SELECT symbol, time_sec, open, high, low, close, volume, quote_volume, taker_buy_quote, is_closed
       FROM ranked
       WHERE rn <= ${safeLimit}
       ORDER BY symbol ASC, time_sec ASC
@@ -760,6 +782,8 @@ export class PgStore {
         list = [];
         result.set(sym, list);
       }
+      const qv = r.quote_volume !== null && r.quote_volume !== undefined ? Number(r.quote_volume) : NaN;
+      const tbq = r.taker_buy_quote !== null && r.taker_buy_quote !== undefined ? Number(r.taker_buy_quote) : NaN;
       list.push({
         time,
         open: Number(r.open),
@@ -767,6 +791,8 @@ export class PgStore {
         low: Number(r.low),
         close: Number(r.close),
         volume: Number(r.volume ?? 0),
+        ...(Number.isFinite(qv) ? { quoteVolume: qv } : {}),
+        ...(Number.isFinite(tbq) ? { takerBuyQuoteVolume: tbq } : {}),
         isClosed: Boolean(r.is_closed),
       });
     }
@@ -801,6 +827,8 @@ export class PgStore {
         low: number;
         close: number;
         volume: number;
+        quote_volume: number | null;
+        taker_buy_quote: number | null;
         is_closed: boolean;
         updated_at: number;
       }
@@ -819,6 +847,16 @@ export class PgStore {
         const low = Number(c?.low);
         const close = Number(c?.close);
         const volume = Number.isFinite(Number(c?.volume)) ? Number(c?.volume) : 0;
+        const quote_volume =
+          typeof c?.quoteVolume === "number" && Number.isFinite(c.quoteVolume) && c.quoteVolume >= 0
+            ? c.quoteVolume
+            : null;
+        const taker_buy_quote =
+          typeof c?.takerBuyQuoteVolume === "number" &&
+          Number.isFinite(c.takerBuyQuoteVolume) &&
+          c.takerBuyQuoteVolume >= 0
+            ? c.takerBuyQuoteVolume
+            : null;
         if (
           !Number.isFinite(timeSec) ||
           !Number.isFinite(open) ||
@@ -840,6 +878,8 @@ export class PgStore {
           low,
           close,
           volume,
+          quote_volume,
+          taker_buy_quote,
           is_closed: c.isClosed !== false,
           updated_at: nowMs,
         });
@@ -851,7 +891,7 @@ export class PgStore {
 
     await this.sql.begin(async (tx) => {
       const q = tx as unknown as Sql;
-      // 11 columns/row * 500 rows = 5,500 params, safely under Postgres's 65,535 param cap
+      // 13 columns/row * 500 rows = 6,500 params, safely under Postgres's 65,535 param cap
       for (let i = 0; i < rows.length; i += 500) {
         const chunk = rows.slice(i, i + 500);
         await q`
@@ -866,6 +906,8 @@ export class PgStore {
             "low",
             "close",
             "volume",
+            "quote_volume",
+            "taker_buy_quote",
             "is_closed",
             "updated_at",
           )}
@@ -875,6 +917,8 @@ export class PgStore {
             low = EXCLUDED.low,
             close = EXCLUDED.close,
             volume = EXCLUDED.volume,
+            quote_volume = COALESCE(EXCLUDED.quote_volume, market_candles.quote_volume),
+            taker_buy_quote = COALESCE(EXCLUDED.taker_buy_quote, market_candles.taker_buy_quote),
             is_closed = EXCLUDED.is_closed,
             updated_at = EXCLUDED.updated_at
         `;

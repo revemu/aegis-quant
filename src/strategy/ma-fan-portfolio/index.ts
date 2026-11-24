@@ -16,6 +16,8 @@ import {
   calcCandleAtrPct14,
   calcRollingReturnCorrelation,
   computeDailyMacroRegimeAt,
+  computeIntradayVwapDistPctAt,
+  computeTrueTakerBuyPct12At,
   computeUsdStrength5dAt,
   isGapInducedBar,
   isOpeningSession45mBar,
@@ -33,6 +35,7 @@ import type {
   SymbolIndicatorSnapshot,
 } from "./types.js";
 import {
+  binanceDerivativesCache,
   buildSymbolIndicators,
   evaluateBenchmarkSitOut,
   fetchPortfolioUniverseAndBenchmark,
@@ -774,6 +777,11 @@ export class MaFanPortfolioStrategy implements IStrategy {
   }
 
   public async runLearningShadowScan(force = true) {
+    const syms = Array.from(this.snapshots.keys());
+    const isBinance = this.exchange.exchangeName === "binance";
+    if (isBinance && syms.length > 0) {
+      await binanceDerivativesCache.refreshSymbols(syms, { force }).catch(() => {});
+    }
     const baseMinVolR = Number.isFinite(Number(this.cfg.portfolioMinBuyVolRatio))
       ? Number(this.cfg.portfolioMinBuyVolRatio)
       : 1.3;
@@ -785,7 +793,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       : 40;
     const summary = await this.learning.runShadowWalkForward({
       exchange: this.exchange.exchangeName,
-      symbols: Array.from(this.snapshots.keys()),
+      symbols: syms,
       benchmarkSymbol: this.benchmarkSymbol,
       slPct: Number(this.cfg.portfolioDisasterSlPct ?? 3.5),
       tpMode: this.cfg.portfolioTp1TargetMode,
@@ -800,6 +808,12 @@ export class MaFanPortfolioStrategy implements IStrategy {
       benchmarkFallback1d: this.benchmark1d,
       usdProxySymbol: this.usdProxySymbol,
       usdProxyFallback1d: this.usdProxy1d,
+      ...(isBinance
+        ? {
+            fundingBySymbol: binanceDerivativesCache.getFundingMap(),
+            oiBySymbol: binanceDerivativesCache.getOiMap(),
+          }
+        : {}),
       force,
     });
     await this.learning.applyAutonomousTuning(this.cfg, (patch) => this.updateRuntimeSettings(patch)).catch(() => {});
@@ -1237,6 +1251,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
     this.lastUniverseFetchTs = Date.now();
     this.syncAlpacaWsSubscriptions();
     this.emitInspectedChartCandles({ force: true, includeNewlyClosed: true });
+
+    if (this.exchange.exchangeName === "binance" && res.symbols.length > 0 && this.initialLearningBootstrapDone) {
+      void binanceDerivativesCache.refreshSymbols(res.symbols).catch(() => {});
+    }
 
     if (!this.initialLearningBootstrapDone && this.snapshots.size > 0) {
       this.initialLearningBootstrapDone = true;
@@ -1971,6 +1989,12 @@ export class MaFanPortfolioStrategy implements IStrategy {
       benchmarkFallback1d: this.benchmark1d,
       usdProxySymbol: this.usdProxySymbol,
       usdProxyFallback1d: this.usdProxy1d,
+      ...(this.exchange.exchangeName === "binance"
+        ? {
+            fundingBySymbol: binanceDerivativesCache.getFundingMap(),
+            oiBySymbol: binanceDerivativesCache.getOiMap(),
+          }
+        : {}),
     });
 
     if (canExecute && freeSlots > 0 && sizeScale > 0 && !sitOutEval.isSitOut && entryCandidates.length > 0) {
@@ -2035,6 +2059,11 @@ export class MaFanPortfolioStrategy implements IStrategy {
             ? ((chClosedBar.high - Math.max(chClosedBar.open, chClosedBar.close)) / (chClosedBar.high - chClosedBar.low)) * 100
             : 0;
         const barTimeSec = chClosedBar?.time || Math.floor(Date.now() / 1000);
+        const liveVwapDistPct = isAlpaca && chInd ? computeIntradayVwapDistPctAt(chInd.c15, chInd.lastClosedIdx) : null;
+        const liveTakerBuyPct12 = !isAlpaca && chInd ? computeTrueTakerBuyPct12At(chInd.c15, chInd.lastClosedIdx) : null;
+        const liveDerivs = !isAlpaca
+          ? binanceDerivativesCache.getLatestAt(ch.sym, barTimeSec)
+          : { fundingRateBps: null, oiDelta4hPct: null };
         await this.executeEntrySlot(
           ch.sym,
           ch.price,
@@ -2059,6 +2088,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
             mayerMultiple: liveMacro1d?.mayerMultiple ?? null,
             macroRiskIndex: liveMacro1d?.macroRiskIndex ?? null,
             usdRet5dPct: liveUsdRet5dPct ?? null,
+            vwapDistPct: liveVwapDistPct,
+            takerBuyPct12: liveTakerBuyPct12,
+            fundingRateBps: liveDerivs.fundingRateBps,
+            oiDelta4hPct: liveDerivs.oiDelta4hPct,
           },
         );
       }
@@ -2158,6 +2191,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
       mayerMultiple?: number | null;
       macroRiskIndex?: number | null;
       usdRet5dPct?: number | null;
+      vwapDistPct?: number | null;
+      takerBuyPct12?: number | null;
+      fundingRateBps?: number | null;
+      oiDelta4hPct?: number | null;
     },
   ): Promise<void> {
     const usedIdx = new Set(this.slots.map((s) => s.slotIndex));

@@ -125,6 +125,10 @@ export interface ShadowObserveFactorsSummary {
   mayerBuckets?: Record<string, BucketMetric>;
   macroRiskBuckets?: Record<string, BucketMetric>;
   usdStrengthBuckets?: Record<string, BucketMetric>;
+  vwapBuckets?: Record<string, BucketMetric>;
+  takerBuyBuckets?: Record<string, BucketMetric>;
+  fundingBuckets?: Record<string, BucketMetric>;
+  oiDeltaBuckets?: Record<string, BucketMetric>;
   latestMacroRegime?: LatestMacroRegimeSnapshot | null;
 }
 
@@ -213,6 +217,8 @@ export interface ShadowWalkForwardContext {
   benchmarkFallback1d?: Candle[];
   usdProxySymbol?: string;
   usdProxyFallback1d?: Candle[];
+  fundingBySymbol?: Map<string, Array<{ timeMs: number; fundingRateBps: number }>>;
+  oiBySymbol?: Map<string, Array<{ timeMs: number; openInterestValueUsd: number }>>;
   force?: boolean;
 }
 
@@ -740,6 +746,165 @@ export function computeUsdStrength5dAt(
   return Number.isFinite(retPct) ? Number(retPct.toFixed(3)) : null;
 }
 
+const nyVwapDateFmt = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "America/New_York",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+const nyVwapDateCache = new Map<number, string>();
+
+function getNyCalendarDateKey(timeSec: number): string {
+  const t = Math.floor(timeSec);
+  const hit = nyVwapDateCache.get(t);
+  if (hit) return hit;
+  const key = nyVwapDateFmt.format(new Date(t * 1000));
+  if (nyVwapDateCache.size > 20_000) nyVwapDateCache.clear();
+  nyVwapDateCache.set(t, key);
+  return key;
+}
+
+export function classifyVwapZone(vwapDistPct: number | null | undefined): string | null {
+  if (vwapDistPct === null || vwapDistPct === undefined || !Number.isFinite(vwapDistPct)) return null;
+  if (vwapDistPct < -0.5) return "BELOW_VWAP (<-0.5%)";
+  if (vwapDistPct <= 0.5) return "AT_VWAP (-0.5..+0.5%)";
+  return "ABOVE_VWAP (>+0.5%)";
+}
+
+export function classifyTakerBuyZone(takerBuyPct12: number | null | undefined): string | null {
+  if (takerBuyPct12 === null || takerBuyPct12 === undefined || !Number.isFinite(takerBuyPct12)) return null;
+  if (takerBuyPct12 < 48.5) return "SELLER_DOM (<48.5%)";
+  if (takerBuyPct12 < 51.5) return "BALANCED (48.5-51.5%)";
+  return "BUYER_DOM (>=51.5%)";
+}
+
+export function classifyFundingZone(fundingRateBps: number | null | undefined): string | null {
+  if (fundingRateBps === null || fundingRateBps === undefined || !Number.isFinite(fundingRateBps)) return null;
+  if (fundingRateBps < 0) return "NEG_FUNDING (<0 bps)";
+  if (fundingRateBps <= 1.0) return "NEUTRAL_FUND (0-1 bps)";
+  return "CROWDED_LONG (>+1 bps)";
+}
+
+export function classifyOiDeltaZone(oiDelta4hPct: number | null | undefined): string | null {
+  if (oiDelta4hPct === null || oiDelta4hPct === undefined || !Number.isFinite(oiDelta4hPct)) return null;
+  if (oiDelta4hPct < -1.0) return "OI_FLUSH (<-1%)";
+  if (oiDelta4hPct <= 1.0) return "OI_FLAT (-1..+1%)";
+  return "OI_BUILD (>+1%)";
+}
+
+/**
+ * Strictly causal Intraday Anchored VWAP% distance at bar `idx` (resets per America/New_York calendar day).
+ */
+export function computeIntradayVwapDistPctAt(c15: Candle[], idx: number): number | null {
+  if (!c15 || idx < 0 || idx >= c15.length) return null;
+  const cur = c15[idx];
+  if (!cur || !Number.isFinite(cur.time) || !Number.isFinite(cur.close) || cur.close <= 0) return null;
+  const dayKey = getNyCalendarDateKey(cur.time);
+  let pvSum = 0;
+  let volSum = 0;
+  for (let i = idx; i >= 0; i--) {
+    const b = c15[i]!;
+    if (!b || !Number.isFinite(b.time)) continue;
+    if (getNyCalendarDateKey(b.time) !== dayKey) break;
+    const vol = Number(b.volume);
+    if (!Number.isFinite(vol) || vol <= 0) continue;
+    const tp = (b.high + b.low + b.close) / 3;
+    if (!Number.isFinite(tp) || tp <= 0) continue;
+    pvSum += tp * vol;
+    volSum += vol;
+  }
+  if (volSum <= 0 || pvSum <= 0) return null;
+  const vwap = pvSum / volSum;
+  const distPct = ((cur.close - vwap) / vwap) * 100;
+  return Number.isFinite(distPct) ? Number(distPct.toFixed(3)) : null;
+}
+
+/**
+ * Strictly causal trailing `lookback`-bar (default 12 = 3h) True Taker Buy% from Binance spot kline takerBuyQuoteVolume / quoteVolume.
+ * Returns null cleanly when bars lack taker volume fields (e.g. US stocks).
+ */
+export function computeTrueTakerBuyPct12At(c15: Candle[], endIdx: number, lookback = 12): number | null {
+  if (!c15 || endIdx < 0 || endIdx >= c15.length || lookback <= 0) return null;
+  const start = Math.max(0, endIdx - lookback + 1);
+  let totalQuote = 0;
+  let totalTakerBuy = 0;
+  let validBars = 0;
+  for (let i = start; i <= endIdx; i++) {
+    const b = c15[i]!;
+    const qv = b?.quoteVolume;
+    const tbq = b?.takerBuyQuoteVolume;
+    if (
+      typeof qv === "number" &&
+      Number.isFinite(qv) &&
+      qv > 0 &&
+      typeof tbq === "number" &&
+      Number.isFinite(tbq) &&
+      tbq >= 0
+    ) {
+      totalQuote += qv;
+      totalTakerBuy += tbq;
+      validBars++;
+    }
+  }
+  if (validBars < Math.min(6, lookback) || totalQuote <= 0) return null;
+  const pct = clamp((totalTakerBuy / totalQuote) * 100, 0, 100);
+  return Number.isFinite(pct) ? Number(pct.toFixed(2)) : null;
+}
+
+/**
+ * Zero-lookahead causal lookup for latest Binance Futures Funding Rate (bps) published at or before `barTimeSec`.
+ */
+export function lookupCausalFundingBpsAt(
+  series: ReadonlyArray<{ timeMs: number; fundingRateBps: number }> | undefined,
+  barTimeSec: number,
+): number | null {
+  if (!series || series.length === 0 || !Number.isFinite(barTimeSec) || barTimeSec <= 0) return null;
+  const barMs = normalizeTsMs(barTimeSec);
+  for (let i = series.length - 1; i >= 0; i--) {
+    const pt = series[i]!;
+    if (pt.timeMs <= barMs) {
+      if (barMs - pt.timeMs <= 24 * 3_600_000 && Number.isFinite(pt.fundingRateBps)) {
+        return Number(pt.fundingRateBps.toFixed(3));
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Zero-lookahead causal lookup for 1h -> 4h Open Interest USD Delta% where latest hourly bar has closed (`timeMs + 3600_000 <= barMs`).
+ */
+export function lookupCausalOiDelta4hPctAt(
+  series: ReadonlyArray<{ timeMs: number; openInterestValueUsd: number }> | undefined,
+  barTimeSec: number,
+): number | null {
+  if (!series || series.length < 2 || !Number.isFinite(barTimeSec) || barTimeSec <= 0) return null;
+  const barMs = normalizeTsMs(barTimeSec);
+  let curIdx = -1;
+  for (let i = series.length - 1; i >= 0; i--) {
+    if (series[i]!.timeMs + 3_600_000 <= barMs) {
+      curIdx = i;
+      break;
+    }
+  }
+  if (curIdx <= 0) return null;
+  const cur = series[curIdx]!;
+  if (barMs - (cur.timeMs + 3_600_000) > 4 * 3_600_000 || cur.openInterestValueUsd <= 0) return null;
+  const targetPrevMs = cur.timeMs - 4 * 3_600_000;
+  for (let j = curIdx - 1; j >= 0; j--) {
+    const prev = series[j]!;
+    if (prev.timeMs <= targetPrevMs) {
+      if (targetPrevMs - prev.timeMs <= 2 * 3_600_000 && prev.openInterestValueUsd > 0) {
+        const deltaPct = ((cur.openInterestValueUsd - prev.openInterestValueUsd) / prev.openInterestValueUsd) * 100;
+        return Number.isFinite(deltaPct) ? Number(deltaPct.toFixed(3)) : null;
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
 export interface ObserveSetupInput {
   entryTimeSec: number;
   score: number;
@@ -754,6 +919,10 @@ export interface ObserveSetupInput {
   mayerMultiple?: number | null;
   macroRiskIndex?: number | null;
   usdRet5dPct?: number | null;
+  vwapDistPct?: number | null;
+  takerBuyPct12?: number | null;
+  fundingRateBps?: number | null;
+  oiDelta4hPct?: number | null;
   checkpointRetPct?: Record<number, number | null>;
 }
 
@@ -798,6 +967,10 @@ export function computeObserveFactorsFromSetups(setups: ObserveSetupInput[]): Sh
   const mayerMap = tally();
   const macroRiskMap = tally();
   const usdMap = tally();
+  const vwapMap = tally();
+  const takerMap = tally();
+  const fundingMap = tally();
+  const oiMap = tally();
 
   for (const s of setups) {
     const scoreKey = s.score < 30 ? "<30" : s.score < 50 ? "30-50" : s.score < 70 ? "50-70" : ">=70";
@@ -845,6 +1018,18 @@ export function computeObserveFactorsFromSetups(setups: ObserveSetupInput[]): Sh
 
     const usdZone = classifyUsdZone(s.usdRet5dPct ?? null);
     if (usdZone) bump(usdMap, usdZone, s.pnlPct);
+
+    const vwapZone = classifyVwapZone(s.vwapDistPct ?? null);
+    if (vwapZone) bump(vwapMap, vwapZone, s.pnlPct);
+
+    const takerZone = classifyTakerBuyZone(s.takerBuyPct12 ?? null);
+    if (takerZone) bump(takerMap, takerZone, s.pnlPct);
+
+    const fundingZone = classifyFundingZone(s.fundingRateBps ?? null);
+    if (fundingZone) bump(fundingMap, fundingZone, s.pnlPct);
+
+    const oiZone = classifyOiDeltaZone(s.oiDelta4hPct ?? null);
+    if (oiZone) bump(oiMap, oiZone, s.pnlPct);
   }
 
   const cpDefs = [
@@ -898,6 +1083,10 @@ export function computeObserveFactorsFromSetups(setups: ObserveSetupInput[]): Sh
     mayerBuckets: toRec(mayerMap, ["DEEP_BEAR (<0.9)", "BELOW_200D (0.9-1.0)", "HEALTHY_BULL (1.0-1.25)", "OVERHEATED (>=1.25)"]),
     macroRiskBuckets: toRec(macroRiskMap, ["CALM (<35)", "ELEVATED (35-65)", "HIGH (>=65)"]),
     usdStrengthBuckets: toRec(usdMap, ["USD_WEAK (<-0.5%)", "USD_FLAT (-0.5..+0.5%)", "USD_SURGE (>+0.5%)"]),
+    vwapBuckets: toRec(vwapMap, ["BELOW_VWAP (<-0.5%)", "AT_VWAP (-0.5..+0.5%)", "ABOVE_VWAP (>+0.5%)"]),
+    takerBuyBuckets: toRec(takerMap, ["SELLER_DOM (<48.5%)", "BALANCED (48.5-51.5%)", "BUYER_DOM (>=51.5%)"]),
+    fundingBuckets: toRec(fundingMap, ["NEG_FUNDING (<0 bps)", "NEUTRAL_FUND (0-1 bps)", "CROWDED_LONG (>+1 bps)"]),
+    oiDeltaBuckets: toRec(oiMap, ["OI_FLUSH (<-1%)", "OI_FLAT (-1..+1%)", "OI_BUILD (>+1%)"]),
   };
 }
 
@@ -1731,6 +1920,10 @@ export class LearningEngine {
       mayerMultiple?: number | null;
       macroRiskIndex?: number | null;
       usdRet5dPct?: number | null;
+      vwapDistPct?: number | null;
+      takerBuyPct12?: number | null;
+      fundingRateBps?: number | null;
+      oiDelta4hPct?: number | null;
     };
   }): Promise<string> {
     const sym = params.symbol.toUpperCase();
@@ -1801,6 +1994,18 @@ export class LearningEngine {
                 : {}),
               ...(typeof oc.usdRet5dPct === "number" && Number.isFinite(oc.usdRet5dPct)
                 ? { usdRet5dPct: Number(oc.usdRet5dPct.toFixed(3)) }
+                : {}),
+              ...(typeof oc.vwapDistPct === "number" && Number.isFinite(oc.vwapDistPct)
+                ? { vwapDistPct: Number(oc.vwapDistPct.toFixed(3)) }
+                : {}),
+              ...(typeof oc.takerBuyPct12 === "number" && Number.isFinite(oc.takerBuyPct12)
+                ? { takerBuyPct12: Number(oc.takerBuyPct12.toFixed(2)) }
+                : {}),
+              ...(typeof oc.fundingRateBps === "number" && Number.isFinite(oc.fundingRateBps)
+                ? { fundingRateBps: Number(oc.fundingRateBps.toFixed(3)) }
+                : {}),
+              ...(typeof oc.oiDelta4hPct === "number" && Number.isFinite(oc.oiDelta4hPct)
+                ? { oiDelta4hPct: Number(oc.oiDelta4hPct.toFixed(3)) }
                 : {}),
             }
           : {}),
@@ -2682,6 +2887,8 @@ export class LearningEngine {
                 });
                 const dMacro = p1d >= 0 ? bench1dRegimes[p1d] : undefined;
                 const dUsdRet = pUsd >= 0 ? usd1dRets[pUsd] : null;
+                const symFundingSeries = !isAlpaca ? opts.fundingBySymbol?.get(coin.symbol) : undefined;
+                const symOiSeries = !isAlpaca ? opts.oiBySymbol?.get(coin.symbol) : undefined;
                 observeSetupRecords.push({
                   entryTimeSec: c.time,
                   score: candScore,
@@ -2696,6 +2903,10 @@ export class LearningEngine {
                   mayerMultiple: dMacro?.mayerMultiple ?? null,
                   macroRiskIndex: dMacro?.macroRiskIndex ?? null,
                   usdRet5dPct: dUsdRet ?? null,
+                  vwapDistPct: isAlpaca ? computeIntradayVwapDistPctAt(coin.c15, prev) : null,
+                  takerBuyPct12: !isAlpaca ? computeTrueTakerBuyPct12At(coin.c15, prev) : null,
+                  fundingRateBps: !isAlpaca ? lookupCausalFundingBpsAt(symFundingSeries, c.time) : null,
+                  oiDelta4hPct: !isAlpaca ? lookupCausalOiDelta4hPctAt(symOiSeries, c.time) : null,
                   checkpointRetPct: sim.checkpointRetPct,
                 });
 
