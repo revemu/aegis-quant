@@ -451,6 +451,7 @@ export function evaluateBenchmarkSitOut(opts: {
   benchmark1d: Candle[];
   benchmark15m: Candle[];
   sitOutMode: Config["portfolioSitOutMode"];
+  breadthPct?: number;
 }): {
   isSitOut: boolean;
   pass4h: boolean;
@@ -476,9 +477,11 @@ export function evaluateBenchmarkSitOut(opts: {
   const pass1d = val1d25 !== undefined && last1d ? last1d.close >= val1d25 : true;
   const gap4hPct = val4h75 && val4h75 > 0 && last4h ? ((last4h.close - val4h75) / val4h75) * 100 : undefined;
   const gap1dPct = val1d25 && val1d25 > 0 && last1d ? ((last1d.close - val1d25) / val1d25) * 100 : undefined;
+  const breadthVal = Number.isFinite(Number(opts.breadthPct)) ? Number(opts.breadthPct) : 50;
 
   let isSitOut = false;
   if (opts.sitOutMode === "dual") isSitOut = !pass4h || !pass1d;
+  else if (opts.sitOutMode === "breadth_35") isSitOut = (!pass4h || !pass1d) && breadthVal < 35;
   else if (opts.sitOutMode === "btc1d") isSitOut = !pass1d;
   else if (opts.sitOutMode === "btc4h") isSitOut = !pass4h;
 
@@ -490,6 +493,12 @@ export function evaluateBenchmarkSitOut(opts: {
   let reason = `${opts.benchmarkSymbol} Bullish (Entries Allowed)`;
   if (opts.sitOutMode === "off") {
     reason = `Macro Gate OFF (${opts.benchmarkSymbol}: $${benchmarkPrice.toFixed(2)})`;
+  } else if (opts.sitOutMode === "breadth_35") {
+    if (isSitOut) {
+      reason = `Macro Sit-Out (${opts.benchmarkSymbol} Bear & Breadth ${breadthVal.toFixed(0)}% < 35%)`;
+    } else if (!pass4h || !pass1d) {
+      reason = `${opts.benchmarkSymbol} Bear — Breadth ${breadthVal.toFixed(0)}% ≥ 35% (Rebound Entries Allowed)`;
+    }
   } else if (isSitOut) {
     const fails: string[] = [];
     if (!pass4h && (opts.sitOutMode === "dual" || opts.sitOutMode === "btc4h")) fails.push("4H < EMA75");

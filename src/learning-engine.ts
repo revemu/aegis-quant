@@ -1273,7 +1273,9 @@ export function evaluateBreadthSitOutOos(
     (a, b) => b.testAvgPnlPct - a.testAvgPnlPct || b.testProfitFactor - a.testProfitFactor,
   );
   const best = ranked[0] || modes[0]!;
-  const curNorm = currentSitOutMode === "off" || currentSitOutMode === "dual" ? currentSitOutMode : "dual";
+  const curNorm = ["off", "breadth_20", "breadth_35", "breadth_50", "dual"].includes(currentSitOutMode)
+    ? currentSitOutMode
+    : "dual";
   const curRes = modes.find((m) => m.mode === curNorm) || modes[modes.length - 1]!;
   const verdict =
     testSetups.length < 5

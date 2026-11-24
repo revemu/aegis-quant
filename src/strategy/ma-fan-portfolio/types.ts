@@ -2,7 +2,7 @@ import type { Candle } from "../../market-structure.js";
 
 export type PortfolioUniversePreset = "us_top49" | "us_top25" | "custom";
 export type PortfolioTp1Mode = "EMA25" | "EMA75" | "EMA200" | "none";
-export type PortfolioSitOutMode = "off" | "btc1d" | "btc4h" | "dual";
+export type PortfolioSitOutMode = "off" | "btc1d" | "btc4h" | "dual" | "breadth_35";
 export type PortfolioRankBy = "COMPOSITE_QUALITY" | "RSI15";
 
 export interface SymbolIndicatorSnapshot {

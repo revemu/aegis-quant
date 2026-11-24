@@ -436,8 +436,8 @@ export const defaultStrategyConfig = {
   portfolioStaleExitMaxGainPct: 0.3,
   /** Minimum required distance % to EMA200 before opening a new slot (0 = disabled). */
   portfolioMinRoomToEma200Pct: 0,
-  /** Macro sit-out benchmark guard: "dual" (recommended), "btc1d", "btc4h", or "off". */
-  portfolioSitOutMode: "dual" as "off" | "btc1d" | "btc4h" | "dual",
+  /** Macro sit-out benchmark guard: "dual", "breadth_35" (Bear & Breadth < 35%), "btc1d", "btc4h", or "off". */
+  portfolioSitOutMode: "dual" as "off" | "btc1d" | "btc4h" | "dual" | "breadth_35",
   /** Candidate ranking priority when multiple setups trigger on the same 15m bar. */
   portfolioRankBy: "COMPOSITE_QUALITY" as "COMPOSITE_QUALITY" | "RSI15",
   /** Optional max hold hours per slot (0 = disabled). */
@@ -691,7 +691,7 @@ export function loadConfigFromDatabase(): typeof defaultStrategyConfig {
       if (saved.portfolioMinRoomToEma200Pct !== undefined && Number.isFinite(Number(saved.portfolioMinRoomToEma200Pct))) {
         merged.portfolioMinRoomToEma200Pct = Math.min(10.0, Math.max(0, Number(saved.portfolioMinRoomToEma200Pct)));
       }
-      if (["off", "btc1d", "btc4h", "dual"].includes(saved.portfolioSitOutMode)) {
+      if (["off", "btc1d", "btc4h", "dual", "breadth_35"].includes(saved.portfolioSitOutMode)) {
         merged.portfolioSitOutMode = saved.portfolioSitOutMode;
       }
       if (saved.portfolioRankBy === "RSI15" || saved.portfolioRankBy === "COMPOSITE_QUALITY") {

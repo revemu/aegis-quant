@@ -1356,13 +1356,6 @@ export class MaFanPortfolioStrategy implements IStrategy {
 
   private async evaluatePortfolioCycle(): Promise<void> {
     const canExecute = !this.isPaused && !this.isMarketClosed;
-    const sitOutEval = evaluateBenchmarkSitOut({
-      benchmarkSymbol: this.benchmarkSymbol,
-      benchmark4h: this.benchmark4h,
-      benchmark1d: this.benchmark1d,
-      benchmark15m: this.benchmark15m,
-      sitOutMode: this.cfg.portfolioSitOutMode || "dual",
-    });
 
     // Breadth: % of universe above EMA25 on latest closed 15m candle
     let above25 = 0;
@@ -1375,6 +1368,16 @@ export class MaFanPortfolioStrategy implements IStrategy {
         above25++;
       }
     }
+    const breadthAboveEma25Pct = totalCount > 0 ? (above25 / totalCount) * 100 : 50;
+
+    const sitOutEval = evaluateBenchmarkSitOut({
+      benchmarkSymbol: this.benchmarkSymbol,
+      benchmark4h: this.benchmark4h,
+      benchmark1d: this.benchmark1d,
+      benchmark15m: this.benchmark15m,
+      sitOutMode: this.cfg.portfolioSitOutMode || "dual",
+      breadthPct: breadthAboveEma25Pct,
+    });
 
     this.macroState = {
       benchmarkSymbol: this.benchmarkSymbol,
@@ -1383,7 +1386,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       isSitOut: sitOutEval.isSitOut,
       sitOutMode: this.cfg.portfolioSitOutMode || "dual",
       reason: sitOutEval.reason,
-      breadthAboveEma25Pct: totalCount > 0 ? (above25 / totalCount) * 100 : 50,
+      breadthAboveEma25Pct,
       universeCount: this.snapshots.size,
       pass4h: sitOutEval.pass4h,
       pass1d: sitOutEval.pass1d,

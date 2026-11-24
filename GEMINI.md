@@ -10322,3 +10322,13 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - **Causal Ablation (`OI_FLUSH`, `HEAVY_WICK`, `USD_SURGE`)**: `Half-Size USD_SURGE (>+0.5%)` ลด MaxDD และเพิ่ม PF ทุกช่วงเวลา (120d: PF `2.23 -> 2.85`, OOS 30% DD `0.97% -> 0.48%`, PF `2.63 -> 4.39`) แต่จำนวนเทรดรวมยังน้อย (`12t` บน 120d / `4t` ในช่วง OI 21d) จึงคงสถานะ Observe-Only ตามวินัย Anti-Overfit
 - **Version Bump**: **`0.3.1.15`** (`package.json`, `src/version.ts`, `public/index.html`)
 
+---
+
+## 360. Added `breadth_35` Macro Sit-Out Mode (`Bear & Breadth < 35%`) (`config.ts`, `types.ts`, `universe.ts`, `index.ts`, `learning-engine.ts`, `public/index.html`, v0.3.1.16)
+- **สาเหตุที่เพิ่ม**: Multi-Window Zero-Lookahead OOS Backtest บน Binance (`21d / 60d / 120d`, 25 เหรียญ, ค่าธรรมเนียม `0.15%`) ยืนยันว่าโหมด `dual` พักตลาดเกือบตลอดขาลง (`2t` ใน 120 วัน) ขณะที่ `breadth_35` (`(!pass4h || !pass1d) && breadth < 35%`) ทำกำไรได้สม่ำเสมอทั้ง 60d (`11t`, WR `54.5%`, `+1.48%`, PF `2.05`, MaxDD `0.97%`, SL `0`) และ 120d (`12t`, WR `58.3%`, `+1.74%`, PF `2.23`, OOS 30% `+1.43%`, PF `2.63`)
+- **สิ่งที่แก้ไข**:
+  1. [`src/config.ts`](file:///c:/Sites/github/aegis-quant/src/config.ts) & [`src/strategy/ma-fan-portfolio/types.ts`](file:///c:/Sites/github/aegis-quant/src/strategy/ma-fan-portfolio/types.ts): เพิ่ม `"breadth_35"` เข้า Type `PortfolioSitOutMode` และ Whitelist ใน `loadConfigFromDb`
+  2. [`src/strategy/ma-fan-portfolio/universe.ts`](file:///c:/Sites/github/aegis-quant/src/strategy/ma-fan-portfolio/universe.ts) (`evaluateBenchmarkSitOut`) & [`src/strategy/ma-fan-portfolio/index.ts`](file:///c:/Sites/github/aegis-quant/src/strategy/ma-fan-portfolio/index.ts) (`evaluatePortfolioCycle`): คำนวณ `breadthAboveEma25Pct` ก่อนแล้วส่งเข้า `evaluateBenchmarkSitOut` เพื่อตัดสินใจ Sit-Out เฉพาะเมื่อ Benchmark Bear (`4H < EMA75 || 1D < EMA25`) และ `breadth < 35%` พร้อมข้อความสถานะแยกชัด (`Bear & Breadth < 35%` vs `Breadth >= 35% Rebound Entries Allowed`)
+  3. [`src/learning-engine.ts`](file:///c:/Sites/github/aegis-quant/src/learning-engine.ts) (`evaluateBreadthSitOutOos`) & [`public/index.html`](file:///c:/Sites/github/aegis-quant/public/index.html): รองรับ `breadth_35` ทั้งในการเปรียบเทียบ OOS ของ Learning Engine และตัวเลือก Dropdown `#cfg_portfolioSitOutMode` บน Dashboard
+- **Version Bump**: **`0.3.1.16`** (`package.json`, `src/version.ts`, `public/index.html`)
+
