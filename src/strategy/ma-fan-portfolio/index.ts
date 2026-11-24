@@ -50,6 +50,24 @@ interface ActivePortfolioSlot extends PortfolioSlotRecord {
 }
 
 /**
+ * Resolves safe sell quantity from Alpaca live position without ever falling back to locked `liveQty` when `qtyAvailable === 0`.
+ */
+export function resolveAlpacaAvailableExitQty(
+  liveQty: number,
+  qtyAvailable: number | undefined,
+  requestedQty: number,
+  closeFullSlot: boolean,
+): number {
+  if (!Number.isFinite(liveQty) || liveQty <= 1e-6) return 0;
+  const avail =
+    typeof qtyAvailable === "number" && Number.isFinite(qtyAvailable)
+      ? Math.max(0, Math.min(liveQty, qtyAvailable))
+      : liveQty;
+  if (avail <= 1e-6) return 0;
+  return closeFullSlot ? avail : Math.min(requestedQty, avail);
+}
+
+/**
  * Counts how many closed 15m bars exist strictly after `refBarTime` up to `lastClosedIdx`.
  * Used instead of wall-clock timestamps so US equity overnight (17.5h) and weekend (65.5h) gaps
  * never falsely expire valid active MA-Fan setups.
@@ -2397,7 +2415,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
             (o) =>
               o.side === "SELL" &&
               String(o.type || "").toUpperCase() === "MARKET" &&
-              nowSec - Number(o.time || 0) < 30,
+              (o.status === "PARTIALLY_FILLED" || nowSec - Number(o.time || 0) < 120),
           );
           if (pendingSellMarket) {
             await new Promise((r) => setTimeout(r, 500));
@@ -2420,7 +2438,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
             }
           } else if (openOrders.some((o) => o.side === "SELL")) {
             await this.exchange.cancelAllOpenOrders(slot.symbol).catch(() => {});
-            await new Promise((r) => setTimeout(r, 250));
+            await new Promise((r) => setTimeout(r, 1000));
           }
         }
 
@@ -2436,9 +2454,13 @@ export class MaFanPortfolioStrategy implements IStrategy {
               await this.db.syncRecentTradesFromExchange(this.exchange, slot.symbol).catch(() => {});
             }
             slot.qty = livePos.qty;
-            const availQty = livePos.qtyAvailable > 0 ? Math.min(livePos.qty, livePos.qtyAvailable) : livePos.qty;
-            sellQty = closeFullSlot ? availQty : Math.min(sellQty, availQty);
-            if (sellQty <= 0) return false;
+            sellQty = resolveAlpacaAvailableExitQty(livePos.qty, livePos.qtyAvailable, sellQty, closeFullSlot);
+            if (sellQty <= 1e-6) {
+              slot.pendingExitOnOpen = true;
+              slot.pendingExitReason = reason;
+              this.saveState(true);
+              return false;
+            }
           }
         }
 

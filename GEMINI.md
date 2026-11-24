@@ -10332,3 +10332,14 @@ When investigating live production behavior, debugging issues, or analyzing trad
   3. [`src/learning-engine.ts`](file:///c:/Sites/github/aegis-quant/src/learning-engine.ts) (`evaluateBreadthSitOutOos`) & [`public/index.html`](file:///c:/Sites/github/aegis-quant/public/index.html): รองรับ `breadth_35` ทั้งในการเปรียบเทียบ OOS ของ Learning Engine และตัวเลือก Dropdown `#cfg_portfolioSitOutMode` บน Dashboard
 - **Version Bump**: **`0.3.1.16`** (`package.json`, `src/version.ts`, `public/index.html`)
 
+---
+
+## 361. Fix Alpaca Urgent Exit `HTTP 403` Loop (`held_for_orders`) (`src/strategy/ma-fan-portfolio/index.ts`, v0.3.1.17)
+- **สาเหตุของปัญหา (พบจาก Log สดตลาด US เปิด `21:30–21:36 น.`)**:
+  1. ใน `executeExitSlot`: `livePos.qtyAvailable > 0 ? ... : livePos.qty` — เมื่อ `qtyAvailable === 0` (หุ้นถูกล็อกโดยออเดอร์ขายที่ค้าง `NEW` / `PARTIALLY_FILLED` / `pending_cancel`) ระบบดัน fallback ไปส่งจำนวนเต็ม `livePos.qty` จนเกิด `HTTP 403 insufficient qty available` ซ้ำๆ
+  2. `pendingSellMarket` ถืออายุนานสุดเพียง `30` วินาที และหลัง `cancelAllOpenOrders` รอแค่ `250ms` ทำให้ตลาด US ช่วงเปิดตลาดสั่งยกเลิกและส่งซ้ำชนกันเอง
+- **สิ่งที่แก้ไข**:
+  1. เพิ่ม Helper `resolveAlpacaAvailableExitQty(liveQty, qtyAvailable, requestedQty, closeFullSlot)`: หาก `qtyAvailable <= 1e-6` คืน `0` ทันที (ห้าม fallback ไป `liveQty`), ตั้ง `pendingExitOnOpen = true` แล้วรอ Tick ถัดไปอย่างปลอดภัย
+  2. ขยายหน้าต่างรอ `pendingSellMarket` จาก `30s` เป็น **`120s`**, ห้ามยกเลิกออเดอร์ที่สถานะเป็น **`PARTIALLY_FILLED`**, และเพิ่มเวลารอหลัง `cancelAllOpenOrders` จาก `250ms` เป็น **`1000ms`**
+- **Version Bump**: **`0.3.1.17`** (`package.json`, `src/version.ts`, `public/index.html`)
+
