@@ -527,6 +527,7 @@ export interface OpenInterestPoint {
 export class BinanceDerivativesCache {
   private fundingMap = new Map<string, FundingRatePoint[]>();
   private oiMap = new Map<string, OpenInterestPoint[]>();
+  private perpSymbolAlias = new Map<string, string>();
   private lastFetchMs = new Map<string, number>();
   private refreshInFlight: Promise<void> | null = null;
   private readonly refreshIntervalMs = 15 * 60 * 1000;
@@ -550,6 +551,60 @@ export class BinanceDerivativesCache {
     };
   }
 
+  private async fetchPairForPerpSymbol(
+    perpSym: string,
+    lim: number,
+  ): Promise<{ funding: FundingRatePoint[]; oi: OpenInterestPoint[] }> {
+    const [fRes, oRes] = await Promise.all([
+      fetch(`https://fapi.binance.com/fapi/v1/fundingRate?symbol=${encodeURIComponent(perpSym)}&limit=${lim}`, {
+        signal: AbortSignal.timeout(6000),
+      }).catch(() => null),
+      fetch(
+        `https://fapi.binance.com/futures/data/openInterestHist?symbol=${encodeURIComponent(perpSym)}&period=1h&limit=${lim}`,
+        { signal: AbortSignal.timeout(6000) },
+      ).catch(() => null),
+    ]);
+
+    let funding: FundingRatePoint[] = [];
+    if (fRes && fRes.ok) {
+      const fRaw = (await fRes.json()) as Array<{ fundingTime?: number | string; fundingRate?: number | string }>;
+      if (Array.isArray(fRaw)) {
+        funding = fRaw
+          .map((r) => ({
+            timeMs: Number(r.fundingTime),
+            fundingRateBps: Number(r.fundingRate) * 10000,
+          }))
+          .filter((p) => Number.isFinite(p.timeMs) && p.timeMs > 0 && Number.isFinite(p.fundingRateBps))
+          .sort((a, b) => a.timeMs - b.timeMs);
+      }
+    }
+
+    let oi: OpenInterestPoint[] = [];
+    if (oRes && oRes.ok) {
+      const oRaw = (await oRes.json()) as Array<{
+        timestamp?: number | string;
+        sumOpenInterestValue?: number | string;
+      }>;
+      if (Array.isArray(oRaw)) {
+        oi = oRaw
+          .map((r) => ({
+            timeMs: Number(r.timestamp),
+            openInterestValueUsd: Number(r.sumOpenInterestValue),
+          }))
+          .filter(
+            (p) =>
+              Number.isFinite(p.timeMs) &&
+              p.timeMs > 0 &&
+              Number.isFinite(p.openInterestValueUsd) &&
+              p.openInterestValueUsd > 0,
+          )
+          .sort((a, b) => a.timeMs - b.timeMs);
+      }
+    }
+
+    return { funding, oi };
+  }
+
   public async refreshSymbols(symbols: string[], opts?: { force?: boolean; limit?: number }): Promise<void> {
     if (this.refreshInFlight) {
       await this.refreshInFlight;
@@ -560,7 +615,7 @@ export class BinanceDerivativesCache {
     const due = clean.filter((sym) => opts?.force || now - (this.lastFetchMs.get(sym) ?? 0) >= this.refreshIntervalMs);
     if (due.length === 0) return;
 
-    const lim = Math.max(24, Math.min(500, Math.round(opts?.limit ?? 200)));
+    const lim = Math.max(24, Math.min(500, Math.round(opts?.limit ?? 500)));
     this.refreshInFlight = (async () => {
       try {
         const batchSize = 4;
@@ -570,52 +625,24 @@ export class BinanceDerivativesCache {
             chunk.map(async (sym) => {
               this.lastFetchMs.set(sym, Date.now());
               try {
-                const [fRes, oRes] = await Promise.all([
-                  fetch(`https://fapi.binance.com/fapi/v1/fundingRate?symbol=${encodeURIComponent(sym)}&limit=${lim}`, {
-                    signal: AbortSignal.timeout(6000),
-                  }).catch(() => null),
-                  fetch(
-                    `https://fapi.binance.com/futures/data/openInterestHist?symbol=${encodeURIComponent(sym)}&period=1h&limit=${lim}`,
-                    { signal: AbortSignal.timeout(6000) },
-                  ).catch(() => null),
-                ]);
-
-                if (fRes && fRes.ok) {
-                  const fRaw = (await fRes.json()) as Array<{ fundingTime?: number | string; fundingRate?: number | string }>;
-                  if (Array.isArray(fRaw)) {
-                    const parsed: FundingRatePoint[] = fRaw
-                      .map((r) => ({
-                        timeMs: Number(r.fundingTime),
-                        fundingRateBps: Number(r.fundingRate) * 10000,
-                      }))
-                      .filter((p) => Number.isFinite(p.timeMs) && p.timeMs > 0 && Number.isFinite(p.fundingRateBps))
-                      .sort((a, b) => a.timeMs - b.timeMs);
-                    if (parsed.length > 0) this.fundingMap.set(sym, parsed);
+                const initialPerp = this.perpSymbolAlias.get(sym) ?? sym;
+                let res = await this.fetchPairForPerpSymbol(initialPerp, lim);
+                if (
+                  res.funding.length === 0 &&
+                  res.oi.length === 0 &&
+                  !initialPerp.startsWith("1000") &&
+                  !this.perpSymbolAlias.has(sym)
+                ) {
+                  const altSym = `1000${sym}`;
+                  const altRes = await this.fetchPairForPerpSymbol(altSym, lim);
+                  if (altRes.funding.length > 0 || altRes.oi.length > 0) {
+                    this.perpSymbolAlias.set(sym, altSym);
+                    res = altRes;
                   }
                 }
 
-                if (oRes && oRes.ok) {
-                  const oRaw = (await oRes.json()) as Array<{
-                    timestamp?: number | string;
-                    sumOpenInterestValue?: number | string;
-                  }>;
-                  if (Array.isArray(oRaw)) {
-                    const parsed: OpenInterestPoint[] = oRaw
-                      .map((r) => ({
-                        timeMs: Number(r.timestamp),
-                        openInterestValueUsd: Number(r.sumOpenInterestValue),
-                      }))
-                      .filter(
-                        (p) =>
-                          Number.isFinite(p.timeMs) &&
-                          p.timeMs > 0 &&
-                          Number.isFinite(p.openInterestValueUsd) &&
-                          p.openInterestValueUsd > 0,
-                      )
-                      .sort((a, b) => a.timeMs - b.timeMs);
-                    if (parsed.length > 0) this.oiMap.set(sym, parsed);
-                  }
-                }
+                if (res.funding.length > 0) this.fundingMap.set(sym, res.funding);
+                if (res.oi.length > 0) this.oiMap.set(sym, res.oi);
               } catch {
                 // Best-effort observe-only enrichment; non-perp spot pairs cleanly skip
               }
@@ -632,3 +659,81 @@ export class BinanceDerivativesCache {
 }
 
 export const binanceDerivativesCache = new BinanceDerivativesCache();
+
+/**
+ * One-shot historical 15m taker-volume backfill (up to 1000 bars = ~10.4 days) for existing PostgreSQL candles
+ * missing `quoteVolume` / `takerBuyQuoteVolume` (Observe-Only, 0 API calls once >= 90% populated).
+ */
+export async function backfillBinanceTakerVolumeIfNeeded(opts: {
+  symbols: string[];
+  baseUrl?: string;
+  pgStore: PgStore | null;
+  limit?: number;
+  log?: (msg: string) => void;
+}): Promise<{ checkedSymbols: number; backfilledSymbols: number; upsertedBars: number }> {
+  const pg = opts.pgStore;
+  const cleanSyms = Array.from(new Set(opts.symbols.map((s) => s.toUpperCase().trim()).filter(Boolean)));
+  if (!pg || cleanSyms.length === 0) {
+    return { checkedSymbols: 0, backfilledSymbols: 0, upsertedBars: 0 };
+  }
+
+  const targetBars = Math.max(260, Math.min(1000, Math.round(opts.limit ?? 1000)));
+  const baseUrl = opts.baseUrl || "https://api.binance.com";
+  const dbMap = await pg
+    .loadMarketCandlesBatch("binance", cleanSyms, "15m", targetBars)
+    .catch(() => new Map<string, Candle[]>());
+
+  const needBackfill: string[] = [];
+  for (const sym of cleanSyms) {
+    const bars = dbMap.get(sym) || [];
+    const takerPopulatedCount = bars.filter(
+      (c) =>
+        typeof c.quoteVolume === "number" &&
+        Number.isFinite(c.quoteVolume) &&
+        typeof c.takerBuyQuoteVolume === "number" &&
+        Number.isFinite(c.takerBuyQuoteVolume),
+    ).length;
+    if (bars.length < Math.floor(targetBars * 0.9) || takerPopulatedCount < Math.floor(bars.length * 0.9)) {
+      needBackfill.push(sym);
+    }
+  }
+
+  if (needBackfill.length === 0) {
+    return { checkedSymbols: cleanSyms.length, backfilledSymbols: 0, upsertedBars: 0 };
+  }
+
+  const upsertItems: Array<{ exchange: string; symbol: string; timeframe: string; candles: Candle[] }> = [];
+  let upsertedBars = 0;
+  const chunkSize = 5;
+  for (let i = 0; i < needBackfill.length; i += chunkSize) {
+    const chunk = needBackfill.slice(i, i + chunkSize);
+    await Promise.all(
+      chunk.map(async (sym) => {
+        const incoming = await fetchBinanceKlinesSimple(sym, "15m", targetBars, baseUrl).catch(() => [] as Candle[]);
+        if (incoming.length === 0) return;
+        const changed = filterChangedCandles(dbMap.get(sym) || [], incoming);
+        if (changed.length > 0) {
+          upsertItems.push({ exchange: "binance", symbol: sym, timeframe: "15m", candles: changed });
+          upsertedBars += changed.length;
+        }
+      }),
+    );
+  }
+
+  if (upsertItems.length > 0) {
+    await pg.upsertMarketCandlesBatch(upsertItems).catch((err) => {
+      opts.log?.(`⚠️ [Binance Taker Backfill] PG upsert failed: ${(err as Error).message}`);
+    });
+    if (upsertedBars > 0) {
+      opts.log?.(
+        `📥 [Binance Taker Backfill] Updated ${upsertedBars} bars across ${upsertItems.length}/${cleanSyms.length} symbols (15m up to ${targetBars} bars)`,
+      );
+    }
+  }
+
+  return {
+    checkedSymbols: cleanSyms.length,
+    backfilledSymbols: upsertItems.length,
+    upsertedBars,
+  };
+}

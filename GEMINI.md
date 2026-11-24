@@ -10279,3 +10279,20 @@ When investigating live production behavior, debugging issues, or analyzing trad
      - รวมผลสถิติเข้า `ShadowObserveFactorsSummary` (`vwapBuckets`, `takerBuyBuckets`, `fundingBuckets`, `oiDeltaBuckets`) และบันทึกค่าจริงเข้า `trade_learning_journal.features` ใน `onPortfolioEntry`
   4. [`src/strategy/ma-fan-portfolio/index.ts`](file:///c:/Sites/github/dynamic-grid-bn/src/strategy/ma-fan-portfolio/index.ts) & [`public/app.js`](file:///c:/Sites/github/dynamic-grid-bn/public/app.js): เชื่อม `binanceDerivativesCache`, Live/Shadow Observe Telemetry และเพิ่มการ์ด **`⚡ Alpha Flow & Positioning (VWAP / Taker Buy / Funding / OI — Observe-Only)`** ใน Learning Report Modal
 - **Version Bump**: **`0.3.1.12`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 357. Expanded Binance Taker/OI Backfill (`1000b/500h`), `1000x` Meme Perp Fallback, Boot Shadow Race Fix & Future Learning Backlog (`universe.ts`, `index.ts`, v0.3.1.13)
+- **สิ่งที่ปรับปรุง (100% Observe-Only — ไม่แตะต้องกฎซื้อ/ขายหรือฟิลเตอร์เดิม)**:
+  1. [`src/strategy/ma-fan-portfolio/universe.ts`](file:///c:/Sites/github/dynamic-grid-bn/src/strategy/ma-fan-portfolio/universe.ts):
+     - **`BinanceDerivativesCache` Upgrade**: ขยาย Default `limit` ของ `/fapi/v1/fundingRate` และ `/futures/data/openInterestHist` (`1h`) จาก `200` เป็น **`500`** (ครอบคลุม OI `~20.8` วัน และ Funding `~166` วัน ครบ 24/24 คู่ Binance) พร้อมระบบ Auto-Fallback `1000x` Meme Contract (`perpSymbolAlias`: เช่น `PEPEUSDT -> 1000PEPEUSDT`) เมื่อคู่ตรงคืนค่าว่างแล้ว Cache Alias ไว้ใช้รอบถัดไป
+     - **1-Shot Historical Taker Volume Backfill (`backfillBinanceTakerVolumeIfNeeded`)**: ตรวจสอบคอลัมน์ `quote_volume` / `taker_buy_quote` ใน `market_candles` (`15m`) สูงสุด `1,000` แท่ง (`~10.4` วัน) ตอนบูต; หากมีน้อยกว่า `90%` จะดึงและ Upsert ให้ครบในครั้งเดียว และข้ามด้วย `0` API Call ในการบูตครั้งถัดไป
+  2. [`src/strategy/ma-fan-portfolio/index.ts`](file:///c:/Sites/github/dynamic-grid-bn/src/strategy/ma-fan-portfolio/index.ts):
+     - **Boot Shadow Scan Race-Condition Fix**: เพิ่มแฟล็ก `initialShadowBootstrapComplete` และหุ้ม `reconcileAndRunInitialShadow()` ด้วย `try ... finally` เพื่อรัน `backfillBinanceTakerVolumeIfNeeded()` ก่อน `runLearningShadowScan(true)` (ซึ่งเรียก `binanceDerivativesCache.refreshSymbols()`) และกั้นไม่ให้ `evaluatePortfolioCycle()` ส่ง `shadowContext` เข้า `runPeriodicCycle()` ชิงสแกนก่อนบูตเสร็จ
+- **คลังแนวคิดการเรียนรู้ในอนาคต (Future Learning Backlog — ยังไม่เปิดใช้งาน รอผลเทรดจริง `V3`/`V4` ครบ $N \ge 15\text{–}20$ ไม้ก่อนประเมิน OOS)**:
+  1. **Alpaca — Intraday Anchored VWAP (`ABOVE_VWAP >+0.5%`)** Filter หรือ Score Boost
+  2. **Alpaca — Ranking Score Recalibration** (แก้ปัญหา Score ผกผัน `<30` vs `50-70`)
+  3. **Binance — True Taker Buy% (`>=51.5%`) & Funding/OI Positioning Filter** (หลังเก็บตัวอย่างครบ ~20 วัน)
+  4. **Binance — `US_OVERLAP_14_21` Session Guard** (ช่วงเวลาOverlap ที่ขาดทุนหนักสุดใน Shadow)
+  5. **Binance — Blocked-Filter (`1hRSI`, `GAP_TRAP`, `VolR`) & Breadth Sit-Out (`breadth_50` vs `dual`) Recalibration** หลังยืนยันผลจริงโหมด `V4`
+- **Version Bump**: **`0.3.1.13`** (`package.json`, `src/version.ts`, `public/index.html`)

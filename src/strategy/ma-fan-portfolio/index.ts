@@ -35,6 +35,7 @@ import type {
   SymbolIndicatorSnapshot,
 } from "./types.js";
 import {
+  backfillBinanceTakerVolumeIfNeeded,
   binanceDerivativesCache,
   buildSymbolIndicators,
   evaluateBenchmarkSitOut,
@@ -150,6 +151,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
   private universeFetchPromise: Promise<void> | null = null;
   private latestSurvival: SurvivalGuardDecision | null = null;
   private initialLearningBootstrapDone: boolean = false;
+  private initialShadowBootstrapComplete: boolean = false;
   private breadthHistory: Array<{ timeMs: number; breadthPct: number }> = [];
 
   // Real-time Alpaca WebSocket hybrid stream (<= 30 symbols) & live chart sync
@@ -828,21 +830,34 @@ export class MaFanPortfolioStrategy implements IStrategy {
   }
 
   private async reconcileAndRunInitialShadow(): Promise<void> {
-    if (
-      !this.cfg.dryRun &&
-      this.exchange.hasCredentials() &&
-      (this.exchange.exchangeName === "alpaca" || this.exchange.exchangeName === "binance")
-    ) {
-      await this.db.syncRecentTradesFromExchange(this.exchange, "ALL").catch(() => {});
-      const roundsSummary = this.db.getTradeRounds("ALL").summary;
-      if (roundsSummary.closedRounds > 0) {
-        this.realizedPnl = roundsSummary.totalNetPnlQuote;
-        this.tradeRealizedPnl = roundsSummary.totalNetPnlQuote;
-        this.saveState(true);
+    try {
+      if (
+        !this.cfg.dryRun &&
+        this.exchange.hasCredentials() &&
+        (this.exchange.exchangeName === "alpaca" || this.exchange.exchangeName === "binance")
+      ) {
+        await this.db.syncRecentTradesFromExchange(this.exchange, "ALL").catch(() => {});
+        const roundsSummary = this.db.getTradeRounds("ALL").summary;
+        if (roundsSummary.closedRounds > 0) {
+          this.realizedPnl = roundsSummary.totalNetPnlQuote;
+          this.tradeRealizedPnl = roundsSummary.totalNetPnlQuote;
+          this.saveState(true);
+        }
       }
+      await this.learning.reconcileJournalFromOrders(this.exchange.exchangeName).catch(() => {});
+      if (this.exchange.exchangeName === "binance" && this.snapshots.size > 0) {
+        await backfillBinanceTakerVolumeIfNeeded({
+          symbols: Array.from(this.snapshots.keys()),
+          baseUrl: this.cfg.binanceBaseUrl || "https://api.binance.com",
+          pgStore: this.db.getPgStore(),
+          limit: 1000,
+          log: (m) => this.log(m),
+        }).catch(() => {});
+      }
+      await this.runLearningShadowScan(true).catch(() => {});
+    } finally {
+      this.initialShadowBootstrapComplete = true;
     }
-    await this.learning.reconcileJournalFromOrders(this.exchange.exchangeName).catch(() => {});
-    await this.runLearningShadowScan(false).catch(() => {});
   }
 
   private async finalizeClosedPortfolioSlot(
@@ -1972,30 +1987,36 @@ export class MaFanPortfolioStrategy implements IStrategy {
         tp1TargetMode: this.cfg.portfolioTp1TargetMode,
       });
     }
-    void this.learning.runPeriodicCycle(this.cfg, (patch) => this.updateRuntimeSettings(patch), {
-      exchange: this.exchange.exchangeName,
-      symbols: Array.from(this.snapshots.keys()),
-      benchmarkSymbol: this.benchmarkSymbol,
-      slPct: disasterSlPct,
-      tpMode: this.cfg.portfolioTp1TargetMode,
-      pullbackMode: this.cfg.portfolioPullbackMode,
-      minVolRatio: baseMinVolR,
-      minRelStrength: baseMinRs,
-      minRsi1h: baseMinRsi1h,
-      maxSlots: this.getMaxSlots(),
-      sitOutMode: this.cfg.portfolioSitOutMode,
-      fallbackSnapshots: this.snapshots,
-      benchmarkFallback15m: this.benchmark15m,
-      benchmarkFallback1d: this.benchmark1d,
-      usdProxySymbol: this.usdProxySymbol,
-      usdProxyFallback1d: this.usdProxy1d,
-      ...(this.exchange.exchangeName === "binance"
+    void this.learning.runPeriodicCycle(
+      this.cfg,
+      (patch) => this.updateRuntimeSettings(patch),
+      this.initialShadowBootstrapComplete
         ? {
-            fundingBySymbol: binanceDerivativesCache.getFundingMap(),
-            oiBySymbol: binanceDerivativesCache.getOiMap(),
+            exchange: this.exchange.exchangeName,
+            symbols: Array.from(this.snapshots.keys()),
+            benchmarkSymbol: this.benchmarkSymbol,
+            slPct: disasterSlPct,
+            tpMode: this.cfg.portfolioTp1TargetMode,
+            pullbackMode: this.cfg.portfolioPullbackMode,
+            minVolRatio: baseMinVolR,
+            minRelStrength: baseMinRs,
+            minRsi1h: baseMinRsi1h,
+            maxSlots: this.getMaxSlots(),
+            sitOutMode: this.cfg.portfolioSitOutMode,
+            fallbackSnapshots: this.snapshots,
+            benchmarkFallback15m: this.benchmark15m,
+            benchmarkFallback1d: this.benchmark1d,
+            usdProxySymbol: this.usdProxySymbol,
+            usdProxyFallback1d: this.usdProxy1d,
+            ...(this.exchange.exchangeName === "binance"
+              ? {
+                  fundingBySymbol: binanceDerivativesCache.getFundingMap(),
+                  oiBySymbol: binanceDerivativesCache.getOiMap(),
+                }
+              : {}),
           }
-        : {}),
-    });
+        : undefined,
+    );
 
     if (canExecute && freeSlots > 0 && sizeScale > 0 && !sitOutEval.isSitOut && entryCandidates.length > 0) {
       const concurrentReadyCount = entryCandidates.length;
