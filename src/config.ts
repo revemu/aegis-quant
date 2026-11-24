@@ -420,12 +420,22 @@ export const defaultStrategyConfig = {
   portfolioBlacklist: [] as string[],
   /** Portfolio TP1 target mode: "EMA200" (backtest winner), "EMA75", "EMA25", or "none". */
   portfolioTp1TargetMode: "EMA200" as "EMA25" | "EMA75" | "EMA200" | "none",
-  /** Partial 50% take-profit when reaching TP1 target in profit (>= +0.8%). */
+  /** Minimum TP1 target gain percentage above entry (default 1.2%). */
+  portfolioTp1MinGainPct: 1.2,
+  /** Partial 50% take-profit when reaching TP1 target in profit (>= portfolioTp1MinGainPct). */
   portfolioPartialTpAtEma200: true,
-  /** Lock stop-loss at breakeven (+0.25%) once TP1 target is reached. */
+  /** Lock stop-loss at breakeven (+0.25%) once TP1 target is reached (when portfolioRunnerTrailPct === 0). */
   portfolioLockBreakevenAtEma200: true,
-  /** Hard calibrated disaster stop-loss percentage below entry (default 3.5%). */
-  portfolioDisasterSlPct: 3.5,
+  /** Optional post-TP1 runner trailing stop % from peak (0 = use +0.25% BE lock; >0 e.g. 1.2 = trail from peak with +0.1% floor). */
+  portfolioRunnerTrailPct: 0,
+  /** Hard calibrated disaster stop-loss percentage below entry (default 2.0%). */
+  portfolioDisasterSlPct: 2.0,
+  /** Stale Time-Stop: cut stagnant open slot before TP1 after N 15m trading bars if gain < portfolioStaleExitMaxGainPct (0 = disabled). */
+  portfolioStaleExitBars: 16,
+  /** Maximum gain % threshold for Stale Time-Stop (default 0.3%). */
+  portfolioStaleExitMaxGainPct: 0.3,
+  /** Minimum required distance % to EMA200 before opening a new slot (0 = disabled). */
+  portfolioMinRoomToEma200Pct: 0,
   /** Macro sit-out benchmark guard: "dual" (recommended), "btc1d", "btc4h", or "off". */
   portfolioSitOutMode: "dual" as "off" | "btc1d" | "btc4h" | "dual",
   /** Candidate ranking priority when multiple setups trigger on the same 15m bar. */
@@ -663,9 +673,24 @@ export function loadConfigFromDatabase(): typeof defaultStrategyConfig {
       if (["EMA25", "EMA75", "EMA200", "none"].includes(saved.portfolioTp1TargetMode)) {
         merged.portfolioTp1TargetMode = saved.portfolioTp1TargetMode;
       }
+      if (saved.portfolioTp1MinGainPct !== undefined && Number.isFinite(Number(saved.portfolioTp1MinGainPct))) {
+        merged.portfolioTp1MinGainPct = Math.min(5.0, Math.max(0.5, Number(saved.portfolioTp1MinGainPct)));
+      }
       if (saved.portfolioPartialTpAtEma200 !== undefined) merged.portfolioPartialTpAtEma200 = Boolean(saved.portfolioPartialTpAtEma200);
       if (saved.portfolioLockBreakevenAtEma200 !== undefined) merged.portfolioLockBreakevenAtEma200 = Boolean(saved.portfolioLockBreakevenAtEma200);
+      if (saved.portfolioRunnerTrailPct !== undefined && Number.isFinite(Number(saved.portfolioRunnerTrailPct))) {
+        merged.portfolioRunnerTrailPct = Math.min(5.0, Math.max(0, Number(saved.portfolioRunnerTrailPct)));
+      }
       if (saved.portfolioDisasterSlPct !== undefined) merged.portfolioDisasterSlPct = Math.max(0, Number(saved.portfolioDisasterSlPct));
+      if (saved.portfolioStaleExitBars !== undefined && Number.isFinite(Number(saved.portfolioStaleExitBars))) {
+        merged.portfolioStaleExitBars = Math.min(96, Math.max(0, Math.round(Number(saved.portfolioStaleExitBars))));
+      }
+      if (saved.portfolioStaleExitMaxGainPct !== undefined && Number.isFinite(Number(saved.portfolioStaleExitMaxGainPct))) {
+        merged.portfolioStaleExitMaxGainPct = Math.min(2.0, Math.max(-2.0, Number(saved.portfolioStaleExitMaxGainPct)));
+      }
+      if (saved.portfolioMinRoomToEma200Pct !== undefined && Number.isFinite(Number(saved.portfolioMinRoomToEma200Pct))) {
+        merged.portfolioMinRoomToEma200Pct = Math.min(10.0, Math.max(0, Number(saved.portfolioMinRoomToEma200Pct)));
+      }
       if (["off", "btc1d", "btc4h", "dual"].includes(saved.portfolioSitOutMode)) {
         merged.portfolioSitOutMode = saved.portfolioSitOutMode;
       }

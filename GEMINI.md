@@ -10242,3 +10242,21 @@ When investigating live production behavior, debugging issues, or analyzing trad
     - เพิ่ม `countClosedBarsSinceEntry(c15, lastClosedIdx, entryTime)` รองรับทั้ง ms/sec และนับเฉพาะแท่ง `15m` ที่ปิดจริงหลังเข้าออเดอร์ (ไม่นับช่วงตลาด US ปิดข้ามคืน)
     - แยก `resolveEffectiveTp1Mode()` ใช้ร่วมกันทั้ง `evaluatePortfolioCycle()`, `buildSlotTelemetryList()` (`phaseText`), และ `emitTelemetryTick()` (`portfolio.tp1Mode`)
 - **Version Bump**: **`0.3.1.10`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 355. Balanced R:R Upgrade — Configurable TP1 Floor, No Q2 Premature Downgrade, 4h Stale Time-Stop, Runner Trailing Stop & Min EMA200 Room (`src/config.ts`, `src/strategy/ma-fan-portfolio/index.ts`, `src/learning-engine.ts`, v0.3.1.11)
+- **สาเหตุที่ตรวจพบจาก OOS Backtest 3 ตลาด (~65 ตัว)**:
+  - โหมด `V0` เดิมยอมรับ `SL -3.5%` แต่โดน Q2 Regime กดเป้า TP1 ลงเหลือ `EMA25/75` (ติดพื้น `+0.80%`) และรีบล็อก BE แคบๆ ที่ `+0.25%` ทำให้ R:R เสียเปรียบหนัก (**`1:0.52`** บน Alpaca, **`1:0.23`** บน Crypto/bStock) และบางไม้ถือแช่ไม่วิ่งจนไหลลงโดน SL `-3.5%` เต็มคำ
+  - ผล Zero-Lookahead Full-Lifecycle OOS Backtest ยืนยัน:
+    - **Alpaca US Stocks (`V3`: TP1=EMA200 floor +1.2%, SL -2.0%, Time-Stop 4h `<+0.3%`)**: `R:R 1:0.52 -> 1:1.35`, Net PnL `+0.66% -> +2.55%` (OOS `8t`: WR `87.5%`, PF `11.42`), `PF 1.18 -> 2.08`, MaxDD `2.3% -> 1.0%`
+    - **Binance Crypto (`V4` when `sitOut=off`: MinRoom `>=1.8%`, TP1=EMA200 `+1.5%`, Runner Trail `1.2%`, SL `-2.25%`, Time-Stop 4h)**: พลิกตลาดหมี `-9.93%` (`PF 0.47`, `R:R 1:0.23`) -> **`+0.46%` (`PF 1.18`, `R:R 1:1.19`)**
+- **สิ่งที่แก้ไข**:
+  1. [`src/config.ts`](file:///c:/Sites/github/dynamic-grid-bn/src/config.ts): ปรับค่า Default `portfolioDisasterSlPct = 2.0` พร้อมเพิ่ม 5 พารามิเตอร์ใหม่ (`portfolioTp1MinGainPct = 1.2`, `portfolioStaleExitBars = 16`, `portfolioStaleExitMaxGainPct = 0.3`, `portfolioRunnerTrailPct = 0`, `portfolioMinRoomToEma200Pct = 0`)
+  2. [`src/strategy/ma-fan-portfolio/index.ts`](file:///c:/Sites/github/dynamic-grid-bn/src/strategy/ma-fan-portfolio/index.ts):
+     - ยกเลิกการลดเป้า TP1 ของ Q2 ลงมา `EMA25/EMA75` (`resolveEffectiveTp1Mode()` คืนค่าที่ตั้งไว้ตรงๆ) และใช้พื้น `portfolioTp1MinGainPct` แทน `1.008` ตายตัว
+     - เพิ่ม **Stale Time-Stop** (`STALE_TIME_${staleExitBars}B`) ตัดไม้ซึมก่อนถึง TP1 เมื่อ `activeBarsHeld >= portfolioStaleExitBars` และ PnL% `< portfolioStaleExitMaxGainPct`
+     - เพิ่ม **Runner Trailing Stop** (`SL_RUNNER_TRAIL_${runnerTrailPct}%`) หลัง TP1 เมื่อ `portfolioRunnerTrailPct > 0` (รักษากำไรขั้นต่ำ `+0.1%` แล้วไล่ตามจุดสูงสุด) พร้อมป้าย `phaseText` เฉพาะ
+     - เพิ่ม **Min Room to EMA200 Gate** (`FILTER:LOW_ROOM_200`) เมื่อ `portfolioMinRoomToEma200Pct > 0` และซิงค์ `slot.stopLossPrice` ตาม SL ปัจจุบันก่อน BE/TP1
+  3. [`src/learning-engine.ts`](file:///c:/Sites/github/dynamic-grid-bn/src/learning-engine.ts): รองรับ `tp1FloorPct` (default `1.2%`) ใน `simulateMaFanCounterfactual`, เพิ่มค่า SL Candidates `[2.0, 2.25, ...]` และลดเพดานล่าง `recSlPct` เป็น `2.0%` พร้อม Normalize `FILTER:LOW_ROOM_200`
+- **Version Bump**: **`0.3.1.11`** (`package.json`, `src/version.ts`, `public/index.html`)

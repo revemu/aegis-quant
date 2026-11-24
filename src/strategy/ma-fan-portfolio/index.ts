@@ -493,6 +493,24 @@ export class MaFanPortfolioStrategy implements IStrategy {
     if (Number.isFinite(Number(this.cfg.portfolioMinRsi1h))) {
       this.cfg.portfolioMinRsi1h = Math.min(70, Math.max(15, Number(this.cfg.portfolioMinRsi1h)));
     }
+    if (Number.isFinite(Number(this.cfg.portfolioTp1MinGainPct))) {
+      this.cfg.portfolioTp1MinGainPct = Math.min(5.0, Math.max(0.5, Number(this.cfg.portfolioTp1MinGainPct)));
+    }
+    if (Number.isFinite(Number(this.cfg.portfolioRunnerTrailPct))) {
+      this.cfg.portfolioRunnerTrailPct = Math.min(5.0, Math.max(0, Number(this.cfg.portfolioRunnerTrailPct)));
+    }
+    if (Number.isFinite(Number(this.cfg.portfolioDisasterSlPct))) {
+      this.cfg.portfolioDisasterSlPct = Math.max(0, Number(this.cfg.portfolioDisasterSlPct));
+    }
+    if (Number.isFinite(Number(this.cfg.portfolioStaleExitBars))) {
+      this.cfg.portfolioStaleExitBars = Math.min(96, Math.max(0, Math.round(Number(this.cfg.portfolioStaleExitBars))));
+    }
+    if (Number.isFinite(Number(this.cfg.portfolioStaleExitMaxGainPct))) {
+      this.cfg.portfolioStaleExitMaxGainPct = Math.min(2.0, Math.max(-2.0, Number(this.cfg.portfolioStaleExitMaxGainPct)));
+    }
+    if (Number.isFinite(Number(this.cfg.portfolioMinRoomToEma200Pct))) {
+      this.cfg.portfolioMinRoomToEma200Pct = Math.min(10.0, Math.max(0, Number(this.cfg.portfolioMinRoomToEma200Pct)));
+    }
     if (Array.isArray(clean.portfolioCustomWhitelist)) {
       this.cfg.portfolioCustomWhitelist = clean.portfolioCustomWhitelist.map((x: any) => String(x).toUpperCase().trim()).filter(Boolean);
     } else if (typeof clean.portfolioCustomWhitelist === "string") {
@@ -1294,20 +1312,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
 
   private resolveEffectiveTp1Mode(): "EMA200" | "EMA75" | "EMA25" | "none" {
     const rawTp1 = this.cfg.portfolioTp1TargetMode || "EMA200";
-    const configuredTp1Mode: "EMA200" | "EMA75" | "EMA25" | "none" =
-      rawTp1 === "EMA25" || rawTp1 === "EMA75" || rawTp1 === "none" ? rawTp1 : "EMA200";
-    if (configuredTp1Mode === "none" || this.cfg.portfolioQuantRegimeConditional === false) {
-      return configuredTp1Mode;
-    }
-    const isAlpaca = this.exchange.exchangeName === "alpaca";
-    const breadthPct = Number(this.macroState.breadthAboveEma25Pct ?? 50);
-    if (isAlpaca) {
-      if (breadthPct < 55) return "EMA25";
-      if (breadthPct < 70) return "EMA75";
-      return "EMA200";
-    }
-    // On Crypto, Dual Sit-Out already blocks bear macro & fee is 0.15%; only step down TP1 in ultra-weak breadth (<20%)
-    return breadthPct < 20 ? "EMA75" : configuredTp1Mode;
+    return rawTp1 === "EMA25" || rawTp1 === "EMA75" || rawTp1 === "none" ? rawTp1 : "EMA200";
   }
 
   private async evaluatePortfolioCycle(): Promise<void> {
@@ -1354,10 +1359,17 @@ export class MaFanPortfolioStrategy implements IStrategy {
     const isAlpaca = this.exchange.exchangeName === "alpaca";
     const q2RegimeActive = this.cfg.portfolioQuantRegimeConditional !== false;
     const tp1Mode = this.resolveEffectiveTp1Mode();
+    const tp1MinGainPct = Math.max(0.5, Number(this.cfg.portfolioTp1MinGainPct ?? 1.2));
+    const tp1FloorMult = 1 + tp1MinGainPct / 100;
+    const runnerTrailPct = Math.max(0, Number(this.cfg.portfolioRunnerTrailPct ?? 0));
+    const staleExitBars = Math.max(0, Math.round(Number(this.cfg.portfolioStaleExitBars ?? 16)));
+    const staleMaxGainPct = Number.isFinite(Number(this.cfg.portfolioStaleExitMaxGainPct))
+      ? Number(this.cfg.portfolioStaleExitMaxGainPct)
+      : 0.3;
     let regimeMinVolR = 1.3;
     let regimeMinRs = -1.0;
     let regimeMinRsi1h = 40;
-    const disasterSlPct = Number(this.cfg.portfolioDisasterSlPct ?? 3.5);
+    const disasterSlPct = Number(this.cfg.portfolioDisasterSlPct ?? 2.0);
     const maxHoldHours = Number(this.cfg.portfolioMaxHoldHours || 0);
 
     for (const slot of [...this.slots]) {
@@ -1367,13 +1379,17 @@ export class MaFanPortfolioStrategy implements IStrategy {
       slot.troughPrice = Math.min(slot.troughPrice, px);
       slot.peakPrice = Math.max(slot.peakPrice, px);
 
-      let tp1TargetPrice = slot.entryPrice * 1.008;
+      if (disasterSlPct > 0 && slot.entryPrice > 0 && !slot.beLocked && !slot.tp1Done) {
+        slot.stopLossPrice = slot.entryPrice * (1 - disasterSlPct / 100);
+      }
+
+      let tp1TargetPrice = slot.entryPrice * tp1FloorMult;
       let isBullishFan = false;
       if (ind) {
         const i = ind.lastClosedIdx;
         if (tp1Mode !== "none") {
           const emaVal = tp1Mode === "EMA25" ? ind.m25[i]! : tp1Mode === "EMA75" ? ind.m75[i]! : ind.m200[i]!;
-          tp1TargetPrice = Math.max(emaVal, slot.entryPrice * 1.008);
+          tp1TargetPrice = Math.max(emaVal, slot.entryPrice * tp1FloorMult);
         }
         isBullishFan =
           ind.m4[i]! > ind.m8[i]! &&
@@ -1401,16 +1417,36 @@ export class MaFanPortfolioStrategy implements IStrategy {
         continue;
       }
 
-      // Locked Breakeven Stop
-      if (slot.beLocked && px <= slot.entryPrice * 1.0025) {
+      // Runner Trailing Stop (post-TP1) or Classic Locked Breakeven Stop
+      if (slot.tp1Done && runnerTrailPct > 0) {
+        const trailStopPx = Math.max(
+          slot.entryPrice * 1.001,
+          slot.peakPrice * (1 - runnerTrailPct / 100),
+        );
+        slot.stopLossPrice = Math.max(slot.stopLossPrice, trailStopPx);
+        if (px <= trailStopPx) {
+          await this.executeExitSlot(slot, slot.qty, px, `SL_RUNNER_TRAIL_${runnerTrailPct}%`, true);
+          continue;
+        }
+      } else if (slot.beLocked && px <= slot.entryPrice * 1.0025) {
         await this.executeExitSlot(slot, slot.qty, px, "SL_BREAKEVEN", true);
         continue;
       }
 
-      // TP1 Target (EMA200 / EMA75 / EMA25 with +0.8% floor)
+      // TP1 Target (EMA200 / EMA75 / EMA25 with configurable min gain floor)
       if (tp1Mode !== "none" && px >= tp1TargetPrice) {
         let changed = false;
-        if (this.cfg.portfolioLockBreakevenAtEma200 !== false && !slot.beLocked) {
+        if (runnerTrailPct > 0) {
+          const trailFloor = slot.entryPrice * 1.001;
+          if (!slot.tp1Done || slot.stopLossPrice < trailFloor) {
+            slot.peakPrice = Math.max(slot.entryPrice, px);
+            slot.stopLossPrice = Math.max(slot.stopLossPrice, trailFloor);
+            changed = true;
+            this.log(
+              `🛡️ [Slot ${slot.slotIndex + 1} ${slot.symbol}] Reached ${tp1Mode} ($${tp1TargetPrice.toFixed(2)}) -> Runner Trail -${runnerTrailPct}% Active (Floor $${trailFloor.toFixed(2)})!`,
+            );
+          }
+        } else if (this.cfg.portfolioLockBreakevenAtEma200 !== false && !slot.beLocked) {
           slot.beLocked = true;
           slot.stopLossPrice = Math.max(slot.stopLossPrice, slot.entryPrice * 1.0025);
           changed = true;
@@ -1423,6 +1459,9 @@ export class MaFanPortfolioStrategy implements IStrategy {
             slot.tp1Done = true;
             changed = true;
           }
+        } else if (runnerTrailPct > 0 && !slot.tp1Done) {
+          slot.tp1Done = true;
+          changed = true;
         }
         if (changed) this.saveState(true);
       }
@@ -1431,6 +1470,18 @@ export class MaFanPortfolioStrategy implements IStrategy {
       if (isBullishFan) {
         await this.executeExitSlot(slot, slot.qty, px, "FULL_BULLISH_FAN", true);
         continue;
+      }
+
+      // Stale Time-Stop: cut dead positions before TP1 if stagnant after N 15m trading bars
+      if (!slot.tp1Done && staleExitBars > 0 && slot.activeBarsHeld >= staleExitBars) {
+        const curGainPct = slot.entryPrice > 0 ? ((px - slot.entryPrice) / slot.entryPrice) * 100 : 0;
+        if (curGainPct < staleMaxGainPct) {
+          this.log(
+            `⏱️ [Slot ${slot.slotIndex + 1} ${slot.symbol}] Stale Time-Stop (${slot.activeBarsHeld} bars >= ${staleExitBars}, PnL ${curGainPct >= 0 ? "+" : ""}${curGainPct.toFixed(2)}% < +${staleMaxGainPct}%)`,
+          );
+          const exited = await this.executeExitSlot(slot, slot.qty, px, `STALE_TIME_${staleExitBars}B`, true);
+          if (exited) continue;
+        }
       }
 
       // Optional Max Hold Hours
@@ -1663,6 +1714,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       const effRewardPct = isAlpaca ? distanceToEma200Pct : Math.max(0.8, distanceToEma200Pct);
       const snrAtr = effRewardPct / Math.max(0.12, curAtrPct);
       const minSnrAtr = isAlpaca ? 1.25 : 0.65;
+      const minRoom200Pct = Math.max(0, Number(this.cfg.portfolioMinRoomToEma200Pct ?? 0));
       const snrScoreBonus = isAlpaca && q4VolActive && snrAtr >= 3.5 && snrAtr <= 12 ? 8 : 0;
       const maxCorrLimit = isAlpaca ? 0.75 : 0.85;
       const evRes = q5EvActive
@@ -1695,6 +1747,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       let gapBlockedThisBar = false;
       let openSessionBlocked = false;
       let lowSnrBlocked = false;
+      let lowRoom200Blocked = false;
       let negEvBlocked = false;
       let highCorrBlocked = false;
       const passesBaseFilters = rsi1h >= baseMinRsi1h && buyVolRatio12 >= baseMinVolR && relStrength24h >= baseMinRs;
@@ -1760,6 +1813,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
             stage = "CROSS_8X16_FAIL_FILTERS";
             filterNote = `Low SNR (${snrAtr.toFixed(2)}x ATR < ${minSnrAtr.toFixed(2)}x)`;
             lowSnrBlocked = true;
+          } else if (minRoom200Pct > 0 && distanceToEma200Pct < minRoom200Pct) {
+            stage = "CROSS_8X16_FAIL_FILTERS";
+            filterNote = `Low Room to EMA200 (${distanceToEma200Pct.toFixed(2)}% < ${minRoom200Pct.toFixed(1)}%)`;
+            lowRoom200Blocked = true;
           } else if (q5EvActive && evRes.shouldBlockTrap && (!q4VolActive || snrAtr < minSnrAtr * 1.3)) {
             stage = "CROSS_8X16_FAIL_FILTERS";
             filterNote = `Negative Empirical EV (${evRes.shrunkEvPct.toFixed(2)}%)`;
@@ -1823,6 +1880,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
         extraBlocked.push({ candidate: cand, blockReason: "FILTER:OPEN_SESSION_45M", barTimeSec: barTime });
       } else if (lowSnrBlocked) {
         extraBlocked.push({ candidate: cand, blockReason: "FILTER:LOW_SNR_ATR", barTimeSec: barTime });
+      } else if (lowRoom200Blocked) {
+        extraBlocked.push({ candidate: cand, blockReason: "FILTER:LOW_ROOM_200", barTimeSec: barTime });
       } else if (negEvBlocked) {
         extraBlocked.push({ candidate: cand, blockReason: "FILTER:NEG_EMPIRICAL_EV", barTimeSec: barTime });
       } else if (highCorrBlocked) {
@@ -2445,8 +2504,9 @@ export class MaFanPortfolioStrategy implements IStrategy {
         const remainingCost = Math.max(0.01, slot.entryPrice > 0 ? slot.qty * slot.entryPrice : slot.allocatedCapital);
         const unreal = mktVal - remainingCost;
         const unrealPct = remainingCost > 0 ? (unreal / remainingCost) * 100 : 0;
-        const tp1 = slot.tp1TargetPrice || slot.entryPrice * 1.008;
-        const sl = slot.stopLossPrice || slot.entryPrice * 0.965;
+        const tp1FloorMult = 1 + Math.max(0.5, Number(this.cfg.portfolioTp1MinGainPct ?? 1.2)) / 100;
+        const tp1 = slot.tp1TargetPrice || slot.entryPrice * tp1FloorMult;
+        const sl = slot.stopLossPrice || slot.entryPrice * (1 - Number(this.cfg.portfolioDisasterSlPct ?? 2.0) / 100);
         const range = Math.max(0.0001, tp1 - sl);
         const progressPct = Math.max(0, Math.min(100, ((curPx - sl) / range) * 100));
 
@@ -2471,8 +2531,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
         }
 
         const effectiveTp1Mode = this.resolveEffectiveTp1Mode();
+        const runnerTrailPct = Math.max(0, Number(this.cfg.portfolioRunnerTrailPct ?? 0));
         let phaseText = effectiveTp1Mode === "none" ? "ถือรอ Full Bullish Fan" : `ถือรอถึง ${effectiveTp1Mode}`;
         if (slot.pendingExitOnOpen) phaseText = "⏳ รอคัทตอนตลาดเปิด";
+        else if (slot.tp1Done && runnerTrailPct > 0) phaseText = `TP1 แล้ว • Trail -${runnerTrailPct}%`;
         else if (slot.tp1Done && slot.beLocked) phaseText = "TP1 แล้ว • ล็อก BE รอ Full Fan";
         else if (slot.beLocked) phaseText = "ล็อก BE แล้ว • รันกำไร";
         else if (isBullishFan) phaseText = "Full Bullish Fan!";

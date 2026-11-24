@@ -473,6 +473,7 @@ export function normalizeBlockReasonKey(rawReason: string | null | undefined): s
     if (detail.startsWith("HIGH_CORR") || detail.startsWith("High Corr")) return "FILTER:HIGH_CORR";
     if (detail.startsWith("OPEN_SESSION_45M") || detail.startsWith("Opening 45m")) return "FILTER:OPEN_SESSION_45M";
     if (detail.startsWith("LOW_SNR_ATR") || detail.startsWith("Low SNR")) return "FILTER:LOW_SNR_ATR";
+    if (detail.startsWith("LOW_ROOM_200") || detail.startsWith("Low Room")) return "FILTER:LOW_ROOM_200";
     if (detail.startsWith("NEG_EMPIRICAL_EV") || detail.startsWith("Negative Empirical EV")) return "FILTER:NEG_EMPIRICAL_EV";
     if (detail.includes("Survival")) return `FILTER:${detail}`;
   }
@@ -539,6 +540,7 @@ function simulateMaFanCounterfactual(
   slTriggerPct: number,
   futureBars: Array<{ high: number; low: number; close: number }>,
   costPct = 0,
+  tp1FloorPct = 1.2,
 ): {
   finalRet: number;
   maePct: number;
@@ -547,8 +549,9 @@ function simulateMaFanCounterfactual(
   checkpointRetPct: Record<number, number | null>;
   verdict: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL";
 } {
+  const minFloor = Math.max(0.5, Number.isFinite(tp1FloorPct) ? tp1FloorPct : 1.2);
   const tp1Pct = Number.isFinite(distTargetPct) && distTargetPct > 0
-    ? Math.max(0.8, Math.min(distTargetPct, 8.0))
+    ? Math.max(minFloor, Math.min(distTargetPct, 8.0))
     : 2.0;
   const beLockPct = 0.25;
 
@@ -1288,7 +1291,7 @@ function analyzeTuning(events: TuningEvent[], cur: TuneCfg, costPct = 0): Tuning
     apply: (c: TuneCfg, v: any) => TuneCfg;
     curVal: number | string;
   }> = [
-    { param: "portfolioDisasterSlPct", label: "Disaster SL %", values: [2.5, 3, 3.5, 4, 4.5, 5], apply: (c, v) => ({ ...c, sl: v }), curVal: cur.sl },
+    { param: "portfolioDisasterSlPct", label: "Disaster SL %", values: [2.0, 2.25, 2.5, 3, 3.5, 4], apply: (c, v) => ({ ...c, sl: v }), curVal: cur.sl },
     { param: "portfolioMinBuyVolRatio", label: "Min Buy VolRatio (12 bars)", values: [1.0, 1.15, 1.3, 1.6, 2.0], apply: (c, v) => ({ ...c, minVolR: v }), curVal: cur.minVolR },
     { param: "portfolioMinRelStrength24h", label: "Min RS 24h vs Benchmark (%)", values: [-3, -2, -1, 0, 1], apply: (c, v) => ({ ...c, minRs: v }), curVal: cur.minRs },
     { param: "portfolioMinRsi1h", label: "Min 1h RSI", values: [35, 40, 45, 50], apply: (c, v) => ({ ...c, minRsi1h: v }), curVal: cur.minRsi1h },
@@ -2796,7 +2799,7 @@ export class LearningEngine {
         .slice(0, 8);
 
       const maeP80Abs = winMaeAbs.length >= 5 ? percentile(winMaeAbs, 0.8) : null;
-      const recSlPct = maeP80Abs !== null ? Math.round(clamp(maeP80Abs + 0.8, 2.5, 5.0) * 4) / 4 : null;
+      const recSlPct = maeP80Abs !== null ? Math.round(clamp(maeP80Abs + 0.8, 2.0, 5.0) * 4) / 4 : null;
       const overallPf = sumLossAbsPct > 0 ? sumWinPct / sumLossAbsPct : sumWinPct > 0 ? 99 : 0;
 
       const initTuneCfg = tuneCfgFromConfig({
