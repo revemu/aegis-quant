@@ -312,8 +312,8 @@ export async function fetchPortfolioUniverseAndBenchmark(opts: {
         ...opts.alpacaCreds,
       }),
       fetchAlpacaSingleCached("SPY", "4h", 120, opts.existingBenchmarkCandles?.c4h),
-      fetchAlpacaSingleCached("SPY", "1d", 260, opts.existingBenchmarkCandles?.c1d),
-      fetchAlpacaSingleCached("UUP", "1d", 120, opts.existingBenchmarkCandles?.usd1d).catch(() => [] as Candle[]),
+      fetchAlpacaSingleCached("SPY", "1d", 400, opts.existingBenchmarkCandles?.c1d),
+      fetchAlpacaSingleCached("UUP", "1d", 200, opts.existingBenchmarkCandles?.usd1d).catch(() => [] as Candle[]),
     ]);
 
     if (pg && upsertItems.length > 0) {
@@ -406,8 +406,8 @@ export async function fetchPortfolioUniverseAndBenchmark(opts: {
   const [bench15, bench4h, bench1d, eur1d] = await Promise.all([
     loadBinSeries(benchSym, "15m", 260, opts.existingBenchmarkCandles?.c15),
     loadBinSeries(benchSym, "4h", 120, opts.existingBenchmarkCandles?.c4h),
-    loadBinSeries(benchSym, "1d", 260, opts.existingBenchmarkCandles?.c1d),
-    loadBinSeries("EURUSDT", "1d", 120, opts.existingBenchmarkCandles?.usd1d).catch(() => [] as Candle[]),
+    loadBinSeries(benchSym, "1d", 400, opts.existingBenchmarkCandles?.c1d),
+    loadBinSeries("EURUSDT", "1d", 200, opts.existingBenchmarkCandles?.usd1d).catch(() => [] as Candle[]),
   ]);
 
   const snapshots = new Map<string, SymbolIndicatorSnapshot>();
@@ -530,6 +530,7 @@ export class BinanceDerivativesCache {
   private perpSymbolAlias = new Map<string, string>();
   private lastFetchMs = new Map<string, number>();
   private refreshInFlight: Promise<void> | null = null;
+  private hasLoggedInitial = false;
   private readonly refreshIntervalMs = 15 * 60 * 1000;
 
   public getFundingMap(): Map<string, FundingRatePoint[]> {
@@ -605,7 +606,10 @@ export class BinanceDerivativesCache {
     return { funding, oi };
   }
 
-  public async refreshSymbols(symbols: string[], opts?: { force?: boolean; limit?: number }): Promise<void> {
+  public async refreshSymbols(
+    symbols: string[],
+    opts?: { force?: boolean; limit?: number; log?: (msg: string) => void },
+  ): Promise<void> {
     if (this.refreshInFlight) {
       await this.refreshInFlight;
       return;
@@ -647,6 +651,21 @@ export class BinanceDerivativesCache {
                 // Best-effort observe-only enrichment; non-perp spot pairs cleanly skip
               }
             }),
+          );
+        }
+
+        if (opts?.log && (opts.force || !this.hasLoggedInitial)) {
+          this.hasLoggedInitial = true;
+          const fundedCount = clean.filter((s) => (this.fundingMap.get(s)?.length ?? 0) > 0).length;
+          const oiCount = clean.filter((s) => (this.oiMap.get(s)?.length ?? 0) > 0).length;
+          const aliases = clean
+            .map((s) => {
+              const alias = this.perpSymbolAlias.get(s);
+              return alias && alias !== s ? `${s}->${alias}` : null;
+            })
+            .filter((x): x is string => Boolean(x));
+          opts.log(
+            `📥 [Binance Derivatives] Loaded Funding (${fundedCount}/${clean.length}) & OI ${lim}h (${oiCount}/${clean.length})${aliases.length > 0 ? ` | aliases: ${aliases.join(", ")}` : ""}`,
           );
         }
       } finally {

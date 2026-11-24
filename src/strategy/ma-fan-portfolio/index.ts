@@ -22,6 +22,7 @@ import {
   isGapInducedBar,
   isOpeningSession45mBar,
   LearningEngine,
+  resolveCounterfactualExitOptions,
   type SurvivalGuardDecision,
   type SurvivalPostureLevel,
 } from "../../learning-engine.js";
@@ -782,7 +783,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
     const syms = Array.from(this.snapshots.keys());
     const isBinance = this.exchange.exchangeName === "binance";
     if (isBinance && syms.length > 0) {
-      await binanceDerivativesCache.refreshSymbols(syms, { force }).catch(() => {});
+      await binanceDerivativesCache.refreshSymbols(syms, { force, log: (m) => this.log(m) }).catch(() => {});
     }
     const baseMinVolR = Number.isFinite(Number(this.cfg.portfolioMinBuyVolRatio))
       ? Number(this.cfg.portfolioMinBuyVolRatio)
@@ -793,12 +794,17 @@ export class MaFanPortfolioStrategy implements IStrategy {
     const baseMinRsi1h = Number.isFinite(Number(this.cfg.portfolioMinRsi1h))
       ? Number(this.cfg.portfolioMinRsi1h)
       : 40;
+    const exitOpts = resolveCounterfactualExitOptions(this.cfg);
     const summary = await this.learning.runShadowWalkForward({
       exchange: this.exchange.exchangeName,
       symbols: syms,
       benchmarkSymbol: this.benchmarkSymbol,
       slPct: Number(this.cfg.portfolioDisasterSlPct ?? 3.5),
       tpMode: this.cfg.portfolioTp1TargetMode,
+      tp1MinGainPct: exitOpts.tp1FloorPct,
+      staleExitBars: exitOpts.staleExitBars,
+      staleExitMaxGainPct: exitOpts.staleExitMaxGainPct,
+      runnerTrailPct: exitOpts.runnerTrailPct,
       pullbackMode: this.cfg.portfolioPullbackMode,
       minVolRatio: baseMinVolR,
       minRelStrength: baseMinRs,
@@ -1997,6 +2003,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
             benchmarkSymbol: this.benchmarkSymbol,
             slPct: disasterSlPct,
             tpMode: this.cfg.portfolioTp1TargetMode,
+            tp1MinGainPct,
+            staleExitBars,
+            staleExitMaxGainPct: staleMaxGainPct,
+            runnerTrailPct,
             pullbackMode: this.cfg.portfolioPullbackMode,
             minVolRatio: baseMinVolR,
             minRelStrength: baseMinRs,

@@ -202,6 +202,10 @@ export interface SurvivalGuardDecision {
 
 export interface ShadowWalkForwardContext {
   tpMode?: string;
+  tp1MinGainPct?: number;
+  staleExitBars?: number;
+  staleExitMaxGainPct?: number;
+  runnerTrailPct?: number;
   pullbackMode?: "EMA8_HOLD" | "EMA4_TOUCH";
   minVolRatio?: number;
   minRelStrength?: number;
@@ -536,17 +540,44 @@ function estimateRoundTripCostPct(exchange: string, symbols: string[]): number {
   return 0.15; // Binance USDT 0.075% x 2 round-trip fee + minor slippage
 }
 
+export interface CounterfactualExitOptions {
+  tp1FloorPct?: number;
+  staleExitBars?: number;
+  staleExitMaxGainPct?: number;
+  runnerTrailPct?: number;
+}
+
 /**
- * Simulate MA-Fan TP1 (50% exit at target with +0.8% floor, lock BE +0.25% on remaining 50%)
- * vs hard Disaster SL over the forward 15m horizon bars, deducting round-trip trading costs.
+ * Resolves v0.3.1.11 exit physics options consistently across strategy, shadow, and counterfactual evaluation.
  */
-function simulateMaFanCounterfactual(
+export function resolveCounterfactualExitOptions(cfg: Partial<Config>): Required<CounterfactualExitOptions> {
+  return {
+    tp1FloorPct: Number.isFinite(Number(cfg.portfolioTp1MinGainPct))
+      ? Math.max(0.5, Number(cfg.portfolioTp1MinGainPct))
+      : 1.2,
+    staleExitBars: Number.isFinite(Number(cfg.portfolioStaleExitBars))
+      ? Math.max(0, Math.round(Number(cfg.portfolioStaleExitBars)))
+      : 16,
+    staleExitMaxGainPct: Number.isFinite(Number(cfg.portfolioStaleExitMaxGainPct))
+      ? Number(cfg.portfolioStaleExitMaxGainPct)
+      : 0.3,
+    runnerTrailPct: Number.isFinite(Number(cfg.portfolioRunnerTrailPct))
+      ? Math.max(0, Number(cfg.portfolioRunnerTrailPct))
+      : 0,
+  };
+}
+
+/**
+ * Simulate MA-Fan TP1 (50% exit at target with configurable floor, lock BE +0.25% or Runner Trail on remaining 50%,
+ * plus optional Stale Time-Stop) vs hard Disaster SL over the forward 15m horizon bars, deducting round-trip trading costs.
+ */
+export function simulateMaFanCounterfactual(
   entryPrice: number,
   distTargetPct: number,
   slTriggerPct: number,
   futureBars: Array<{ high: number; low: number; close: number }>,
   costPct = 0,
-  tp1FloorPct = 1.2,
+  exitOpts: CounterfactualExitOptions | number = {},
 ): {
   finalRet: number;
   maePct: number;
@@ -555,37 +586,67 @@ function simulateMaFanCounterfactual(
   checkpointRetPct: Record<number, number | null>;
   verdict: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL";
 } {
-  const minFloor = Math.max(0.5, Number.isFinite(tp1FloorPct) ? tp1FloorPct : 1.2);
+  const optObj = typeof exitOpts === "object" && exitOpts !== null ? exitOpts : {};
+  const rawFloor = typeof exitOpts === "number" ? exitOpts : optObj.tp1FloorPct;
+  const minFloor = Math.max(0.5, Number.isFinite(Number(rawFloor)) ? Number(rawFloor) : 1.2);
   const tp1Pct = Number.isFinite(distTargetPct) && distTargetPct > 0
     ? Math.max(minFloor, Math.min(distTargetPct, 8.0))
-    : 2.0;
+    : Math.max(minFloor, 2.0);
+  const runnerTrailPct = Math.max(0, Number.isFinite(Number(optObj.runnerTrailPct)) ? Number(optObj.runnerTrailPct) : 0);
+  const staleExitBars = Math.max(0, Math.round(Number.isFinite(Number(optObj.staleExitBars)) ? Number(optObj.staleExitBars) : 0));
+  const staleMaxGainPct = Number.isFinite(Number(optObj.staleExitMaxGainPct)) ? Number(optObj.staleExitMaxGainPct) : 0.3;
   const beLockPct = 0.25;
+  const trailFloorPct = 0.1;
 
   let minLow = entryPrice;
   let maxHigh = entryPrice;
   let tp1Hit = false;
+  let peakPctSinceTp1 = 0;
   let finalRet: number | null = null;
   let exitBarsHeld = futureBars.length;
+  let staleTriggeredAtBar = 0;
 
   for (let i = 0; i < futureBars.length; i++) {
     const b = futureBars[i]!;
     if (b.low < minLow) minLow = b.low;
     if (b.high > maxHigh) maxHigh = b.high;
+    const barsHeld = i + 1;
     const lowPct = ((b.low - entryPrice) / entryPrice) * 100;
     const highPct = ((b.high - entryPrice) / entryPrice) * 100;
+    const closePct = ((b.close - entryPrice) / entryPrice) * 100;
 
     if (!tp1Hit) {
       if (lowPct <= slTriggerPct) {
         finalRet = slTriggerPct;
-        exitBarsHeld = i + 1;
+        exitBarsHeld = barsHeld;
         break;
       }
       if (highPct >= tp1Pct) {
         tp1Hit = true;
+        peakPctSinceTp1 = Math.max(tp1Pct, closePct);
+      } else if (staleExitBars > 0 && barsHeld >= staleExitBars && closePct < staleMaxGainPct) {
+        finalRet = closePct;
+        exitBarsHeld = barsHeld;
+        staleTriggeredAtBar = barsHeld;
+        break;
+      }
+    } else if (runnerTrailPct > 0) {
+      const prevTrailStopPct = Math.max(trailFloorPct, peakPctSinceTp1 - runnerTrailPct);
+      if (lowPct <= prevTrailStopPct) {
+        finalRet = 0.5 * tp1Pct + 0.5 * prevTrailStopPct;
+        exitBarsHeld = barsHeld;
+        break;
+      }
+      peakPctSinceTp1 = Math.max(peakPctSinceTp1, highPct);
+      const nextTrailStopPct = Math.max(trailFloorPct, peakPctSinceTp1 - runnerTrailPct);
+      if (closePct <= nextTrailStopPct) {
+        finalRet = 0.5 * tp1Pct + 0.5 * nextTrailStopPct;
+        exitBarsHeld = barsHeld;
+        break;
       }
     } else if (lowPct <= beLockPct) {
       finalRet = 0.5 * tp1Pct + 0.5 * beLockPct;
-      exitBarsHeld = i + 1;
+      exitBarsHeld = barsHeld;
       break;
     }
   }
@@ -599,7 +660,7 @@ function simulateMaFanCounterfactual(
   const netCost = Math.max(0, costPct);
   const checkpointRetPct: Record<number, number | null> = {};
   for (const cp of [4, 8, 16]) {
-    if (futureBars.length >= cp && exitBarsHeld > cp) {
+    if (futureBars.length >= cp && (exitBarsHeld > cp || staleTriggeredAtBar === cp)) {
       const cpClose = futureBars[cp - 1]!.close;
       checkpointRetPct[cp] = ((cpClose - entryPrice) / entryPrice) * 100 - netCost;
     } else {
@@ -1265,6 +1326,7 @@ export function decodePullbackModeNumeric(n: number): PullbackModeName {
 }
 
 function tuneCfgFromConfig(cfg: Config): TuneCfg {
+  const exitOpts = resolveCounterfactualExitOptions(cfg);
   return {
     sl: Math.max(1.5, Math.min(5.0, Number(cfg.portfolioDisasterSlPct || 3.5))),
     minVolR: Number.isFinite(Number(cfg.portfolioMinBuyVolRatio)) ? Number(cfg.portfolioMinBuyVolRatio) : 1.3,
@@ -1272,11 +1334,15 @@ function tuneCfgFromConfig(cfg: Config): TuneCfg {
     minRsi1h: Number.isFinite(Number(cfg.portfolioMinRsi1h)) ? Number(cfg.portfolioMinRsi1h) : 40,
     tpMode: normalizeTpMode(cfg.portfolioTp1TargetMode),
     pullbackMode: normalizePullbackMode(cfg.portfolioPullbackMode),
+    tp1MinGainPct: exitOpts.tp1FloorPct,
+    staleExitBars: exitOpts.staleExitBars,
+    staleExitMaxGainPct: exitOpts.staleExitMaxGainPct,
+    runnerTrailPct: exitOpts.runnerTrailPct,
   };
 }
 
 function tuneCfgKey(t: TuneCfg): string {
-  return `${t.sl}|${t.minVolR}|${t.minRs}|${t.minRsi1h}|${t.tpMode}|${t.pullbackMode}`;
+  return `${t.sl}|${t.minVolR}|${t.minRs}|${t.minRsi1h}|${t.tpMode}|${t.pullbackMode}|${t.tp1MinGainPct}|${t.staleExitBars}|${t.staleExitMaxGainPct}|${t.runnerTrailPct}`;
 }
 
 interface TuningEvent {
@@ -1358,6 +1424,10 @@ interface TuneCfg {
   minRsi1h: number;
   tpMode: TpModeName;
   pullbackMode: PullbackModeName;
+  tp1MinGainPct: number;
+  staleExitBars: number;
+  staleExitMaxGainPct: number;
+  runnerTrailPct: number;
 }
 
 interface MetricAcc {
@@ -1420,7 +1490,12 @@ function evalTuneConfig(groups: TuningEvent[][], cfg: TuneCfg, splitTime: number
         : cfg.tpMode === "EMA75"
           ? e.dist75
           : e.dist200;
-    const sim = simulateMaFanCounterfactual(px, dist, -cfg.sl, e.futureBars, costPct);
+    const sim = simulateMaFanCounterfactual(px, dist, -cfg.sl, e.futureBars, costPct, {
+      tp1FloorPct: cfg.tp1MinGainPct,
+      staleExitBars: cfg.staleExitBars,
+      staleExitMaxGainPct: cfg.staleExitMaxGainPct,
+      runnerTrailPct: cfg.runnerTrailPct,
+    });
     const acc = e.timeSec < splitTime ? train : test;
     acc.n++;
     acc.sum += sim.finalRet;
@@ -2228,7 +2303,11 @@ export class LearningEngine {
 
   // ── Level 2: Counterfactual Verification, Journal Sync & Shadow Learning ──
 
-  public async evaluatePendingBlockedSignals(exchange: string, slPct = 3.5): Promise<number> {
+  public async evaluatePendingBlockedSignals(
+    exchange: string,
+    slPct = 3.5,
+    exitOpts?: CounterfactualExitOptions,
+  ): Promise<number> {
     const pg = this.getPg();
     if (!pg) return 0;
 
@@ -2264,7 +2343,7 @@ export class LearningEngine {
         p.features?.distTp1Pct !== undefined && Number.isFinite(Number(p.features.distTp1Pct))
           ? Number(p.features.distTp1Pct)
           : Number(p.features?.distEma200Pct);
-      const sim = simulateMaFanCounterfactual(p.entryPrice, distTargetPct, slTriggerPct, futureBars, costPct);
+      const sim = simulateMaFanCounterfactual(p.entryPrice, distTargetPct, slTriggerPct, futureBars, costPct, exitOpts);
 
       updates.push({
         journalUid: p.journalUid,
@@ -2533,7 +2612,7 @@ export class LearningEngine {
         ? await pg.loadMarketCandlesBatch(ex, cleanSymbols, "1h", 700).catch(() => new Map<string, Candle[]>())
         : new Map<string, Candle[]>();
       const pg1d = pg
-        ? await pg.loadMarketCandlesBatch(ex, Array.from(new Set([benchSym, usdSym])), "1d", 320).catch(() => new Map<string, Candle[]>())
+        ? await pg.loadMarketCandlesBatch(ex, Array.from(new Set([benchSym, usdSym])), "1d", 450).catch(() => new Map<string, Candle[]>())
         : new Map<string, Candle[]>();
 
       const pickClosedDaily = (dbBars: Candle[] | undefined, fbBars: Candle[] | undefined): Candle[] => {
@@ -2637,6 +2716,24 @@ export class LearningEngine {
       const baseMinRsi1h = Number.isFinite(Number(opts.minRsi1h)) ? Number(opts.minRsi1h) : 40;
       const baseTpMode = normalizeTpMode(opts.tpMode);
       const basePullbackMode = normalizePullbackMode(opts.pullbackMode);
+      const shadowTp1FloorPct = Number.isFinite(Number(opts.tp1MinGainPct))
+        ? Math.max(0.5, Number(opts.tp1MinGainPct))
+        : 1.2;
+      const shadowStaleExitBars = Number.isFinite(Number(opts.staleExitBars))
+        ? Math.max(0, Math.round(Number(opts.staleExitBars)))
+        : 16;
+      const shadowStaleMaxGainPct = Number.isFinite(Number(opts.staleExitMaxGainPct))
+        ? Number(opts.staleExitMaxGainPct)
+        : 0.3;
+      const shadowRunnerTrailPct = Number.isFinite(Number(opts.runnerTrailPct))
+        ? Math.max(0, Number(opts.runnerTrailPct))
+        : 0;
+      const shadowExitOpts: CounterfactualExitOptions = {
+        tp1FloorPct: shadowTp1FloorPct,
+        staleExitBars: shadowStaleExitBars,
+        staleExitMaxGainPct: shadowStaleMaxGainPct,
+        runnerTrailPct: shadowRunnerTrailPct,
+      };
 
       const bySymbol: Record<string, ShadowSymbolProfile> = {};
       const tuningEvents: TuningEvent[] = [];
@@ -2803,7 +2900,7 @@ export class LearningEngine {
                 const d75 = useEma8Primary ? dist75Ema8 : dist75;
                 const d200 = useEma8Primary ? dist200Ema8 : dist200;
                 const distTarget = baseTpMode === "EMA25" ? d25 : baseTpMode === "EMA75" ? d75 : d200;
-                const sim = simulateMaFanCounterfactual(simEntryPrice, distTarget, slTriggerPct, futureBars, costPct);
+                const sim = simulateMaFanCounterfactual(simEntryPrice, distTarget, slTriggerPct, futureBars, costPct, shadowExitOpts);
 
                 lastEntryIdx = idx;
                 waitingPullback = false;
@@ -3020,6 +3117,10 @@ export class LearningEngine {
         portfolioMinRsi1h: baseMinRsi1h,
         portfolioTp1TargetMode: baseTpMode,
         portfolioPullbackMode: basePullbackMode,
+        portfolioTp1MinGainPct: shadowTp1FloorPct,
+        portfolioStaleExitBars: shadowStaleExitBars,
+        portfolioStaleExitMaxGainPct: shadowStaleMaxGainPct,
+        portfolioRunnerTrailPct: shadowRunnerTrailPct,
       } as Config);
       const toBucketStatsRecord = (acc: Map<string, { setups: number; wins: number; sumPnl: number }>) => {
         const out: Record<string, { setups: number; winRatePct: number; avgPnlPct: number }> = {};
@@ -3536,7 +3637,11 @@ export class LearningEngine {
     try {
       await this.ensureSymbolStatesLoaded();
       if (pg) {
-        await this.evaluatePendingBlockedSignals(cfg.exchange || "binance", cfg.portfolioDisasterSlPct || 3.5);
+        await this.evaluatePendingBlockedSignals(
+          cfg.exchange || "binance",
+          cfg.portfolioDisasterSlPct || 3.5,
+          resolveCounterfactualExitOptions(cfg),
+        );
         await this.evaluatePostExitTrades(cfg.exchange || "binance").catch(() => {});
       }
 
@@ -3552,10 +3657,18 @@ export class LearningEngine {
 
   public async buildReport(cfg: Config) {
     this.refreshShadowTuningFromConfig(cfg);
+    const exitOpts = resolveCounterfactualExitOptions(cfg);
     const activeTechnicalParams = {
       portfolioCapitalUsagePct: Number(cfg.portfolioCapitalUsagePct || 50),
       portfolioPullbackMode: normalizePullbackMode(cfg.portfolioPullbackMode),
       portfolioTp1TargetMode: cfg.portfolioTp1TargetMode || "EMA200",
+      portfolioTp1MinGainPct: exitOpts.tp1FloorPct,
+      portfolioStaleExitBars: exitOpts.staleExitBars,
+      portfolioStaleExitMaxGainPct: exitOpts.staleExitMaxGainPct,
+      portfolioRunnerTrailPct: exitOpts.runnerTrailPct,
+      portfolioMinRoomToEma200Pct: Number.isFinite(Number(cfg.portfolioMinRoomToEma200Pct))
+        ? Math.max(0, Number(cfg.portfolioMinRoomToEma200Pct))
+        : 0,
       portfolioDisasterSlPct: Number(cfg.portfolioDisasterSlPct || 3.5),
       portfolioMinBuyVolRatio: Number.isFinite(Number(cfg.portfolioMinBuyVolRatio))
         ? Number(cfg.portfolioMinBuyVolRatio)

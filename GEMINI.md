@@ -10305,3 +10305,20 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - [`public/index.html`](file:///c:/Sites/github/dynamic-grid-bn/public/index.html) & [`public/app.js`](file:///c:/Sites/github/dynamic-grid-bn/public/app.js): เปลี่ยน Title หน้าเว็บ (`Aegis Quant — Systematic Trading Dashboard`), Login (`Aegis Quant Hub`), Orchestrator Bar (`🛡️ AEGIS QUANT`), Badge (`AEGIS QUANT`), `document.title` และ Tooltip เวอร์ชัน เป็น **`Aegis Quant`**
   - [`README.md`](file:///c:/Sites/github/dynamic-grid-bn/README.md) & [`GEMINI.md`](file:///c:/Sites/github/dynamic-grid-bn/GEMINI.md): อัปเดตชื่อโปรเจกต์เป็น **`Aegis Quant (aegis-quant)`**
 - **Version Bump**: **`0.3.1.14`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 359. Expanded 1D Macro Lookback (`400b`), `v0.3.1.11` Counterfactual Physics Sync, Derivatives Boot Log & Binance OOS Validation (`universe.ts`, `learning-engine.ts`, `index.ts`, v0.3.1.15)
+- **สิ่งที่แก้ไข (`v0.3.1.15`)**:
+  1. [`src/strategy/ma-fan-portfolio/universe.ts`](file:///c:/Sites/github/aegis-quant/src/strategy/ma-fan-portfolio/universe.ts) & [`src/learning-engine.ts`](file:///c:/Sites/github/aegis-quant/src/learning-engine.ts):
+     - **100% 1D Macro / Mayer Multiple Coverage**: ขยาย `1d` lookback ของ Benchmark (`SPY`, `BTCUSDT`) จาก `260` เป็น **`400`** แท่ง, USD Proxy (`UUP`, `EURUSDT`) จาก `120` เป็น **`200`** แท่ง, และ PostgreSQL `loadMarketCandlesBatch("1d")` ใน `runShadowWalkForward` จาก `320` เป็น **`450`** แท่ง (แก้ปัญหา Alpaca `mayerBuckets` หายไป 24% เมื่อย้อนหลัง 89 วันทำการ)
+     - **Binance Derivatives Boot/Force Summary Log**: เพิ่ม `hasLoggedInitial` และออปชัน `log` ให้ `BinanceDerivativesCache.refreshSymbols()` พิมพ์สรุป 1 บรรทัดตอนบูตหรือกดสแกนซ้ำ (เช่น `Loaded Funding (25/25) & OI 500h (25/25) | aliases: PEPEUSDT->1000PEPEUSDT`) โดยไม่สแปมในรอบ Refresh ทุก 15 นาที
+  2. [`src/learning-engine.ts`](file:///c:/Sites/github/aegis-quant/src/learning-engine.ts) & [`src/strategy/ma-fan-portfolio/index.ts`](file:///c:/Sites/github/aegis-quant/src/strategy/ma-fan-portfolio/index.ts):
+     - **Sync `v0.3.1.11` Exit Physics เข้า Counterfactual / Shadow / Blocked-Signal Evaluator**: เพิ่ม `CounterfactualExitOptions` และ `resolveCounterfactualExitOptions(cfg)` ส่งต่อ `portfolioTp1MinGainPct`, `portfolioStaleExitBars`, `portfolioStaleExitMaxGainPct`, และ `portfolioRunnerTrailPct` เข้า `simulateMaFanCounterfactual`, `ShadowWalkForwardContext`, `TuneCfg`, `evalTuneConfig`, `evaluatePendingBlockedSignals`, และเปิดแสดงค่าใน `activeTechnicalParams`
+     - **Stale Time-Stop & Runner Trail Physics**: จำลอง Stale Time-Stop (16 แท่ง `< +0.3%`) โดยยังคง `checkpointRetPct[16]` เมื่อออกที่แท่ง 16 (`staleTriggeredAtBar === cp`) เพื่อรักษาสถิติ `timeDecay`, และจำลอง Runner Trail หลัง TP1 ด้วยพื้น `+0.1%`
+- **ผล Multi-Window Zero-Lookahead OOS Backtest บน Binance (`V4` 25 เหรียญ • 21d / 60d / 120d • ค่าธรรมเนียม 0.15%/รอบ • MM 50% • 2 Slots)**:
+  - **Macro Sit-Out Modes (120d)**: `dual` ออกเพียง `2t` (`+0.15%`, OOS 30% `0t`); `off` ได้ `17t` (`+0.85%`, PF `1.28`, SL `2`); **`breadth_35`** ดีที่สุดใน Window 60d (`11t`, WR `54.5%`, `+1.48%`, PF `2.05`, MaxDD `0.97%`, SL `0`) และ Window 120d (`12t`, WR `58.3%`, **`+1.74%`**, PF **`2.23`**, SL `0`; OOS 30% `6t`, **`+1.43%`**, PF `2.63`; OOS 50% `11t`, `+1.48%`, PF `2.05`) *(หมายเหตุ: `portfolioSitOutMode` ปัจจุบันใน `config.ts` รองรับเฉพาะ `"off" | "btc1d" | "btc4h" | "dual"` — ยังไม่ได้ปรับ config จริงบนเซิร์ฟเวอร์)*
+  - **Sensitivity (`minRsi1h = 45` vs `40` บน `breadth_35`)**: การลด `minRsi1h` เป็น `40` ทำให้ผลลัพธ์พลิกขาดทุนทุกช่วงเวลา (21d: `-1.52%`, 60d: `-0.26%`, 120d: `-0.47%`) ยืนยันว่าเกณฑ์ **`minRsi1h = 45` จำเป็น**แม้ Counterfactual แบบเดี่ยวจะดูเหมือนพลาดชนะ
+  - **Causal Ablation (`OI_FLUSH`, `HEAVY_WICK`, `USD_SURGE`)**: `Half-Size USD_SURGE (>+0.5%)` ลด MaxDD และเพิ่ม PF ทุกช่วงเวลา (120d: PF `2.23 -> 2.85`, OOS 30% DD `0.97% -> 0.48%`, PF `2.63 -> 4.39`) แต่จำนวนเทรดรวมยังน้อย (`12t` บน 120d / `4t` ในช่วง OI 21d) จึงคงสถานะ Observe-Only ตามวินัย Anti-Overfit
+- **Version Bump**: **`0.3.1.15`** (`package.json`, `src/version.ts`, `public/index.html`)
+
