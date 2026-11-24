@@ -10295,6 +10295,7 @@ When investigating live production behavior, debugging issues, or analyzing trad
   3. **Binance — True Taker Buy% (`>=51.5%`) & Funding/OI Positioning Filter** (หลังเก็บตัวอย่างครบ ~20 วัน)
   4. **Binance — `US_OVERLAP_14_21` Session Guard** (ช่วงเวลาOverlap ที่ขาดทุนหนักสุดใน Shadow)
   5. **Binance — Blocked-Filter (`1hRSI`, `GAP_TRAP`, `VolR`) & Breadth Sit-Out (`breadth_50` vs `dual`) Recalibration** หลังยืนยันผลจริงโหมด `V4`
+  6. **Alpaca / Multi-Market — Near-TP1 Free-Roll / Soft Breakeven Guard (Observe/Backtest Candidate)**: จากเคสจริง `NEE` (`2026-11-24`, High `$84.86` = `+1.17%` / `97%` ของเป้า TP1 Floor `$84.89` และแตะ `EMA200 $84.75` แล้วถอย) — ตั้งสมมติฐานทดสอบว่าหาก MFE วิ่งถึง `>= 85%` ของระยะ TP1 (หรือ `>= +1.0%`) ก่อน TP1 Fill ควรขยับ Disaster SL จาก `-2.0%` ขึ้นมาบังไว้ที่ Breakeven (`0%` หรือ `-0.3%`) หรือไม่ (ต้องทดสอบ Zero-Lookahead OOS Backtest เทียบระหว่างไม้ที่รอดการกลับตัวเป็น SL เต็ม กับไม้ที่โดนสะบัดกินเท่าทุนก่อนทะลุ TP1 บนหุ้น US 49 ตัว + Binance 25 ตัวก่อนเปิดใช้จริง)
 - **Version Bump**: **`0.3.1.13`** (`package.json`, `src/version.ts`, `public/index.html`)
 
 ---
