@@ -41,7 +41,7 @@
     if (elBotVersionBadge) {
       const fullDate = info.commitDate ? `\nCommit Date: ${info.commitDate}` : "";
       const build = info.buildTime ? `\nBooted: ${new Date(info.buildTime).toLocaleString()}` : "";
-      elBotVersionBadge.title = `Dynamic Grid ${vStr}${cStr}\nCommit: ${info.commit || "local"}${fullDate}${build}\n(คลิกเพื่อดูรายละเอียด /api/version)`;
+      elBotVersionBadge.title = `Aegis Quant ${vStr}${cStr}\nCommit: ${info.commit || "local"}${fullDate}${build}\n(คลิกเพื่อดูรายละเอียด /api/version)`;
       elBotVersionBadge.onclick = () => {
         window.open(`${API_BASE}/api/version`, "_blank");
       };
@@ -3882,7 +3882,7 @@
     // Mid Price & 50% Center
     if (data.mid !== undefined) {
       if (elMidPrice) elMidPrice.textContent = fmtPrice(data.mid);
-      document.title = `$${fmtPrice(data.mid)} ${displaySymbol} | Dynamic Grid`;
+      document.title = `$${fmtPrice(data.mid)} ${displaySymbol} | Aegis Quant`;
     }
     if (data.centerPrice !== undefined && elAnchorPrice) elAnchorPrice.textContent = fmtPrice(data.centerPrice);
 

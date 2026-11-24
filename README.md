@@ -1,4 +1,4 @@
-# Dynamic Grid Bot — Binance Spot Trading Edition (`dynamic-grid-bn`)
+# Aegis Quant (`aegis-quant`) — Multi-Market Systematic Trading & Adaptive Learning Engine
 
 บอทเทรด **Dynamic Grid & Dow Theory Market Structure** แบบ Standalone สำหรับ **Binance Spot** 
 ปรับปรุงสเต็ปกรอบราคาแบบไดนามิกตามความผันผวนของตลาด (ATR) และโครงสร้างราคาแนวนอน Support/Resistance Multi-Touch อัตโนมัติ โดยส่งคำสั่งซื้อขายตรงเข้ากระดาน **Binance Spot API** พร้อมระบบควบคุมผ่านหน้าต่าง **Real-Time Web Dashboard**

@@ -1,6 +1,6 @@
-# Dynamic Grid Binance Spot — Project Knowledge & Memory (`GEMINI.md`)
+# Aegis Quant (`aegis-quant`) — Project Knowledge & Memory (`GEMINI.md`)
 
-This document is the persistent operational and architectural knowledge base for `dynamic-grid-bn`. It is automatically loaded into the agent's context to ensure continuity across sessions without re-analyzing the codebase from scratch.
+This document is the persistent operational and architectural knowledge base for `aegis-quant` (formerly `dynamic-grid-bn`). It is automatically loaded into the agent's context to ensure continuity across sessions without re-analyzing the codebase from scratch.
 
 ---
 
@@ -10296,3 +10296,12 @@ When investigating live production behavior, debugging issues, or analyzing trad
   4. **Binance — `US_OVERLAP_14_21` Session Guard** (ช่วงเวลาOverlap ที่ขาดทุนหนักสุดใน Shadow)
   5. **Binance — Blocked-Filter (`1hRSI`, `GAP_TRAP`, `VolR`) & Breadth Sit-Out (`breadth_50` vs `dual`) Recalibration** หลังยืนยันผลจริงโหมด `V4`
 - **Version Bump**: **`0.3.1.13`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 358. Project Rebrand — `Aegis Quant` (`aegis-quant`) (`package.json`, `public/index.html`, `public/app.js`, `README.md`, `GEMINI.md`, v0.3.1.14)
+- **สิ่งที่ปรับปรุง (Pure Branding — ไม่กระทบ DB, Settings, API, Strategy keys หรือ PM2)**:
+  - [`package.json`](file:///c:/Sites/github/dynamic-grid-bn/package.json): เปลี่ยน `"name"` เป็น `"aegis-quant"`
+  - [`public/index.html`](file:///c:/Sites/github/dynamic-grid-bn/public/index.html) & [`public/app.js`](file:///c:/Sites/github/dynamic-grid-bn/public/app.js): เปลี่ยน Title หน้าเว็บ (`Aegis Quant — Systematic Trading Dashboard`), Login (`Aegis Quant Hub`), Orchestrator Bar (`🛡️ AEGIS QUANT`), Badge (`AEGIS QUANT`), `document.title` และ Tooltip เวอร์ชัน เป็น **`Aegis Quant`**
+  - [`README.md`](file:///c:/Sites/github/dynamic-grid-bn/README.md) & [`GEMINI.md`](file:///c:/Sites/github/dynamic-grid-bn/GEMINI.md): อัปเดตชื่อโปรเจกต์เป็น **`Aegis Quant (aegis-quant)`**
+- **Version Bump**: **`0.3.1.14`** (`package.json`, `src/version.ts`, `public/index.html`)
