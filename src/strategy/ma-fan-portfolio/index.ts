@@ -65,6 +65,28 @@ export function countClosedBarsSince(c15: Candle[], lastClosedIdx: number, refBa
   return count;
 }
 
+/**
+ * Counts completed 15m trading bars (`bar.time + 900 > entrySec`) since position entry.
+ * Accepts either millisecond or second `entryTime` and ignores non-trading overnight gaps.
+ */
+export function countClosedBarsSinceEntry(c15: Candle[], lastClosedIdx: number, entryTime: number): number {
+  if (!c15 || c15.length === 0 || lastClosedIdx < 0 || !Number.isFinite(entryTime) || entryTime <= 0) {
+    return 0;
+  }
+  const entrySec = entryTime > 1e12 ? Math.floor(entryTime / 1000) : Math.floor(entryTime);
+  const bound = Math.min(lastClosedIdx, c15.length - 1);
+  let count = 0;
+  for (let i = bound; i >= 0; i--) {
+    const bar = c15[i]!;
+    if (bar.time + 900 > entrySec) {
+      if (bar.isClosed !== false) count++;
+    } else {
+      break;
+    }
+  }
+  return count;
+}
+
 export class MaFanPortfolioStrategy implements IStrategy {
   public readonly name = "MA-Fan Portfolio (3-Slot Rotation)";
   public readonly strategyType: StrategyType = "ma_fan_portfolio";
@@ -1270,6 +1292,24 @@ export class MaFanPortfolioStrategy implements IStrategy {
     } catch {}
   }
 
+  private resolveEffectiveTp1Mode(): "EMA200" | "EMA75" | "EMA25" | "none" {
+    const rawTp1 = this.cfg.portfolioTp1TargetMode || "EMA200";
+    const configuredTp1Mode: "EMA200" | "EMA75" | "EMA25" | "none" =
+      rawTp1 === "EMA25" || rawTp1 === "EMA75" || rawTp1 === "none" ? rawTp1 : "EMA200";
+    if (configuredTp1Mode === "none" || this.cfg.portfolioQuantRegimeConditional === false) {
+      return configuredTp1Mode;
+    }
+    const isAlpaca = this.exchange.exchangeName === "alpaca";
+    const breadthPct = Number(this.macroState.breadthAboveEma25Pct ?? 50);
+    if (isAlpaca) {
+      if (breadthPct < 55) return "EMA25";
+      if (breadthPct < 70) return "EMA75";
+      return "EMA200";
+    }
+    // On Crypto, Dual Sit-Out already blocks bear macro & fee is 0.15%; only step down TP1 in ultra-weak breadth (<20%)
+    return breadthPct < 20 ? "EMA75" : configuredTp1Mode;
+  }
+
   private async evaluatePortfolioCycle(): Promise<void> {
     const canExecute = !this.isPaused && !this.isMarketClosed;
     const sitOutEval = evaluateBenchmarkSitOut({
@@ -1313,31 +1353,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
     // 1. Evaluate Active Slot Exits (always update telemetry prices, execute only when active)
     const isAlpaca = this.exchange.exchangeName === "alpaca";
     const q2RegimeActive = this.cfg.portfolioQuantRegimeConditional !== false;
-    const breadthPct = Number(this.macroState.breadthAboveEma25Pct ?? 50);
-    const configuredTp1Mode = this.cfg.portfolioTp1TargetMode || "EMA200";
-    let tp1Mode = configuredTp1Mode;
+    const tp1Mode = this.resolveEffectiveTp1Mode();
     let regimeMinVolR = 1.3;
     let regimeMinRs = -1.0;
     let regimeMinRsi1h = 40;
-    if (q2RegimeActive) {
-      if (isAlpaca) {
-        if (breadthPct < 55) {
-          tp1Mode = configuredTp1Mode === "none" ? "none" : "EMA25";
-        } else if (breadthPct < 70) {
-          tp1Mode = configuredTp1Mode === "none" ? "none" : "EMA75";
-        } else {
-          tp1Mode = configuredTp1Mode === "none" ? "none" : "EMA200";
-        }
-      } else {
-        // On Crypto, Dual Sit-Out already blocks bear macro & fee is 0.15%; only step down TP1 in ultra-weak breadth (<20%)
-        tp1Mode =
-          configuredTp1Mode === "none"
-            ? "none"
-            : breadthPct < 20
-              ? "EMA75"
-              : configuredTp1Mode;
-      }
-    }
     const disasterSlPct = Number(this.cfg.portfolioDisasterSlPct ?? 3.5);
     const maxHoldHours = Number(this.cfg.portfolioMaxHoldHours || 0);
 
@@ -1362,8 +1381,9 @@ export class MaFanPortfolioStrategy implements IStrategy {
           ind.m16[i]! > ind.m25[i]! &&
           ind.m25[i]! > ind.m75[i]! &&
           ind.m75[i]! > ind.m200[i]!;
-        if (ind.lastClosedTime > slot.entryTime) {
-          slot.activeBarsHeld = Math.max(slot.activeBarsHeld, Math.floor((ind.lastClosedTime - slot.entryTime) / 900));
+        const barsHeld = countClosedBarsSinceEntry(ind.c15, ind.lastClosedIdx, slot.entryTime);
+        if (barsHeld > slot.activeBarsHeld) {
+          slot.activeBarsHeld = barsHeld;
         }
       }
       slot.tp1TargetPrice = tp1TargetPrice;
@@ -2450,7 +2470,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
             emas.ema75 > emas.ema200;
         }
 
-        let phaseText = "ถือรอถึง EMA200";
+        const effectiveTp1Mode = this.resolveEffectiveTp1Mode();
+        let phaseText = effectiveTp1Mode === "none" ? "ถือรอ Full Bullish Fan" : `ถือรอถึง ${effectiveTp1Mode}`;
         if (slot.pendingExitOnOpen) phaseText = "⏳ รอคัทตอนตลาดเปิด";
         else if (slot.tp1Done && slot.beLocked) phaseText = "TP1 แล้ว • ล็อก BE รอ Full Fan";
         else if (slot.beLocked) phaseText = "ล็อก BE แล้ว • รันกำไร";
@@ -2658,7 +2679,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
                 ema200: inspectedInd.m200[inspectedInd.lastClosedIdx] || 0,
               }
             : null),
-        tp1Mode: this.cfg.portfolioTp1TargetMode || "EMA200",
+        tp1Mode: this.resolveEffectiveTp1Mode(),
         disasterSlPct: Number(this.cfg.portfolioDisasterSlPct ?? 3.5),
         wsConnected: isAlpaca
           ? this.wsConnected

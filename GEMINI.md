@@ -32,6 +32,7 @@ This document is the persistent operational and architectural knowledge base for
 > 1. **ต้องดึงสถานะสดจาก Orchestrator เสมอ**: เมื่อผู้ใช้ถามสถานะ แจ้งปัญหา หรือส่งรูปภาพ ต้องล็อกอินด้วย `.env` (`ORCH_URL` / `ORCH_USERNAME` / `ORCH_PASSWORD`) แล้วดึงข้อมูลจาก `/api/orch/instances` และ `/i/<instanceKey>/api/*` เสมอ ห้ามสรุปจากไฟล์บนเครื่อง Local เด็ดขาด
 > 2. **Safe Partial Config Patch**: เมื่อปรับค่า Runtime Settings ผ่าน `POST /i/<instanceKey>/api/config` ให้ส่งเฉพาะฟิลด์ที่ต้องการเปลี่ยน ห้ามส่งค่า `"******"` ทับ credentials และห้ามส่ง `strategyType`/`strategyMode` เว้นแต่ตั้งใจสลับโหมดกลยุทธ์
 > 3. **Zero-Lookahead & Anti-Bias Backtesting**: ทุกครั้งที่เขียนสคริปต์จำลองหรือรัน Backtest ห้ามมี Look-Ahead Bias เด็ดขาด: (ก) อินดิเคเตอร์ Timeframe ใหญ่ (`1h RSI`, `4h/1d EMA`) ต้องอ้างอิงเฉพาะแท่งที่ปิดสมบูรณ์แล้วก่อนหรือ ณ เวลาแท่งปัจจุบัน (`c1h.time + 3600 <= c15.time`), (ข) ข้อมูลเรียนรู้ย้อนหลัง (`Shadow EV`, `WinMAE`, `Cooldown`) ต้องรับรู้ผล ณ แท่งที่ไม้นั้นปิดจบจริง (`resolveTime = exitBarTime <= currentBarTime`), (ค) ต้องจำลองเงินทุนจำกัด (`initialCapital` + `portfolioCapitalUsagePct` MM Cap + หัก Cash ทันที + หักค่าธรรมเนียมไป-กลับ), และ (ง) ต้องแยกวัดผล **In-Sample (Train) vs Out-of-Sample (OOS Test)** เสมอ ห้ามปรับจูนเกณฑ์แล้วรายงานเฉพาะผล In-Sample
+> 4. **Proactive Improvement & Learning Audit on Every Bot Check**: ทุกครั้งที่ผู้ใช้สั่งให้ตรวจสอบ/เช็กสถานะบอท นอกเหนือจากสรุปสถานะสดแล้ว ต้องแนบบทวิเคราะห์สั้นๆ เสมอ 3 ส่วน (แบบ Read-Only ห้ามแก้โค้ดหรือค่าตั้งค่าเองก่อนได้รับอนุญาต): (ก) **บั๊ก/จุดผิดปกติที่ควรปรับปรุง** จาก Telemetry/Logs สด (หรือระบุว่าไม่พบ), (ข) **รีวิวการเรียนรู้ที่ผ่านมา** จาก `/api/learning/report` โดยแยกชัดว่า **ตัวไหนใช้ได้ดี** vs **ตัวไหนผลน้อย/ควรปรับหรือพิจารณาเอาออก** (อ้างอิงตัวเลข OOS/WR/Saved% และขนาดตัวอย่าง $N$), และ (ค) **แนวคิดเพิ่มการเรียนรู้ใหม่** แบบ Zero-Lookahead เฉพาะเมื่อเห็นช่องโหว่จริงจากข้อมูล (หากข้อมูลยังไม่พอให้แนะนำรอเก็บตัวอย่างแทน ไม่ยัดฟีเจอร์เกินจำเป็น)
 
 ---
 
@@ -10227,3 +10228,17 @@ When investigating live production behavior, debugging issues, or analyzing trad
      - ใน `MaFanPortfolioStrategy` & `onPortfolioEntry`: บันทึก `mayerMultiple`, `macroRiskIndex`, `usdRet5dPct` (เฉพาะค่าตัวเลขที่ใช้งานได้จริง ไม่แปลง `null` เป็น `0`) ลง `features` ของตาราง `trade_learning_journal` เมื่อเปิดไม้จริง
 - **การแสดงผลบนแดชบอร์ด (`public/app.js`)**: เพิ่มการ์ด **`🌐 Macro Regime 1D — Mayer / Risk Index / USD Proxy (Observe-Only)`** แสดงค่า 1D ล่าสุดคู่กับสถิติ Shadow WR/Avg PnL ของแต่ละโซนในหน้า Learning Report Modal
 - **Version Bump**: **`0.3.1.9`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 354. Telemetry & Alpaca 1D Bar Close Fixes — Post-Close 1D Lag, Slot `holdingBars` & Dynamic Q2 TP1 `phaseText` (`src/exchange/alpaca/feed.ts`, `src/strategy/ma-fan-portfolio/index.ts`, v0.3.1.10)
+- **สาเหตุที่ตรวจพบจากการตรวจสอบระบบสดบน Orchestrator**:
+  1. **แท่ง `1D` ของ Alpaca ไม่อัปเดตหลังตลาดปิดนาน ~8 ชม.**: แท่ง `1Day` จาก Alpaca ระบุ Timestamp ที่ `00:00 ET` (`04:00Z`/`05:00Z`) เดิมเช็ก `last.time + 86400 > nowSec` ทำให้หลังตลาดปิดไปแล้วตอน `16:00 ET` (`04:00` น. ไทย) แท่งของวันนั้นยังถูกตีเป็น `isClosed = false` ยาวไปจนถึง `00:00 ET` (`12:00` น. ไทย) กดให้ `gap1dPct`, `Mayer Multiple`, และ `Macro Risk Index` ค้างเป็นวันก่อนหน้า
+  2. **`holdingBars` ของ Slot ที่ถืออยู่ค้างเป็น `0` ตลอด**: ใน `evaluatePortfolioCycle()` เทียบ `ind.lastClosedTime` (วินาที) กับ `slot.entryTime` (มิลลิวินาที) ซึ่งผิดหน่วย `1000x`
+  3. **`phaseText` บนการ์ด Slot และ `portfolio.tp1Mode` แสดงค่า Config ดิบแทนโหมด Q2 Regime จริง**: แสดง `"ถือรอถึง EMA200"` แม้ Q2 Regime จะสลับเป้า TP1 จริงเป็น `EMA25` หรือ `EMA75` แล้วก็ตาม
+- **การแก้ไข (ไม่แตะกฎซื้อ/ขายหรือฟิลเตอร์ใดๆ)**:
+  - [`src/exchange/alpaca/feed.ts`](file:///c:/Sites/github/dynamic-grid-bn/src/exchange/alpaca/feed.ts): เพิ่ม Helper `isAlpacaBarClosed(barTimeSec, interval, nowSec)` โดยใช้ Offset `58,500` วินาที (`16h 15m` หลัง `00:00 ET`) สำหรับแท่ง `1d`/`1day` ทั้งใน `fetchAlpacaBars()` และ `fetchAlpacaMultiBars()` ป้องกันทั้ง Intra-day Look-Ahead และ Post-Close Lag 8 ชม.
+  - [`src/strategy/ma-fan-portfolio/index.ts`](file:///c:/Sites/github/dynamic-grid-bn/src/strategy/ma-fan-portfolio/index.ts):
+    - เพิ่ม `countClosedBarsSinceEntry(c15, lastClosedIdx, entryTime)` รองรับทั้ง ms/sec และนับเฉพาะแท่ง `15m` ที่ปิดจริงหลังเข้าออเดอร์ (ไม่นับช่วงตลาด US ปิดข้ามคืน)
+    - แยก `resolveEffectiveTp1Mode()` ใช้ร่วมกันทั้ง `evaluatePortfolioCycle()`, `buildSlotTelemetryList()` (`phaseText`), และ `emitTelemetryTick()` (`portfolio.tp1Mode`)
+- **Version Bump**: **`0.3.1.10`** (`package.json`, `src/version.ts`, `public/index.html`)

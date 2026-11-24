@@ -122,6 +122,22 @@ export function intervalToSeconds(interval: string): number {
   }
 }
 
+/**
+ * Determines whether an Alpaca bar has finalized.
+ * Alpaca 1Day bars are timestamped at 00:00 ET (04:00Z EDT / 05:00Z EST) and finalize
+ * at US regular close (16:00 ET); adding 16h15m (58,500s) avoids both intraday look-ahead
+ * and the 8-hour post-close stale delay caused by adding a full 86,400s.
+ */
+export function isAlpacaBarClosed(
+  barTimeSec: number,
+  interval: string,
+  nowSec = Math.floor(Date.now() / 1000),
+): boolean {
+  const iv = (interval || "").toLowerCase();
+  const closeOffsetSec = iv === "1d" || iv === "1day" ? 58_500 : intervalToSeconds(interval);
+  return nowSec >= barTimeSec + closeOffsetSec;
+}
+
 export function mapIntervalToAlpacaTimeframe(interval: string): { timeframe: string; aggregateHours: number } {
   switch (interval.toLowerCase()) {
     case "1m":
@@ -328,7 +344,7 @@ export async function fetchAlpacaBars(params: FetchAlpacaBarsParams): Promise<Ca
 
   if (candles.length > 0) {
     const last = candles[candles.length - 1]!;
-    if (last.time + intervalSec > nowSec) {
+    if (!isAlpacaBarClosed(last.time, params.interval, nowSec)) {
       last.isClosed = false;
     }
   }
@@ -708,7 +724,7 @@ export async function fetchAlpacaMultiBars(params: {
       }
       if (candles.length > 0) {
         const last = candles[candles.length - 1]!;
-        if (last.time + intervalSec > nowSec) last.isClosed = false;
+        if (!isAlpacaBarClosed(last.time, params.interval, nowSec)) last.isClosed = false;
       }
       if (candles.length > perSymLimit) candles = candles.slice(-perSymLimit);
       out.set(normalizeStockSymbol(sym), candles);
