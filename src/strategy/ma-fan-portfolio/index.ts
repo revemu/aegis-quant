@@ -179,6 +179,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
   private initialLearningBootstrapDone: boolean = false;
   private initialShadowBootstrapComplete: boolean = false;
   private breadthHistory: Array<{ timeMs: number; breadthPct: number }> = [];
+  private corrGuardLogBar = new Map<string, number>();
 
   // Real-time Alpaca WebSocket hybrid stream (<= 30 symbols) & live chart sync
   private alpacaWs?: AlpacaPortfolioWsClient;
@@ -676,6 +677,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
     this.atrSource = atrSource;
     this.snapshots.clear();
     this.setupStates.clear();
+    this.corrGuardLogBar.clear();
     this.radarList = [];
     this.lastUniverseFetchTs = 0;
     this.inspectedSymbol = this.resolveInitialInspectedSymbol();
@@ -1082,6 +1084,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
         // Update live qty / price on matching persisted slots, clear closed Alpaca positions, and adopt orphaned ones
         const retainedSlots: ActivePortfolioSlot[] = [];
         const clearedSlots: ActivePortfolioSlot[] = [];
+        const adoptedSlots: ActivePortfolioSlot[] = [];
         const shrunkSymbols = new Set<string>();
         for (const slot of this.slots) {
           const exPos = heldMap.get(slot.symbol);
@@ -1107,18 +1110,20 @@ export class MaFanPortfolioStrategy implements IStrategy {
           let slotIndex = 0;
           while (usedIdx.has(slotIndex)) slotIndex++;
           const slPct = Number(this.cfg.portfolioDisasterSlPct ?? 3.5);
-          this.slots.push({
+          const entryPrice = p.avgEntryPrice || p.currentPrice;
+          const allocatedCapital = p.marketValue || entryPrice * p.qty;
+          const adoptedSlot: ActivePortfolioSlot = {
             slotIndex,
             symbol: sym,
             entryTime: Date.now(),
-            entryPrice: p.avgEntryPrice || p.currentPrice,
-            allocatedCapital: p.marketValue || p.avgEntryPrice * p.qty,
-            stopLossPrice: slPct > 0 ? (p.avgEntryPrice || p.currentPrice) * (1 - slPct / 100) : 0,
+            entryPrice,
+            allocatedCapital,
+            stopLossPrice: slPct > 0 ? entryPrice * (1 - slPct / 100) : 0,
             qty: p.qty,
             initialQty: p.qty,
-            troughPrice: p.currentPrice || p.avgEntryPrice,
-            peakPrice: p.currentPrice || p.avgEntryPrice,
-            lastKnownPrice: p.currentPrice || p.avgEntryPrice,
+            troughPrice: p.currentPrice || entryPrice,
+            peakPrice: p.currentPrice || entryPrice,
+            lastKnownPrice: p.currentPrice || entryPrice,
             beLocked: false,
             tp1Done: false,
             realizedProceeds: 0,
@@ -1126,8 +1131,26 @@ export class MaFanPortfolioStrategy implements IStrategy {
             realizedExitFees: 0,
             activeBarsHeld: 0,
             entryReason: "Adopted Alpaca Position",
-          });
+          };
+          this.slots.push(adoptedSlot);
+          adoptedSlots.push(adoptedSlot);
           this.log(`🔄 [Portfolio Sync] Adopted live Alpaca position into Slot ${slotIndex + 1}: ${sym} (${p.qty} @ $${p.avgEntryPrice})`);
+        }
+        for (const adopted of adoptedSlots) {
+          await this.db.syncRecentTradesFromExchange(this.exchange, adopted.symbol).catch(() => {});
+          adopted.learningJournalUid = await this.learning.onPortfolioEntry({
+            exchange: this.exchange.exchangeName,
+            symbol: adopted.symbol,
+            slotIndex: adopted.slotIndex,
+            entryTimeMs: adopted.entryTime,
+            entryPrice: adopted.entryPrice,
+            signalPrice: adopted.entryPrice,
+            qty: adopted.qty,
+            allocatedQuote: adopted.allocatedCapital,
+            snapshot: this.radarList.find((r) => r.symbol === adopted.symbol),
+            macro: this.macroState,
+            score: 0,
+          });
         }
         for (const sym of shrunkSymbols) {
           await this.db.syncRecentTradesFromExchange(this.exchange, sym).catch(() => {});
@@ -1145,7 +1168,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
           this.inspectedSymbol = this.slots[0]!.symbol;
           this.cfg.portfolioInspectedSymbol = this.inspectedSymbol;
         }
-        this.saveState(clearedSlots.length > 0);
+        this.saveState(clearedSlots.length > 0 || adoptedSlots.length > 0);
       } catch (err) {
         this.log(`⚠️ Failed to sync Alpaca positions: ${(err as Error).message}`);
       }
@@ -1240,6 +1263,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
   public async resetBotState(opts?: any): Promise<{ success: boolean }> {
     this.slots = [];
     this.setupStates.clear();
+    this.corrGuardLogBar.clear();
     if (opts?.resetPnl || opts?.fullReset) {
       this.realizedPnl = 0;
       this.tradeRealizedPnl = 0;
@@ -1340,6 +1364,28 @@ export class MaFanPortfolioStrategy implements IStrategy {
       this.snapshots.set(sym, ind);
     }
 
+    if (res.snapshots.size > 0) {
+      const keepSymbols = new Set<string>([
+        this.benchmarkSymbol,
+        ...res.symbols,
+        ...res.snapshots.keys(),
+        ...this.slots.map((s) => s.symbol),
+      ]);
+      const prunedSymbols: string[] = [];
+      for (const sym of Array.from(this.snapshots.keys())) {
+        if (!keepSymbols.has(sym)) {
+          this.snapshots.delete(sym);
+          this.setupStates.delete(sym);
+          prunedSymbols.push(sym);
+        }
+      }
+      if (prunedSymbols.length > 0) {
+        this.log(
+          `🧹 [Universe Sync] Pruned ${prunedSymbols.length} rotated-out symbol(s): ${prunedSymbols.slice(0, 8).join(", ")}${prunedSymbols.length > 8 ? "..." : ""}`,
+        );
+      }
+    }
+
     // Ensure inspectedSymbol points to something loaded
     if (!this.snapshots.has(this.inspectedSymbol)) {
       this.inspectedSymbol = this.slots[0]?.symbol || res.symbols[0] || this.inspectedSymbol;
@@ -1433,11 +1479,20 @@ export class MaFanPortfolioStrategy implements IStrategy {
   private async evaluatePortfolioCycle(): Promise<void> {
     const canExecute = !this.isPaused && !this.isMarketClosed;
 
+    let newestClosedBarSec = 0;
+    for (const ind of this.snapshots.values()) {
+      if (ind.lastClosedTime > newestClosedBarSec) {
+        newestClosedBarSec = ind.lastClosedTime;
+      }
+    }
+    const staleThresholdSec = newestClosedBarSec > 0 ? newestClosedBarSec - 4 * 900 : 0;
+
     // Breadth: % of universe above EMA25 on latest closed 15m candle
     let above25 = 0;
     let totalCount = 0;
     for (const ind of this.snapshots.values()) {
       if (ind.symbol === this.benchmarkSymbol) continue;
+      if (staleThresholdSec > 0 && ind.lastClosedTime > 0 && ind.lastClosedTime < staleThresholdSec) continue;
       totalCount++;
       const idx = ind.lastClosedIdx;
       if (ind.c15[idx] && ind.m25[idx] && ind.c15[idx]!.close > ind.m25[idx]!) {
@@ -1709,6 +1764,11 @@ export class MaFanPortfolioStrategy implements IStrategy {
     for (const [sym, ind] of this.snapshots.entries()) {
       const idx = ind.lastClosedIdx;
       if (idx < 200) continue;
+      const barTime = ind.lastClosedTime;
+      const isHeld = this.slots.some((s) => s.symbol === sym);
+      if (!isHeld && staleThresholdSec > 0 && barTime > 0 && barTime < staleThresholdSec) {
+        continue;
+      }
 
       let st = this.setupStates.get(sym);
       if (!st) {
@@ -1717,10 +1777,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
         this.setupStates.set(sym, st);
       }
 
-      const barTime = ind.lastClosedTime;
       if (barTime > maxClosedBarSec) maxClosedBarSec = barTime;
       const c = ind.c15[idx]!;
-      const isHeld = this.slots.some((s) => s.symbol === sym);
 
       const m4 = ind.m4[idx]!;
       const m8 = ind.m8[idx]!;
@@ -2123,9 +2181,14 @@ export class MaFanPortfolioStrategy implements IStrategy {
             }
             const maxCorrLimit = isAlpaca ? 0.75 : 0.85;
             if (maxCorr > maxCorrLimit) {
-              this.log(
-                `🛡️ [Quant Q1 Corr Guard] Skipped ${ch.sym} (corr ${(maxCorr * 100).toFixed(0)}% > ${(maxCorrLimit * 100).toFixed(0)}% vs held ${corrSym})`,
-              );
+              const corrLogKey = `${ch.sym}:${corrSym}`;
+              const corrBarSec = chInd.lastClosedTime || Math.floor(Date.now() / 900_000) * 900;
+              if (this.corrGuardLogBar.get(corrLogKey) !== corrBarSec) {
+                this.corrGuardLogBar.set(corrLogKey, corrBarSec);
+                this.log(
+                  `🛡️ [Quant Q1 Corr Guard] Skipped ${ch.sym} (corr ${(maxCorr * 100).toFixed(0)}% > ${(maxCorrLimit * 100).toFixed(0)}% vs held ${corrSym})`,
+                );
+              }
               continue;
             }
           }

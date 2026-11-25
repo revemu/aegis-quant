@@ -10368,3 +10368,24 @@ When investigating live production behavior, debugging issues, or analyzing trad
   - `EMA8_CONFIRMED`: Full N=28, WR 64.3%, PF 2.26, MaxDD 0.98% | OOS WR 62.5%, PF 2.77, R:R 1.66
   - `EMA16_CONFIRMED`: Full N=21, WR 71.4%, PF 3.88, MaxDD 0.98%, SL=1 | OOS WR 66.7%, PF 3.89, R:R 1.95, Avg +1.01%
 - **Version Bump**: **`0.3.1.18`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 363. Fix Alpaca Cancel Race Condition, Learning Sync on Adopt, Stale Universe Snapshots & Corr Guard Log Spam (`v0.3.1.19`)
+- **สาเหตุของปัญหา (พบจาก Telemetry และ Log สดของ `alpaca_kyne` และ `binance_dry`)**:
+  1. **Alpaca Protective Limit Cancel Race Condition ([`src/exchange/alpaca/client.ts`](file:///c:/Sites/github/aegis-quant/src/exchange/alpaca/client.ts))**: `mapAlpacaOrderStatus` แมป `pending_cancel` เป็น `"CANCELED"` ทั้งที่ออเดอร์ยังค้างอยู่บนกระดานและมีโอกาสแมตช์ได้ และหลังเรียก `cancelOrder` ระบบรอเพียง `200ms` แล้วโยน error `unfilled within timeout (canceled)` ทำให้เคส `VOO` (6 หุ้น, `\$3,948`) แมตช์ระหว่าง `pending_cancel` จนบอทข้ามไปซื้อ `NVDA` แทนแล้วต้องให้ `Portfolio Sync` มา Adopt ย้อนหลัง (และเกิดอาการเดียวกันตอนขาย `COST` ซ้ำ 6 รอบ)
+  2. **Adopted Position ไม่บันทึกเข้า Learning DB ([`src/strategy/ma-fan-portfolio/index.ts`](file:///c:/Sites/github/aegis-quant/src/strategy/ma-fan-portfolio/index.ts))**: เมื่อ `syncOnChainOrders()` Adopt หุ้นที่ตกหล่นจาก Exchange เข้า Slot ระบบไม่ได้เรียก `syncRecentTradesFromExchange` และ `learning.onPortfolioEntry()` ทำให้จำนวน `openTrades` ใน Learning DB ตกหล่นไม่ตรงกับพอร์ตจริง
+  3. **Stale Snapshots ค้างใน Dynamic Universe ของ `binance_dry`**: เหรียญที่หมุนออกจาก Top Dynamic Universe ยังค้างอยู่ใน `this.snapshots` และ `this.setupStates` จนทำให้ `FETUSDT` (ค้างเก่า 837 นาที) ปรากฏเป็น `WAITING_PULLBACK` บน Slot 1 และดึงค่า Breadth ให้เพี้ยน
+  4. **Log Spam ของ `[Quant Q1 Corr Guard]`**: พ่นข้อความ `Skipped SPY (corr 97% > 75% vs held NVDA)` ซ้ำทุก tick (~0.5 วินาที) รวม 25 บรรทัดใน 13 วินาที
+- **สิ่งที่แก้ไข (`v0.3.1.19`)**:
+  1. **Alpaca Terminal Cancel Poll & Race Fill Booking (`src/exchange/alpaca/client.ts`)**:
+     - เพิ่ม `isAlpacaTerminalStatus` และเปลี่ยน `pending_cancel` ใน `mapAlpacaOrderStatus` ให้เป็น `"NEW"` (ยังไม่ถือว่าจบ)
+     - หลังสั่ง `cancelOrder()` ให้วน poll `GET /v2/orders/:id` แบบ bounded (`[250, 400, 600, 900, 1200, 1500]` ms) จนกว่าจะถึงสถานะ Terminal จริง และหาก `filled_qty > 0` ให้คืนผล `ExchangeOrderResult` ตามจำนวนที่แมตช์ได้จริงโดยไม่โยน error ทิ้ง
+  2. **Sync Trade & Learning Entry on Adopt (`src/strategy/ma-fan-portfolio/index.ts`)**:
+     - `syncOnChainOrders()` เรียก `db.syncRecentTradesFromExchange` และ `learning.onPortfolioEntry` ให้กับทุก `adoptedSlot` พร้อมเก็บ `learningJournalUid` และบันทึก state ทันที
+  3. **Prune Rotated-Out & Stale Snapshots (`src/strategy/ma-fan-portfolio/index.ts`)**:
+     - ใน `refreshUniverseBars()` ลบเหรียญที่ไม่อยู่ในชุด Universe ล่าสุด, Benchmark, หรือ Slot ที่ถืออยู่ออกจาก `this.snapshots` และ `this.setupStates`
+     - ใน `evaluatePortfolioCycle()` ข้าม snapshot ที่ `lastClosedTime < newestClosedBarSec - 4 * 900` (เก่ากว่าแท่งล่าสุด > 1 ชม.) ทั้งในการคำนวณ Breadth และ Radar/Candidates (ยกเว้นตัวที่ถือใน Slot)
+  4. **Throttle `[Quant Q1 Corr Guard]` Log (`src/strategy/ma-fan-portfolio/index.ts`)**:
+     - เก็บ `corrGuardLogBar` (`symbol:corrSym -> lastClosedTime`) เพื่อ log ได้ไม่เกิน 1 ครั้งต่อแท่ง 15m ต่อคู่ (เคลียร์ใน `updateExchangeClient` และ `resetBotState`)
+- **Version Bump**: **`0.3.1.19`** (`package.json`, `src/version.ts`, `public/index.html`)

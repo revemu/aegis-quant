@@ -29,12 +29,26 @@ export interface AlpacaMarketClock {
   nextClose: string;
 }
 
+const ALPACA_TERMINAL_STATUSES = new Set([
+  "filled",
+  "canceled",
+  "expired",
+  "rejected",
+  "done_for_day",
+  "stopped",
+  "suspended",
+]);
+
+function isAlpacaTerminalStatus(rawStatus?: string): boolean {
+  return ALPACA_TERMINAL_STATUSES.has((rawStatus || "").toLowerCase());
+}
+
 function mapAlpacaOrderStatus(rawStatus?: string): ExchangeOrderResult["status"] {
   const s = (rawStatus || "").toLowerCase();
   if (s === "filled") return "FILLED";
   if (s === "partially_filled") return "PARTIALLY_FILLED";
-  if (s === "new" || s === "accepted" || s === "pending_new") return "NEW";
-  if (s === "canceled" || s === "pending_cancel") return "CANCELED";
+  if (s === "new" || s === "accepted" || s === "pending_new" || s === "pending_cancel") return "NEW";
+  if (s === "canceled") return "CANCELED";
   if (s === "expired") return "EXPIRED";
   if (s === "rejected") return "REJECTED";
   return "NEW";
@@ -363,7 +377,7 @@ export class AlpacaClient implements IExchangeClient {
         const curFilledQty = parseFloat(o.filled_qty || 0);
         const curFilledAvg = parseFloat(o.filled_avg_price || 0);
         if (curStatus === "FILLED" && curFilledQty > 0 && curFilledAvg > 0) break;
-        if (curStatus === "CANCELED" || curStatus === "REJECTED" || curStatus === "EXPIRED") break;
+        if (isAlpacaTerminalStatus(o.status) && curStatus !== "FILLED") break;
         await new Promise((r) => setTimeout(r, waitMs));
         try {
           const pollRes = await fetch(`${this.baseUrl}/v2/orders/${o.id}`, { headers: this.getHeaders() });
@@ -374,29 +388,33 @@ export class AlpacaClient implements IExchangeClient {
           // ignore transient poll failure and retry
         }
       }
-      let finalStatus = mapAlpacaOrderStatus(o.status);
-      if (
-        isProtectiveIoc &&
-        finalStatus !== "FILLED" &&
-        finalStatus !== "CANCELED" &&
-        finalStatus !== "REJECTED" &&
-        finalStatus !== "EXPIRED"
-      ) {
+      if (isProtectiveIoc && !isAlpacaTerminalStatus(o.status)) {
         await this.cancelOrder(cleanSym, o.id).catch(() => {});
-        await new Promise((r) => setTimeout(r, 200));
-        try {
-          const afterCancelRes = await fetch(`${this.baseUrl}/v2/orders/${o.id}`, { headers: this.getHeaders() });
-          if (afterCancelRes.ok) {
-            o = await afterCancelRes.json();
+        const cancelDelays = [250, 400, 600, 900, 1200, 1500];
+        for (const waitMs of cancelDelays) {
+          await new Promise((r) => setTimeout(r, waitMs));
+          try {
+            const afterCancelRes = await fetch(`${this.baseUrl}/v2/orders/${o.id}`, { headers: this.getHeaders() });
+            if (afterCancelRes.ok) {
+              o = await afterCancelRes.json();
+            }
+          } catch {
+            // ignore transient poll failure and retry
           }
-        } catch {
-          // ignore
+          const curStatus = mapAlpacaOrderStatus(o.status);
+          const curFilledQty = parseFloat(o.filled_qty || 0);
+          const curFilledAvg = parseFloat(o.filled_avg_price || 0);
+          if (curStatus === "FILLED") {
+            if (curFilledQty > 0 && curFilledAvg > 0) break;
+          } else if (isAlpacaTerminalStatus(o.status)) {
+            break;
+          }
         }
-        finalStatus = mapAlpacaOrderStatus(o.status);
       }
+      const finalStatus = mapAlpacaOrderStatus(o.status);
       const finalFilledQty = parseFloat(o.filled_qty || 0);
       if (isProtectiveIoc && finalFilledQty <= 0) {
-        throw new Error(`Alpaca protective limit ${cleanSym} @ $${body.limit_price} unfilled within timeout (canceled)`);
+        throw new Error(`Alpaca protective limit ${cleanSym} @ $${body.limit_price} unfilled within timeout (${o.status || "canceled"})`);
       }
       if (
         type === "market" &&
