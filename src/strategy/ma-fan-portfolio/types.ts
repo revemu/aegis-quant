@@ -45,6 +45,14 @@ export type RadarStage =
   | "BOTTOM_FAN"
   | "SCANNING";
 
+export interface PortfolioChartSignalMarker {
+  time: number;
+  kind: "CROSS_8X16" | "SIGNAL_READY" | "SIGNAL_BLOCKED" | "SLOT_ENTRY";
+  text: string;
+  detail: string;
+  price: number;
+}
+
 export interface PortfolioRadarCandidate {
   symbol: string;
   price: number;

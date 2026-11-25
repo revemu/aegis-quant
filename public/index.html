@@ -13,7 +13,7 @@
   <link
     href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap"
     rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=0.3.1.17" />
+  <link rel="stylesheet" href="style.css?v=0.3.1.18" />
   <!-- TradingView Lightweight Charts -->
   <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 </head>
@@ -2508,7 +2508,9 @@
                 <div class="form-group">
                   <label for="cfg_portfolioPullbackMode">🎯 จังหวะรอเข้าซื้อหลังเกิดสัญญาณ (Pullback Timing Mode)</label>
                   <select id="cfg_portfolioPullbackMode" class="form-select">
-                    <option value="EMA8_HOLD">🛡️ รอย่อถึงฐาน EMA8 + ยืนแนวรับได้ + กัน Gap (แนะนำ)</option>
+                    <option value="EMA16_CONFIRMED">💎 รอย่อลึกถึงฐาน EMA16 + แท่งปิดคอนเฟิร์ม (WR &amp; R:R สูงสุด — แนะนำ)</option>
+                    <option value="EMA8_CONFIRMED">🛡️ รอย่อถึงฐาน EMA8 + แท่งปิดคอนเฟิร์มแรงซื้อ</option>
+                    <option value="EMA8_HOLD">📊 รอย่อถึงฐาน EMA8 + ปิดยืนแนวรับได้ + กัน Gap</option>
                     <option value="EMA4_TOUCH">⚡ แตะ EMA4 เข้าทันที (พร้อมกัน Gap)</option>
                   </select>
                 </div>
@@ -3446,7 +3448,7 @@
     </div>
   </div>
 
-  <script src="app.js?v=0.3.1.17"></script>
+  <script src="app.js?v=0.3.1.18"></script>
 </body>
 
 </html>

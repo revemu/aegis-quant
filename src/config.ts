@@ -446,8 +446,8 @@ export const defaultStrategyConfig = {
   portfolioMaxBudgetUsd: 0,
   /** Percentage of total portfolio capital allowed to be deployed across all slots (MM cap, default 50%). */
   portfolioCapitalUsagePct: 50,
-  /** Pullback entry timing mode: "EMA8_HOLD" (wait for EMA8 support pullback & hold + anti-gap) or "EMA4_TOUCH". */
-  portfolioPullbackMode: "EMA8_HOLD" as "EMA8_HOLD" | "EMA4_TOUCH",
+  /** Pullback entry timing mode: "EMA16_CONFIRMED" | "EMA8_CONFIRMED" | "EMA8_HOLD" | "EMA4_TOUCH". */
+  portfolioPullbackMode: "EMA8_HOLD" as "EMA8_HOLD" | "EMA4_TOUCH" | "EMA8_CONFIRMED" | "EMA16_CONFIRMED",
   /** Quant Q1: Cross-asset rolling return correlation guard (blocks rho > 0.75 vs held slots). */
   portfolioQuantCorrelationGuard: true,
   /** Quant Q2: Regime-conditional TP1 & filter auto-switching by market breadth. */
@@ -702,7 +702,12 @@ export function loadConfigFromDatabase(): typeof defaultStrategyConfig {
       if (saved.portfolioCapitalUsagePct !== undefined && Number.isFinite(Number(saved.portfolioCapitalUsagePct))) {
         merged.portfolioCapitalUsagePct = Math.min(100, Math.max(10, Number(saved.portfolioCapitalUsagePct)));
       }
-      if (saved.portfolioPullbackMode === "EMA8_HOLD" || saved.portfolioPullbackMode === "EMA4_TOUCH") {
+      if (
+        saved.portfolioPullbackMode === "EMA8_HOLD" ||
+        saved.portfolioPullbackMode === "EMA4_TOUCH" ||
+        saved.portfolioPullbackMode === "EMA8_CONFIRMED" ||
+        saved.portfolioPullbackMode === "EMA16_CONFIRMED"
+      ) {
         merged.portfolioPullbackMode = saved.portfolioPullbackMode;
       }
       if (typeof saved.portfolioQuantCorrelationGuard === "boolean") {

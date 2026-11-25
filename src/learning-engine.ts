@@ -25,6 +25,11 @@ import type {
 } from "./pg-store.js";
 import { calcMACD, calcRSI } from "./strategy/ma-fan/exhaustion.js";
 import { calcEMA } from "./strategy/ma-fan/ribbon.js";
+import {
+  evaluatePullbackCandleConfirm,
+  normalizePullbackMode,
+  type PullbackModeName,
+} from "./strategy/ma-fan-portfolio/signals.js";
 import type { PortfolioMacroState, PortfolioRadarCandidate } from "./strategy/ma-fan-portfolio/types.js";
 
 const COOLDOWN_MS = 48 * 3_600_000;
@@ -206,7 +211,7 @@ export interface ShadowWalkForwardContext {
   staleExitBars?: number;
   staleExitMaxGainPct?: number;
   runnerTrailPct?: number;
-  pullbackMode?: "EMA8_HOLD" | "EMA4_TOUCH";
+  pullbackMode?: PullbackModeName;
   minVolRatio?: number;
   minRelStrength?: number;
   minRsi1h?: number;
@@ -1313,18 +1318,22 @@ export function decodeTpModeNumeric(num: number): TpModeName {
   return "EMA200";
 }
 
-export type PullbackModeName = "EMA8_HOLD" | "EMA4_TOUCH";
-
-function normalizePullbackMode(m?: string): PullbackModeName {
-  return m === "EMA4_TOUCH" ? "EMA4_TOUCH" : "EMA8_HOLD";
-}
+export type { PullbackModeName };
 
 export function encodePullbackModeNumeric(m: string | undefined): number {
-  return m === "EMA4_TOUCH" ? 4 : 8;
+  const mode = normalizePullbackMode(m);
+  if (mode === "EMA4_TOUCH") return 4;
+  if (mode === "EMA8_CONFIRMED") return 9;
+  if (mode === "EMA16_CONFIRMED") return 16;
+  return 8;
 }
 
 export function decodePullbackModeNumeric(n: number): PullbackModeName {
-  return Math.round(Number(n)) === 4 ? "EMA4_TOUCH" : "EMA8_HOLD";
+  const r = Math.round(Number(n));
+  if (r === 4) return "EMA4_TOUCH";
+  if (r === 9) return "EMA8_CONFIRMED";
+  if (r === 16) return "EMA16_CONFIRMED";
+  return "EMA8_HOLD";
 }
 
 function tuneCfgFromConfig(cfg: Config): TuneCfg {
@@ -1354,7 +1363,11 @@ interface TuningEvent {
   timeSec: number;
   entryPrice: number;
   entryPriceEma8?: number;
+  entryPriceNextOpen?: number;
+  ema4TouchOk?: boolean;
   ema8HoldOk?: boolean;
+  ema8ConfirmedOk?: boolean;
+  ema16ConfirmedOk?: boolean;
   snrAtr?: number;
   minSnrAtr?: number;
   rsi1h: number;
@@ -1366,6 +1379,9 @@ interface TuningEvent {
   dist25Ema8?: number;
   dist75Ema8?: number;
   dist200Ema8?: number;
+  dist25NextOpen?: number;
+  dist75NextOpen?: number;
+  dist200NextOpen?: number;
   futureBars: Candle[];
 }
 
@@ -1464,13 +1480,20 @@ function evalTuneConfig(groups: TuningEvent[][], cfg: TuneCfg, splitTime: number
   const train = newAcc();
   const test = newAcc();
   const lastBarBySym = new Map<string, number>();
-  const useEma8 = cfg.pullbackMode === "EMA8_HOLD";
+  const mode = cfg.pullbackMode;
+
+  const matchesPullbackMode = (ev: TuningEvent): boolean => {
+    if (mode === "EMA4_TOUCH") return ev.ema4TouchOk !== false;
+    if (mode === "EMA8_CONFIRMED") return ev.ema8ConfirmedOk === true;
+    if (mode === "EMA16_CONFIRMED") return ev.ema16ConfirmedOk === true;
+    return ev.ema8HoldOk === true;
+  };
 
   for (const g of groups) {
     const e = g.find(
       (ev) =>
         ev.barIdx - (lastBarBySym.get(ev.symbol) ?? -999) >= 8 &&
-        (!useEma8 || ev.ema8HoldOk !== false) &&
+        matchesPullbackMode(ev) &&
         (ev.snrAtr === undefined || ev.snrAtr >= (ev.minSnrAtr ?? 1.25)) &&
         ev.rsi1h >= cfg.minRsi1h &&
         ev.volR >= cfg.minVolR &&
@@ -1479,14 +1502,16 @@ function evalTuneConfig(groups: TuningEvent[][], cfg: TuneCfg, splitTime: number
     if (!e) continue;
     lastBarBySym.set(e.symbol, e.barIdx);
 
-    const hasEma8 = useEma8 && e.entryPriceEma8 !== undefined && e.entryPriceEma8 > 0;
-    const px = hasEma8 ? e.entryPriceEma8! : e.entryPrice;
-    const dist = hasEma8
+    const isClosedMode = mode !== "EMA4_TOUCH";
+    const px = isClosedMode
+      ? (e.entryPriceNextOpen ?? e.entryPriceEma8 ?? e.entryPrice)
+      : e.entryPrice;
+    const dist = isClosedMode
       ? cfg.tpMode === "EMA25"
-        ? (e.dist25Ema8 ?? e.dist25)
+        ? (e.dist25NextOpen ?? e.dist25Ema8 ?? e.dist25)
         : cfg.tpMode === "EMA75"
-          ? (e.dist75Ema8 ?? e.dist75)
-          : (e.dist200Ema8 ?? e.dist200)
+          ? (e.dist75NextOpen ?? e.dist75Ema8 ?? e.dist75)
+          : (e.dist200NextOpen ?? e.dist200Ema8 ?? e.dist200)
       : cfg.tpMode === "EMA25"
         ? e.dist25
         : cfg.tpMode === "EMA75"
@@ -1562,7 +1587,7 @@ function analyzeTuning(events: TuningEvent[], cur: TuneCfg, costPct = 0): Tuning
     { param: "portfolioMinRelStrength24h", label: "Min RS 24h vs Benchmark (%)", values: [-3, -2, -1, 0, 1], apply: (c, v) => ({ ...c, minRs: v }), curVal: cur.minRs },
     { param: "portfolioMinRsi1h", label: "Min 1h RSI", values: [35, 40, 45, 50], apply: (c, v) => ({ ...c, minRsi1h: v }), curVal: cur.minRsi1h },
     { param: "portfolioTp1TargetMode", label: "TP1 Target Mode", values: ["EMA25", "EMA75", "EMA200"], apply: (c, v) => ({ ...c, tpMode: v }), curVal: cur.tpMode },
-    { param: "portfolioPullbackMode", label: "Pullback Entry Timing", values: ["EMA8_HOLD", "EMA4_TOUCH"], apply: (c, v) => ({ ...c, pullbackMode: v }), curVal: cur.pullbackMode },
+    { param: "portfolioPullbackMode", label: "Pullback Entry Timing", values: ["EMA16_CONFIRMED", "EMA8_CONFIRMED", "EMA8_HOLD", "EMA4_TOUCH"], apply: (c, v) => ({ ...c, pullbackMode: v }), curVal: cur.pullbackMode },
   ];
 
   const recs: TuningRecommendation[] = [];
@@ -1570,10 +1595,14 @@ function analyzeTuning(events: TuningEvent[], cur: TuneCfg, costPct = 0): Tuning
 
   for (const cand of candidates) {
     let best: { v: number | string; res: ReturnType<typeof evalTuneConfig>; score: number } | null = null;
+    const effectiveMinTrainN =
+      cand.param === "portfolioPullbackMode"
+        ? Math.max(10, Math.floor(base.train.trades * 0.35))
+        : minTrainN;
     for (const v of cand.values) {
       if (v === cand.curVal) continue;
       const res = evalTuneConfig(groups, cand.apply(cur, v), splitTime, costPct);
-      if (res.train.trades < minTrainN) continue;
+      if (res.train.trades < effectiveMinTrainN) continue;
       if (res.train.avgPnlPct <= base.train.avgPnlPct + 0.03) continue;
       if (res.train.profitFactor < base.train.profitFactor) continue;
       const sc = quantScore(res.train);
@@ -1720,7 +1749,7 @@ function buildTunableCandidatePatch(
     case "portfolioPullbackMode": {
       const curMode = normalizePullbackMode(cfg.portfolioPullbackMode);
       const nextMode = String(suggested) as PullbackModeName;
-      if (!["EMA8_HOLD", "EMA4_TOUCH"].includes(nextMode) || nextMode === curMode) return null;
+      if (!["EMA4_TOUCH", "EMA8_HOLD", "EMA8_CONFIRMED", "EMA16_CONFIRMED"].includes(nextMode) || nextMode === curMode) return null;
       return {
         patchVal: nextMode,
         oldNum: encodePullbackModeNumeric(curMode),
@@ -2814,28 +2843,57 @@ export class LearningEngine {
 
           const prev = idx - 1;
           const prevBar = coin.c15[prev]!;
+          const nextBar = coin.c15[idx + 1]!;
           const limitP = coin.m4[prev]!;
           const limitP8 = coin.m8[prev]!;
           const touchedEma4 = limitP > 0 && coin.m8[prev]! >= coin.m16[prev]! && c.low <= limitP * 1.001;
           const curBarGap = isGapInducedBar(prevBar, c, ex);
+          const canClosedConfirmRaw = !rawCrossWasGap && !curBarGap && coin.m8[idx]! >= coin.m16[idx]!;
           const ema8HoldOk =
-            limitP8 > 0 &&
-            coin.m8[prev]! >= coin.m16[prev]! &&
-            !rawCrossWasGap &&
-            !curBarGap &&
-            c.low <= limitP8 * 1.0015 &&
-            c.close >= coin.m8[idx]! * 0.999;
+            canClosedConfirmRaw &&
+            evaluatePullbackCandleConfirm({
+              bar: c,
+              m4: coin.m4[idx]!,
+              m8: coin.m8[idx]!,
+              m16: coin.m16[idx]!,
+              pullbackMode: "EMA8_HOLD",
+            }).triggered;
+          const ema8ConfirmedOk =
+            canClosedConfirmRaw &&
+            evaluatePullbackCandleConfirm({
+              bar: c,
+              m4: coin.m4[idx]!,
+              m8: coin.m8[idx]!,
+              m16: coin.m16[idx]!,
+              pullbackMode: "EMA8_CONFIRMED",
+            }).triggered;
+          const ema16ConfirmedOk =
+            canClosedConfirmRaw &&
+            evaluatePullbackCandleConfirm({
+              bar: c,
+              m4: coin.m4[idx]!,
+              m8: coin.m8[idx]!,
+              m16: coin.m16[idx]!,
+              pullbackMode: "EMA16_CONFIRMED",
+            }).triggered;
           const primaryTriggered =
-            basePullbackMode === "EMA8_HOLD"
-              ? limitP8 > 0 &&
-                coin.m8[prev]! >= coin.m16[prev]! &&
-                !crossWasGap &&
+            basePullbackMode === "EMA4_TOUCH"
+              ? touchedEma4
+              : !crossWasGap &&
                 !curBarGap &&
-                c.low <= limitP8 * 1.0015 &&
-                c.close >= coin.m8[idx]! * 0.999
-              : touchedEma4;
+                coin.m8[idx]! >= coin.m16[idx]! &&
+                evaluatePullbackCandleConfirm({
+                  bar: c,
+                  m4: coin.m4[idx]!,
+                  m8: coin.m8[idx]!,
+                  m16: coin.m16[idx]!,
+                  pullbackMode: basePullbackMode,
+                }).triggered;
           const activePrimary = waitingPullback && idx > waitFromIdx && idx - lastEntryIdx >= 8 && primaryTriggered;
-          const activeRaw = rawWaitingPullback && idx > rawWaitFromIdx && (touchedEma4 || ema8HoldOk);
+          const activeRaw =
+            rawWaitingPullback &&
+            idx > rawWaitFromIdx &&
+            (touchedEma4 || ema8HoldOk || ema8ConfirmedOk || ema16ConfirmedOk);
 
           if (activePrimary || activeRaw) {
             const rsi1hVal = coin.rsi1h.length >= 20 && p1 >= 14 ? (coin.rsi1h[p1] ?? 50) : 50;
@@ -2855,19 +2913,23 @@ export class LearningEngine {
             const rs24 = coinRet24 - (benchInfo?.ret24h ?? 0);
             const entryPrice = limitP > 0 ? Math.min(c.open, limitP) : c.close;
             const entryPriceEma8 = limitP8 > 0 ? Math.min(c.open, limitP8 * 1.001) : entryPrice;
+            const entryPriceNextOpen = nextBar.open > 0 ? nextBar.open : c.close;
             const futureBars = coin.c15.slice(idx + 1, Math.min(n, idx + 33));
 
-            if (entryPrice > 0 && futureBars.length >= 8) {
+            if (entryPrice > 0 && entryPriceNextOpen > 0 && futureBars.length >= 8) {
               const dist25 = ((coin.m25[prev]! - entryPrice) / entryPrice) * 100;
               const dist75 = ((coin.m75[prev]! - entryPrice) / entryPrice) * 100;
               const dist200 = ((coin.m200[prev]! - entryPrice) / entryPrice) * 100;
               const dist25Ema8 = ((coin.m25[prev]! - entryPriceEma8) / entryPriceEma8) * 100;
               const dist75Ema8 = ((coin.m75[prev]! - entryPriceEma8) / entryPriceEma8) * 100;
               const dist200Ema8 = ((coin.m200[prev]! - entryPriceEma8) / entryPriceEma8) * 100;
+              const dist25NextOpen = ((coin.m25[idx]! - entryPriceNextOpen) / entryPriceNextOpen) * 100;
+              const dist75NextOpen = ((coin.m75[idx]! - entryPriceNextOpen) / entryPriceNextOpen) * 100;
+              const dist200NextOpen = ((coin.m200[idx]! - entryPriceNextOpen) / entryPriceNextOpen) * 100;
 
               const curAtrPct = Math.max(0.12, calcCandleAtrPct14(coin.c15, prev));
               const isAlpacaEx = ex === "alpaca";
-              const effDist200 = basePullbackMode === "EMA8_HOLD" ? dist200Ema8 : dist200;
+              const effDist200 = basePullbackMode === "EMA4_TOUCH" ? dist200 : dist200NextOpen;
               const snrAtr = (isAlpacaEx ? effDist200 : Math.max(0.8, effDist200)) / curAtrPct;
               const minSnrAtr = isAlpacaEx ? 1.25 : 0.65;
 
@@ -2879,7 +2941,11 @@ export class LearningEngine {
                   timeSec: c.time,
                   entryPrice,
                   entryPriceEma8,
+                  entryPriceNextOpen,
+                  ema4TouchOk: touchedEma4,
                   ema8HoldOk,
+                  ema8ConfirmedOk,
+                  ema16ConfirmedOk,
                   snrAtr,
                   minSnrAtr,
                   rsi1h: rsi1hVal,
@@ -2891,16 +2957,19 @@ export class LearningEngine {
                   dist25Ema8,
                   dist75Ema8,
                   dist200Ema8,
+                  dist25NextOpen,
+                  dist75NextOpen,
+                  dist200NextOpen,
                   futureBars,
                 });
               }
 
               if (activePrimary && rsi1hVal >= baseMinRsi1h && volR >= baseMinVolR && rs24 >= baseMinRs) {
-                const useEma8Primary = basePullbackMode === "EMA8_HOLD" && entryPriceEma8 > 0;
-                const simEntryPrice = useEma8Primary ? entryPriceEma8 : entryPrice;
-                const d25 = useEma8Primary ? dist25Ema8 : dist25;
-                const d75 = useEma8Primary ? dist75Ema8 : dist75;
-                const d200 = useEma8Primary ? dist200Ema8 : dist200;
+                const useClosedPrimary = basePullbackMode !== "EMA4_TOUCH";
+                const simEntryPrice = useClosedPrimary ? entryPriceNextOpen : entryPrice;
+                const d25 = useClosedPrimary ? dist25NextOpen : dist25;
+                const d75 = useClosedPrimary ? dist75NextOpen : dist75;
+                const d200 = useClosedPrimary ? dist200NextOpen : dist200;
                 const distTarget = baseTpMode === "EMA25" ? d25 : baseTpMode === "EMA75" ? d75 : d200;
                 const sim = simulateMaFanCounterfactual(simEntryPrice, distTarget, slTriggerPct, futureBars, costPct, shadowExitOpts);
 

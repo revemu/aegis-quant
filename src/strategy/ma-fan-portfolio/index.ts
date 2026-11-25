@@ -30,11 +30,18 @@ export { isGapInducedBar };
 import type { IStrategy, Lot, MarketClockInfo, StrategyContext, StrategyEvent, StrategyType } from "../types.js";
 import type {
   CoinSetupState,
+  PortfolioChartSignalMarker,
   PortfolioMacroState,
   PortfolioRadarCandidate,
   PortfolioSlotTelemetry,
   SymbolIndicatorSnapshot,
 } from "./types.js";
+import {
+  computePortfolioChartSignals,
+  evaluatePullbackCandleConfirm,
+  getPullbackModeLabel,
+  normalizePullbackMode,
+} from "./signals.js";
 import {
   backfillBinanceTakerVolumeIfNeeded,
   binanceDerivativesCache,
@@ -180,6 +187,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
   private lastChartEmitTs: number = 0;
   private lastSyncedClosed15mBySymbol = new Map<string, number>();
   private lastSyncedClosed1hBySymbol = new Map<string, number>();
+  private cachedSignalMarkers: { key: string; markers: PortfolioChartSignalMarker[] } | null = null;
 
   constructor(context: StrategyContext) {
     this.exchange = context.exchange;
@@ -494,7 +502,12 @@ export class MaFanPortfolioStrategy implements IStrategy {
     if (Number.isFinite(Number(this.cfg.portfolioCapitalUsagePct))) {
       this.cfg.portfolioCapitalUsagePct = Math.min(100, Math.max(10, Number(this.cfg.portfolioCapitalUsagePct)));
     }
-    if (clean.portfolioPullbackMode === "EMA8_HOLD" || clean.portfolioPullbackMode === "EMA4_TOUCH") {
+    if (
+      clean.portfolioPullbackMode === "EMA8_HOLD" ||
+      clean.portfolioPullbackMode === "EMA4_TOUCH" ||
+      clean.portfolioPullbackMode === "EMA8_CONFIRMED" ||
+      clean.portfolioPullbackMode === "EMA16_CONFIRMED"
+    ) {
       this.cfg.portfolioPullbackMode = clean.portfolioPullbackMode;
     }
     for (const qKey of [
@@ -750,13 +763,56 @@ export class MaFanPortfolioStrategy implements IStrategy {
     return this.snapshots.values().next().value?.c1h ?? [];
   }
 
+  private getInspectedSignalMarkers(sym: string): PortfolioChartSignalMarker[] {
+    const ind = sym ? this.snapshots.get(sym) : undefined;
+    if (!ind || ind.lastClosedIdx < 200) return [];
+    const slot = this.slots.find((s) => s.symbol === sym) || null;
+    const pullbackMode = normalizePullbackMode(this.cfg.portfolioPullbackMode);
+    const minVolRatio = Number.isFinite(Number(this.cfg.portfolioMinBuyVolRatio))
+      ? Number(this.cfg.portfolioMinBuyVolRatio)
+      : 1.3;
+    const minRelStrength24h = Number.isFinite(Number(this.cfg.portfolioMinRelStrength24h))
+      ? Number(this.cfg.portfolioMinRelStrength24h)
+      : -1.0;
+    const minRsi1h = Number.isFinite(Number(this.cfg.portfolioMinRsi1h))
+      ? Number(this.cfg.portfolioMinRsi1h)
+      : 40;
+    const minRoomToEma200Pct = Math.max(0, Number(this.cfg.portfolioMinRoomToEma200Pct ?? 0));
+    const disasterSlPct = Number(this.cfg.portfolioDisasterSlPct ?? 2.0);
+    const useSessionGuard = this.cfg.portfolioQuantSessionGuard !== false;
+    const useVolTargetedRisk = this.cfg.portfolioQuantVolTargetedRisk !== false;
+
+    const cacheKey = `${sym}|${ind.lastClosedTime}|${pullbackMode}|${minVolRatio}|${minRelStrength24h}|${minRsi1h}|${minRoomToEma200Pct}|${useSessionGuard}|${useVolTargetedRisk}|${slot?.slotIndex ?? -1}|${slot?.entryTime ?? 0}`;
+    if (this.cachedSignalMarkers && this.cachedSignalMarkers.key === cacheKey) {
+      return this.cachedSignalMarkers.markers;
+    }
+
+    const markers = computePortfolioChartSignals({
+      ind,
+      benchmark15m: this.benchmark15m,
+      exchangeName: this.exchange.exchangeName,
+      pullbackMode,
+      minVolRatio,
+      minRelStrength24h,
+      minRsi1h,
+      minRoomToEma200Pct,
+      disasterSlPct,
+      useSessionGuard,
+      useVolTargetedRisk,
+      activeSlot: slot ? { slotIndex: slot.slotIndex, entryTime: slot.entryTime, entryPrice: slot.entryPrice } : null,
+    });
+    this.cachedSignalMarkers = { key: cacheKey, markers };
+    return markers;
+  }
+
   public getInspectPayload() {
     const sym = this.inspectedSymbol || this.slots[0]?.symbol || this.radarList[0]?.symbol || this.symbolInfo.symbol;
     const snap = this.snapshots.get(sym);
     const slot = this.slots.find((s) => s.symbol === sym);
     const radar = this.radarList.find((r) => r.symbol === sym);
+    const pullbackMode = normalizePullbackMode(this.cfg.portfolioPullbackMode);
     if (!snap) {
-      return { symbol: sym, candles: [], htfCandles: [], emas: null, slot: slot || null, radar: radar || null };
+      return { symbol: sym, candles: [], htfCandles: [], emas: null, slot: slot || null, radar: radar || null, pullbackMode, signalMarkers: [] };
     }
     const buildLine = (vals: number[]) =>
       snap.c15.map((c, idx) => ({ time: c.time, value: Number((vals[idx] ?? c.close).toFixed(6)) }));
@@ -774,6 +830,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
       },
       slot: slot || null,
       radar: radar || null,
+      pullbackMode,
+      signalMarkers: this.getInspectedSignalMarkers(sym),
     };
   }
 
@@ -823,7 +881,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       staleExitBars: exitOpts.staleExitBars,
       staleExitMaxGainPct: exitOpts.staleExitMaxGainPct,
       runnerTrailPct: exitOpts.runnerTrailPct,
-      pullbackMode: this.cfg.portfolioPullbackMode,
+      pullbackMode: normalizePullbackMode(this.cfg.portfolioPullbackMode),
       minVolRatio: baseMinVolR,
       minRelStrength: baseMinRs,
       minRsi1h: baseMinRsi1h,
@@ -1829,31 +1887,28 @@ export class MaFanPortfolioStrategy implements IStrategy {
         stage = "SCANNING";
         filterNote = "ตลาดปิดทำการ (พักสแกนสัญญาณเข้าซื้อ)";
       } else if (st.waitingPullback && m8 >= m16) {
-        const pullbackMode = this.cfg.portfolioPullbackMode || "EMA8_HOLD";
+        const pullbackMode = normalizePullbackMode(this.cfg.portfolioPullbackMode);
         const prevBar = ind.c15[Math.max(0, idx - 1)];
-        const curLiveBar = ind.c15[ind.c15.length - 1];
-        const curBarOpen = curLiveBar && curLiveBar.time > barTime ? curLiveBar.open : c.open;
         const curBarGap = isGapInducedBar(prevBar, c, this.exchange.exchangeName);
         const isGapBlocked = Boolean(st.crossWasGap || curBarGap);
+        const barAfterCross = barTime > st.waitFromBarTime;
 
-        const touchedEma8 = c.low <= m8 * 1.0015 || livePx <= m8 * 1.0015;
-        const touchedEma4 = c.low <= m4 * 1.001 || livePx <= m4 * 1.001;
-        if (pullbackMode === "EMA8_HOLD" ? touchedEma8 : touchedEma4) {
+        const confirm = evaluatePullbackCandleConfirm({
+          bar: c,
+          m4,
+          m8,
+          m16,
+          pullbackMode,
+          livePrice: livePx,
+        });
+        if (confirm.touchedZone && barAfterCross) {
           st.pullbackTouched = true;
           st.pullbackLow = Math.min(st.pullbackLow ?? Infinity, c.low, livePx);
         }
 
-        // In EMA8_HOLD mode: must dip to EMA8 support zone, hold above EMA8, and not be a falling-knife red dump
-        const holdsSupport =
-          pullbackMode === "EMA8_HOLD"
-            ? Boolean(st.pullbackTouched) &&
-              livePx <= m4 * 1.0015 &&
-              livePx >= m8 * 0.999 &&
-              c.close >= m8 * 0.999 &&
-              livePx >= curBarOpen * 0.9995
-            : livePx <= m4 * 1.001;
+        const holdsSupport = barAfterCross && confirm.triggered;
 
-        if (isGapBlocked && touchedEma4) {
+        if (isGapBlocked && barAfterCross && (confirm.touchedZone || confirm.triggered)) {
           stage = "CROSS_8X16_FAIL_FILTERS";
           filterNote = "Gap Up Trap (รอย่อสร้างฐานใหม่)";
           gapBlockedThisBar = true;
@@ -1894,11 +1949,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
           }
         } else {
           stage = "WAITING_PULLBACK";
-          filterNote = st.pullbackTouched
-            ? "แตะโซนรับแล้ว • รอจังหวะหยุดไหล/งัดกลับ"
-            : pullbackMode === "EMA8_HOLD"
-              ? "สัญญาณพร้อม • รอย่อหาฐาน EMA8"
-              : "สัญญาณพร้อม • รอย่อแตะ EMA4";
+          filterNote = `สัญญาณพร้อม • ${confirm.reason}`;
         }
       } else if (st.hadBottomFan || isBottomFan) {
         stage = "BOTTOM_FAN";
@@ -2028,7 +2079,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
             staleExitBars,
             staleExitMaxGainPct: staleMaxGainPct,
             runnerTrailPct,
-            pullbackMode: this.cfg.portfolioPullbackMode,
+            pullbackMode: normalizePullbackMode(this.cfg.portfolioPullbackMode),
             minVolRatio: baseMinVolR,
             minRelStrength: baseMinRs,
             minRsi1h: baseMinRsi1h,
@@ -2313,7 +2364,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       entryFeeQuote: entryFee,
       realizedExitFees: 0,
       activeBarsHeld: 0,
-      entryReason: `MA-Fan Pullback ${this.cfg.portfolioPullbackMode === "EMA4_TOUCH" ? "EMA4" : "EMA8"} (Score ${score.toFixed(1)})`,
+      entryReason: `MA-Fan Pullback ${getPullbackModeLabel(normalizePullbackMode(this.cfg.portfolioPullbackMode))} (Score ${score.toFixed(1)})`,
     };
     this.slots.push(slot);
     this.inspectedSymbol = symbol;
@@ -2349,7 +2400,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       notional: actualCost,
       status: "FILLED",
       action: "BUY_FILL",
-      levelDesc: `Slot ${slotIndex + 1} • ${this.cfg.portfolioPullbackMode === "EMA4_TOUCH" ? "EMA4" : "EMA8"} Pullback Entry`,
+      levelDesc: `Slot ${slotIndex + 1} • ${getPullbackModeLabel(normalizePullbackMode(this.cfg.portfolioPullbackMode))} Entry`,
       reason: slot.entryReason,
       placedTime: slot.entryTime,
       fillTime: slot.entryTime,
@@ -2754,7 +2805,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
             ? `🛡️ ${survival.posture} (${effMaxSlots} slots • ${(survival.positionSizeScale * 100).toFixed(0)}% size) • `
             : `👁️ Observe ${survival.posture} • `
           : "";
-      const pbLabel = this.cfg.portfolioPullbackMode === "EMA4_TOUCH" ? "EMA4" : "EMA8";
+      const pbLabel = getPullbackModeLabel(normalizePullbackMode(this.cfg.portfolioPullbackMode));
       botActionReason = `${survPrefix}พร้อมเข้า ${readyCount} ตัว • รอย่อ ${pbLabel} ${waitCount} ตัว • MM ${(this.getCapitalUsageRatio() * 100).toFixed(0)}% • Universe ${this.macroState.universeCount} ตัว • ${this.macroState.reason}`;
     }
 
@@ -2835,6 +2886,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
               }
             : null),
         tp1Mode: this.resolveEffectiveTp1Mode(),
+        pullbackMode: normalizePullbackMode(this.cfg.portfolioPullbackMode),
+        inspectedSignalMarkers: this.getInspectedSignalMarkers(inspectedSym),
         disasterSlPct: Number(this.cfg.portfolioDisasterSlPct ?? 3.5),
         wsConnected: isAlpaca
           ? this.wsConnected

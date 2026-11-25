@@ -10344,3 +10344,27 @@ When investigating live production behavior, debugging issues, or analyzing trad
   2. ขยายหน้าต่างรอ `pendingSellMarket` จาก `30s` เป็น **`120s`**, ห้ามยกเลิกออเดอร์ที่สถานะเป็น **`PARTIALLY_FILLED`**, และเพิ่มเวลารอหลัง `cancelAllOpenOrders` จาก `250ms` เป็น **`1000ms`**
 - **Version Bump**: **`0.3.1.17`** (`package.json`, `src/version.ts`, `public/index.html`)
 
+
+---
+
+## 362. MA-Fan Portfolio Confirmed Pullback Entry Modes, Learning OOS Integration & Chart Signal Markers (`v0.3.1.18`)
+- **ปัญหาที่ตรวจพบจากการวิเคราะห์สด (`alpaca_kyne`, เคส `COST`) และผล Zero-Lookahead OOS Backtest**:
+  1. ในโหมด `EMA8_HOLD` เดิม ระบบใช้ตัวแปร `pullbackTouched` จำค้างข้ามแท่งแล้วเข้าซื้อทันทีใน 3 วินาทีแรกหลังเปิดแท่งใหม่ (`livePx >= curBarOpen * 0.9995`) ทำให้มักได้ราคาต้นแท่งที่ไม่รอแท่งปิดคอนเฟิร์มและมีจุดหลอกสูง
+  2. บนกราฟ Portfolio แสดงแค่เส้นแนวนอน `Entry` (ไม่มีจุด Marker บอกแท่งที่เกิดสัญญาณ `8>16`, แท่งที่เข้าเกณฑ์ `⚡ เข้าได้`, หรือแท่งที่ติดฟิลเตอร์ `⛔`) และเส้นแผนเข้าฮาร์ดโค้ดคำว่า `EMA4` ทั้งที่บอทรันโหมด `EMA8_HOLD`
+- **สิ่งที่พัฒนาและแก้ไข (`v0.3.1.18`)**:
+  1. **สร้างโมดูลกลาง [`src/strategy/ma-fan-portfolio/signals.ts`](file:///c:/Sites/github/aegis-quant/src/strategy/ma-fan-portfolio/signals.ts)** เป็น Single Source of Truth:
+     - เพิ่มโหมดรอย่อคอนเฟิร์ม 4 ระดับ (`PullbackModeName`: `EMA16_CONFIRMED`, `EMA8_CONFIRMED`, `EMA8_HOLD`, `EMA4_TOUCH`) โดยโหมดปิดแท่ง (`EMA16_CONFIRMED`, `EMA8_CONFIRMED`, `EMA8_HOLD`) จะตรวจจังหวะ **แท่ง 15m ปิดยืนฐานได้จริง + ไม่ไล่ราคาหลังแท่งปิด (`<= bar.close * 1.004`)** และโหมด `*_CONFIRMED` เพิ่มเงื่อนไขแท่งเขียวหรือไส้ล่างรับ `>= 35%` (`closePos >= 55%`) + ไส้บน `< 45%`
+     - แก้ไข `EMA8_HOLD` ใน [`src/strategy/ma-fan-portfolio/index.ts`](file:///c:/Sites/github/aegis-quant/src/strategy/ma-fan-portfolio/index.ts) ให้ตัดอาการจำ `pullbackTouched` ค้างข้ามคลื่นและไม่ยิงกลางแท่งต้นแท่ง
+     - เพิ่มฟังก์ชัน `computePortfolioChartSignals` สำหรับคำนวณ Marker ย้อนหลังแบบ Zero-Lookahead (`CROSS_8X16`, `SIGNAL_READY`, `SIGNAL_BLOCKED`, `SLOT_ENTRY`) และส่งผ่านทั้ง `/api/portfolio/inspect` และ `tick.portfolio.inspectedSignalMarkers`
+  2. **ผสาน 4 โหมดเข้า Learning Engine ([`src/learning-engine.ts`](file:///c:/Sites/github/aegis-quant/src/learning-engine.ts))**:
+     - อัปเดต `runShadowWalkForward`, `evalTuneConfig`, `analyzeTuning` (`minTrainN` ผ่อนปรนเป็น `35%` เฉพาะ `portfolioPullbackMode` เพื่อให้โหมดคัดกรองเข้มที่เทรดน้อยแต่ WR/PF สูงแข่งขันได้), และ `buildTunableCandidatePatch` (`encodePullbackModeNumeric`: `EMA4_TOUCH=4, EMA8_HOLD=8, EMA8_CONFIRMED=9, EMA16_CONFIRMED=16`) พร้อมรองรับ Auto-Rollback ครบทุกโหมด
+  3. **Dashboard UI ([`public/app.js`](file:///c:/Sites/github/aegis-quant/public/app.js) & [`public/index.html`](file:///c:/Sites/github/aegis-quant/public/index.html))**:
+     - แสดง Marker บนกราฟ 15m (`8>16`, `⚡ เข้าได้`, `⛔`, `🟢 S1 เข้า`) พร้อมรายละเอียดเมื่อเอาเมาส์ชี้ (Crosshair Tooltip)
+     - แก้เส้นแผนเข้า `lineMfPlanEntry` ให้วางบนเส้น EMA ที่ตรงกับโหมดที่ใช้อยู่จริง (`EMA16` / `EMA8` / `EMA4`) และเพิ่มตัวเลือกทั้ง 4 โหมดใน Settings Modal
+- **ผล Zero-Lookahead OOS Backtest (Alpaca 48 หุ้น US, 1,000 แท่ง 15m, SL 2.0%, Cost 0.06%)**:
+  - `EMA4_TOUCH`: Full WR 48.6%, PF 0.55, MaxDD 3.17% | OOS WR 50.0%, PF 0.78, R:R 0.78
+  - `EMA8_HOLD` (เดิม): Full WR 56.3%, PF 1.14, MaxDD 2.17% | OOS WR 57.9%, PF 1.83, R:R 1.33
+  - `EMA8_HOLD` (ใหม่ปิดแท่ง): Full WR 63.6%, PF 1.95, MaxDD 1.18% | OOS WR 63.2%, PF 2.63, R:R 1.53
+  - `EMA8_CONFIRMED`: Full N=28, WR 64.3%, PF 2.26, MaxDD 0.98% | OOS WR 62.5%, PF 2.77, R:R 1.66
+  - `EMA16_CONFIRMED`: Full N=21, WR 71.4%, PF 3.88, MaxDD 0.98%, SL=1 | OOS WR 66.7%, PF 3.89, R:R 1.95, Avg +1.01%
+- **Version Bump**: **`0.3.1.18`** (`package.json`, `src/version.ts`, `public/index.html`)

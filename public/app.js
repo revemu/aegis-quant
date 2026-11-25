@@ -223,6 +223,8 @@
   let orderMarkers = [];
   let rawOrders = [];
   let structureMarkers = [];
+  let portfolioSignalMarkers = [];
+  const portfolioSignalByTime = new Map();
   let pendingCandles = null;
   const cachedCandlesMap = new Map();
   const candleHasMultipleExits = new Set();
@@ -309,8 +311,12 @@
 
   function renderChartOrderTooltip(candleTime, point) {
     if (!elChartOrderTooltip || !chartContainer) return;
-    const orders = ordersByCandleTime.get(candleTime);
-    if (!orders || orders.length === 0) {
+    const orders = ordersByCandleTime.get(candleTime) || [];
+    const pfSignals =
+      isPortfolioType(latestGridData?.strategyType, latestGridData?.strategyMode) && currentActiveTimeframe === "15m"
+        ? (portfolioSignalByTime.get(candleTime) || [])
+        : [];
+    if (orders.length === 0 && pfSignals.length === 0) {
       hideChartOrderTooltip();
       return;
     }
@@ -410,12 +416,43 @@
       `;
     }
 
+    const signalCardsHtml = pfSignals
+      .map((sig) => {
+        const badgeStyle =
+          sig.kind === "SLOT_ENTRY"
+            ? "background:rgba(16,185,129,0.2); color:#34d399; border:1px solid rgba(16,185,129,0.4);"
+            : sig.kind === "SIGNAL_READY"
+              ? "background:rgba(34,211,238,0.2); color:#22d3ee; border:1px solid rgba(34,211,238,0.4);"
+              : sig.kind === "CROSS_8X16"
+                ? "background:rgba(251,191,36,0.2); color:#fbbf24; border:1px solid rgba(251,191,36,0.4);"
+                : "background:rgba(148,163,184,0.2); color:#cbd5e1; border:1px solid rgba(148,163,184,0.35);";
+        return `
+          <div class="cot-order-card">
+            <div class="cot-card-top">
+              <span class="cot-badge" style="${badgeStyle}">${sig.text}</span>
+              <span class="cot-order-time">${sig.price > 0 ? `$${fmtPrice(sig.price)}` : ""}</span>
+            </div>
+            <div class="cot-card-footer" style="margin-top:4px; white-space:normal; line-height:1.35;">
+              <span>${sig.detail || ""}</span>
+            </div>
+          </div>
+        `;
+      })
+      .join("");
+
+    const totalBadgeCount = sorted.length + pfSignals.length;
+    const headerLabel =
+      sorted.length > 0
+        ? `${sorted.length} ${sorted.length > 1 ? "Trades" : "Trade"}${pfSignals.length > 0 ? ` • ${pfSignals.length} Signal` : ""}`
+        : `${pfSignals.length} ${pfSignals.length > 1 ? "Signals" : "Signal"}`;
+
     elChartOrderTooltip.innerHTML = `
       <div class="cot-header">
         <span class="cot-time">🕒 ${dateStr} ${timeStr}</span>
-        <span class="cot-count-badge">${sorted.length} ${sorted.length > 1 ? "Trades" : "Trade"}</span>
+        <span class="cot-count-badge">${totalBadgeCount > 0 ? headerLabel : ""}</span>
       </div>
       <div class="cot-orders-list">
+        ${signalCardsHtml}
         ${cardsHtml}
       </div>
       ${summaryHtml}
@@ -671,6 +708,38 @@
     }
   }
 
+  function applyPortfolioSignalMarkers(markers) {
+    if (Array.isArray(markers)) {
+      portfolioSignalMarkers = markers;
+    }
+    portfolioSignalByTime.clear();
+    if (!isPortfolioType(latestGridData?.strategyType, latestGridData?.strategyMode) && !isPortfolioType(document.getElementById("cfg_strategyType")?.value)) {
+      return;
+    }
+    if (currentActiveTimeframe !== "15m") {
+      structureMarkers = [];
+      refreshMarkers();
+      return;
+    }
+    const nextMarkers = [];
+    for (const m of portfolioSignalMarkers || []) {
+      if (!m || typeof m.time !== "number" || !Number.isFinite(m.time)) continue;
+      if (!portfolioSignalByTime.has(m.time)) portfolioSignalByTime.set(m.time, []);
+      portfolioSignalByTime.get(m.time).push(m);
+      if (m.kind === "SLOT_ENTRY") {
+        nextMarkers.push({ time: m.time, position: "belowBar", color: "#10b981", shape: "arrowUp", text: m.text || "🟢 เข้า" });
+      } else if (m.kind === "SIGNAL_READY") {
+        nextMarkers.push({ time: m.time, position: "belowBar", color: "#22d3ee", shape: "arrowUp", text: m.text || "⚡ เข้าได้" });
+      } else if (m.kind === "CROSS_8X16") {
+        nextMarkers.push({ time: m.time, position: "belowBar", color: "#fbbf24", shape: "circle", text: m.text || "8>16" });
+      } else if (m.kind === "SIGNAL_BLOCKED") {
+        nextMarkers.push({ time: m.time, position: "aboveBar", color: "#94a3b8", shape: "circle", text: m.text || "⛔" });
+      }
+    }
+    structureMarkers = nextMarkers;
+    refreshMarkers();
+  }
+
   function getClientAnnotatedSwings(data) {
     const rawHighs = Array.isArray(data.swingHighs) ? data.swingHighs : [];
     const rawLows = Array.isArray(data.swingLows) ? data.swingLows : [];
@@ -793,6 +862,8 @@
     maFanCandleDataMap.clear();
     orderMarkers = [];
     structureMarkers = [];
+    portfolioSignalMarkers = [];
+    portfolioSignalByTime.clear();
     orderBadgesData = [];
     swingBadgesData = [];
     badgeDomPool.clear();
@@ -1489,6 +1560,9 @@
         if (Array.isArray(payload.htfCandles) && payload.htfCandles.length > 0) {
           updateHtfCandles(payload.htfCandles);
         }
+        if (Array.isArray(payload.signalMarkers)) {
+          applyPortfolioSignalMarkers(payload.signalMarkers);
+        }
         await refreshFrontPageState();
         if (!portfolioTradeScopeAll) loadTradeManagerData();
       }
@@ -1943,9 +2017,11 @@
           const sc = Number(inspectedRadar.score ?? 0);
           const macroOk = !macro.isSitOut;
           const execOk = !data.isPaused && !data.isMarketClosed;
+          const pbMode = pf.pullbackMode || "EMA8_HOLD";
+          const pbShort = pbMode === "EMA16_CONFIRMED" ? "EMA16+ปิด" : pbMode === "EMA8_CONFIRMED" ? "EMA8+ปิด" : pbMode === "EMA4_TOUCH" ? "EMA4" : "EMA8";
           const checks = [
             { label: "Bottom Fan", ok: hasBottomFan },
-            { label: "EMA4 Hook", ok: hasPullbackHook },
+            { label: `8×16 (${pbShort})`, ok: hasPullbackHook },
             { label: "1H RSI ≥ 40", ok: rsi1h >= 40, val: rsi1h.toFixed(0) },
             { label: "Vol ≥ 1.3x", ok: volRatio >= 1.3, val: `${volRatio.toFixed(2)}x` },
             { label: "RS 24h ≥ -1%", ok: rs24h >= -1.0, val: `${rs24h >= 0 ? "+" : ""}${rs24h.toFixed(1)}%` },
@@ -2582,7 +2658,11 @@
         latestCandleTime = latestCandle.time;
         renderOhlc(latestCandle);
         rebuildOrderMarkers();
-        refreshMarkers();
+        if (isPortfolioType(latestGridData?.strategyType, latestGridData?.strategyMode)) {
+          applyPortfolioSignalMarkers(portfolioSignalMarkers);
+        } else {
+          refreshMarkers();
+        }
         if (chart && chartContainer && chartContainer.clientWidth > 0) {
           chart.applyOptions({ width: chartContainer.clientWidth });
         }
@@ -4830,9 +4910,24 @@
           lineMfEntry = null;
         }
 
-        // Planned EMA4 pullback entry & planned SL when inspecting an empty-slot radar candidate
+        // Planned pullback entry & planned SL when inspecting an empty-slot radar candidate
+        const pbMode = pf.pullbackMode || "EMA8_HOLD";
+        const pbTargetVal =
+          pbMode === "EMA16_CONFIRMED"
+            ? Number(radarCand?.ema16 || 0)
+            : pbMode === "EMA4_TOUCH"
+              ? Number(radarCand?.ema4 || 0)
+              : Number(radarCand?.ema8 || 0);
+        const pbLineLabel =
+          pbMode === "EMA16_CONFIRMED"
+            ? "ฐาน EMA16 (ปิดคอนเฟิร์ม)"
+            : pbMode === "EMA8_CONFIRMED"
+              ? "ฐาน EMA8 (ปิดคอนเฟิร์ม)"
+              : pbMode === "EMA4_TOUCH"
+                ? "EMA4"
+                : "ฐาน EMA8";
         const planEntryPx = !slot && radarCand && (radarCand.stage === "PULLBACK_READY" || radarCand.stage === "WAITING_PULLBACK" || radarCand.stage === "CROSS_8X16_FAIL_FILTERS")
-          ? Number(radarCand.ema4 || 0)
+          ? pbTargetVal
           : 0;
         if (planEntryPx > 0) {
           lineMfPlanEntry = setPriceLine(lineMfPlanEntry, {
@@ -4841,11 +4936,14 @@
             lineWidth: 1.5,
             lineStyle: LightweightCharts.LineStyle.Dashed,
             axisLabelVisible: true,
-            title: radarCand.stage === "PULLBACK_READY" ? "⚡ แผนเข้า EMA4" : "⏳ รอย่อเข้า EMA4",
+            title: radarCand.stage === "PULLBACK_READY" ? `⚡ แผนเข้า ${pbLineLabel}` : `⏳ รอย่อเข้า ${pbLineLabel}`,
           });
         } else if (lineMfPlanEntry) {
           try { candleSeries.removePriceLine(lineMfPlanEntry); } catch (_) {}
           lineMfPlanEntry = null;
+        }
+        if (Array.isArray(pf.inspectedSignalMarkers)) {
+          applyPortfolioSignalMarkers(pf.inspectedSignalMarkers);
         }
 
         if (tp1Target > 0) {
@@ -5160,7 +5258,7 @@
     }
 
     // ── Structure Markers: Dow Theory Swings (HH, LH, HL, LL & จุดเริ่มรอบ) ────
-    if (data.swingHighs || data.swingLows || (data.waveCycle && data.waveCycle.annotatedSwings)) {
+    if (!isPortfolio && (data.swingHighs || data.swingLows || (data.waveCycle && data.waveCycle.annotatedSwings))) {
       const markerMap = new Map();
 
       // Get annotated swings from backend or compute with client fallback
@@ -9614,7 +9712,7 @@
       survival_posture: "Survival Posture",
     };
     const tpMap = { 25: "EMA25", 75: "EMA75", 200: "EMA200" };
-    const pbMap = { 4: "EMA4_TOUCH", 8: "EMA8_HOLD" };
+    const pbMap = { 4: "EMA4_TOUCH", 8: "EMA8_HOLD", 9: "EMA8_CONFIRMED", 16: "EMA16_CONFIRMED" };
     const postureMap = { 0: "NORMAL", 1: "CAUTIOUS", 2: "DEFENSIVE", 3: "CAPITAL_PRESERVATION" };
     const fmtVal = (v) => {
       const n = Math.round(Number(v));
