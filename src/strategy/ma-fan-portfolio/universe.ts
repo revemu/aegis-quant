@@ -837,3 +837,132 @@ export async function backfillBinanceTakerVolumeIfNeeded(opts: {
     upsertedBars,
   };
 }
+
+let subBar1mSyncInFlight: Promise<{ updatedSymbols: number; upsertedBars: number }> | null = null;
+const lastSubBar1mSyncMsByEx = new Map<string, number>();
+const lastSubBar1mPruneMsByEx = new Map<string, number>();
+
+/**
+ * Incremental background 1m sub-bar synchronization to PostgreSQL (`market_candles`, timeframe `"1m"`).
+ * Keeps 15m as the trading timeframe while storing 1m bars for intra-bar path reconstruction & replay.
+ */
+export async function syncSubBar1mCandlesToPg(opts: {
+  exchangeName: string;
+  symbols: string[];
+  alpacaCreds?: { apiKey: string; apiSecret: string; dataUrl: string };
+  binanceBaseUrl?: string;
+  pgStore: PgStore | null;
+  keepDays?: number;
+  force?: boolean;
+  log?: (msg: string) => void;
+}): Promise<{ updatedSymbols: number; upsertedBars: number }> {
+  const pg = opts.pgStore;
+  const ex = (opts.exchangeName || "").toLowerCase().trim();
+  const cleanSyms = Array.from(new Set(opts.symbols.map((s) => s.toUpperCase().trim()).filter(Boolean)));
+  if (!pg || cleanSyms.length === 0 || (ex !== "binance" && ex !== "alpaca")) {
+    return { updatedSymbols: 0, upsertedBars: 0 };
+  }
+
+  if (subBar1mSyncInFlight) {
+    return subBar1mSyncInFlight;
+  }
+
+  const nowMs = Date.now();
+  const lastRun = lastSubBar1mSyncMsByEx.get(ex) ?? 0;
+  if (!opts.force && lastRun > 0 && nowMs - lastRun < 14 * 60 * 1000) {
+    return { updatedSymbols: 0, upsertedBars: 0 };
+  }
+
+  subBar1mSyncInFlight = (async () => {
+    lastSubBar1mSyncMsByEx.set(ex, Date.now());
+    let updatedSymbols = 0;
+    let upsertedBars = 0;
+    const keepDays = Math.max(7, Math.round(opts.keepDays ?? 30));
+
+    try {
+      const latestMap = await pg.loadLatestMarketCandleTimes(ex, cleanSyms, "1m").catch(() => new Map<string, number>());
+
+      if (ex === "binance") {
+        const baseUrl = (opts.binanceBaseUrl || "https://api.binance.com").replace(/\/+$/, "");
+        const batchSize = 4;
+        for (let i = 0; i < cleanSyms.length; i += batchSize) {
+          const chunk = cleanSyms.slice(i, i + batchSize);
+          const upsertItems: Array<{ exchange: string; symbol: string; timeframe: string; candles: Candle[] }> = [];
+          await Promise.all(
+            chunk.map(async (sym) => {
+              const latestSec = latestMap.get(sym) ?? 0;
+              const isCold = latestSec <= 0;
+              let cursorMs = isCold ? Date.now() - 3000 * 60_000 : (latestSec + 60) * 1000;
+              const collected: Candle[] = [];
+              for (let page = 0; page < 3; page++) {
+                if (cursorMs >= Date.now() - 60_000) break;
+                const bars = await fetchBinanceKlinesSimple(sym, "1m", 1000, baseUrl, cursorMs).catch(() => [] as Candle[]);
+                const closed = bars.filter((b) => b.isClosed !== false && b.time > latestSec);
+                if (closed.length === 0) break;
+                collected.push(...closed);
+                const lastBarTime = closed[closed.length - 1]!.time;
+                if (bars.length < 1000 || lastBarTime * 1000 < cursorMs) break;
+                cursorMs = (lastBarTime + 60) * 1000;
+              }
+              if (collected.length > 0) {
+                upsertItems.push({ exchange: "binance", symbol: sym, timeframe: "1m", candles: collected });
+                upsertedBars += collected.length;
+              }
+            }),
+          );
+          if (upsertItems.length > 0) {
+            updatedSymbols += upsertItems.length;
+            await pg.upsertMarketCandlesBatch(upsertItems).catch(() => {});
+          }
+        }
+      } else if (ex === "alpaca" && opts.alpacaCreds?.apiKey && opts.alpacaCreds?.apiSecret) {
+        const coveredCount = cleanSyms.filter((s) => (latestMap.get(s) ?? 0) > 0).length;
+        const perSymbolLimit = coveredCount >= Math.floor(cleanSyms.length * 0.7) ? 180 : 1200;
+        const barMap = await fetchAlpacaMultiBars({
+          symbols: cleanSyms,
+          interval: "1m",
+          limit: perSymbolLimit,
+          apiKey: opts.alpacaCreds.apiKey,
+          apiSecret: opts.alpacaCreds.apiSecret,
+          dataUrl: opts.alpacaCreds.dataUrl,
+        }).catch(() => new Map<string, Candle[]>());
+
+        const upsertItems: Array<{ exchange: string; symbol: string; timeframe: string; candles: Candle[] }> = [];
+        for (const sym of cleanSyms) {
+          const latestSec = latestMap.get(sym) ?? 0;
+          const raw = barMap.get(sym) || [];
+          const fresh = raw.filter(
+            (c) => c.isClosed !== false && c.time > latestSec && isUsRegularTradingHoursBar(c.time, "1m"),
+          );
+          if (fresh.length > 0) {
+            upsertItems.push({ exchange: "alpaca", symbol: sym, timeframe: "1m", candles: fresh });
+            upsertedBars += fresh.length;
+          }
+        }
+        if (upsertItems.length > 0) {
+          updatedSymbols = upsertItems.length;
+          for (let i = 0; i < upsertItems.length; i += 10) {
+            await pg.upsertMarketCandlesBatch(upsertItems.slice(i, i + 10)).catch(() => {});
+          }
+        }
+      }
+
+      const lastPrune = lastSubBar1mPruneMsByEx.get(ex) ?? 0;
+      if (Date.now() - lastPrune >= 24 * 3_600_000) {
+        lastSubBar1mPruneMsByEx.set(ex, Date.now());
+        await pg.pruneOldMarketCandles(ex, "1m", keepDays).catch(() => 0);
+      }
+
+      if (opts.log && (lastRun === 0 || upsertedBars >= 500)) {
+        opts.log(
+          `📥 [Sub-Bar 1m Sync] ${ex}: upserted ${upsertedBars} 1m bars across ${updatedSymbols}/${cleanSyms.length} symbols`,
+        );
+      }
+      return { updatedSymbols, upsertedBars };
+    } finally {
+      subBar1mSyncInFlight = null;
+    }
+  })();
+
+  return subBar1mSyncInFlight;
+}

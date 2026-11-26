@@ -928,6 +928,142 @@ export class PgStore {
     return rows.length;
   }
 
+  public async loadLatestMarketCandleTimes(
+    exchange: string,
+    symbols: string[],
+    timeframe: string,
+  ): Promise<Map<string, number>> {
+    const out = new Map<string, number>();
+    if (this.closed) return out;
+    const cleanSyms = Array.from(new Set(symbols.map((s) => s.toUpperCase().trim()).filter(Boolean)));
+    if (cleanSyms.length === 0) return out;
+    const ex = exchange.toLowerCase().trim();
+    const tf = timeframe.toLowerCase().trim();
+
+    const rows = await this.sql<Array<{ symbol: string; max_sec: string | number }>>`
+      SELECT symbol, MAX(time_sec) AS max_sec
+      FROM market_candles
+      WHERE exchange = ${ex}
+        AND timeframe = ${tf}
+        AND symbol IN ${this.sql(cleanSyms)}
+      GROUP BY symbol
+    `;
+    for (const r of rows) {
+      const t = Number(r.max_sec);
+      if (Number.isFinite(t) && t > 0) {
+        out.set(String(r.symbol).toUpperCase().trim(), t);
+      }
+    }
+    return out;
+  }
+
+  public async loadMarketCandlesWindowsBatch(
+    exchange: string,
+    windows: Array<{ symbol: string; startSec: number; endSec: number }>,
+    timeframe: string,
+  ): Promise<Map<string, Candle[]>> {
+    const result = new Map<string, Candle[]>();
+    if (this.closed || windows.length === 0) return result;
+    const ex = exchange.toLowerCase().trim();
+    const tf = timeframe.toLowerCase().trim();
+
+    const bySym = new Map<string, Array<{ startSec: number; endSec: number }>>();
+    for (const w of windows) {
+      const sym = w.symbol.toUpperCase().trim();
+      if (!sym || !Number.isFinite(w.startSec) || !Number.isFinite(w.endSec) || w.endSec < w.startSec) continue;
+      let list = bySym.get(sym);
+      if (!list) {
+        list = [];
+        bySym.set(sym, list);
+      }
+      list.push({ startSec: Math.floor(w.startSec), endSec: Math.ceil(w.endSec) });
+    }
+
+    const symEntries = Array.from(bySym.entries()).map(([sym, rawWins]) => {
+      const sorted = rawWins.slice().sort((a, b) => a.startSec - b.startSec);
+      const merged: Array<{ startSec: number; endSec: number }> = [];
+      for (const cur of sorted) {
+        const last = merged[merged.length - 1];
+        if (last && cur.startSec <= last.endSec + 1800) {
+          last.endSec = Math.max(last.endSec, cur.endSec);
+        } else {
+          merged.push({ ...cur });
+        }
+      }
+      return { sym, merged };
+    });
+
+    type CandleRow = {
+      time_sec: string | number;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      volume: number;
+      quote_volume: number | null;
+      taker_buy_quote: number | null;
+      is_closed: boolean;
+    };
+
+    const batchSize = 6;
+    for (let i = 0; i < symEntries.length; i += batchSize) {
+      const chunk = symEntries.slice(i, i + batchSize);
+      await Promise.all(
+        chunk.map(async ({ sym, merged }) => {
+          const mapByTime = new Map<number, Candle>();
+          for (const w of merged) {
+            const rows = await this.sql<CandleRow[]>`
+              SELECT time_sec, open, high, low, close, volume, quote_volume, taker_buy_quote, is_closed
+              FROM market_candles
+              WHERE exchange = ${ex}
+                AND symbol = ${sym}
+                AND timeframe = ${tf}
+                AND time_sec >= ${w.startSec}
+                AND time_sec <= ${w.endSec}
+              ORDER BY time_sec ASC
+            `;
+            for (const r of rows) {
+              const time = Number(r.time_sec);
+              if (!Number.isFinite(time) || !Number.isFinite(r.close) || r.close <= 0) continue;
+              const qv = r.quote_volume !== null && r.quote_volume !== undefined ? Number(r.quote_volume) : NaN;
+              const tbq = r.taker_buy_quote !== null && r.taker_buy_quote !== undefined ? Number(r.taker_buy_quote) : NaN;
+              mapByTime.set(time, {
+                time,
+                open: Number(r.open),
+                high: Number(r.high),
+                low: Number(r.low),
+                close: Number(r.close),
+                volume: Number(r.volume ?? 0),
+                ...(Number.isFinite(qv) ? { quoteVolume: qv } : {}),
+                ...(Number.isFinite(tbq) ? { takerBuyQuoteVolume: tbq } : {}),
+                isClosed: Boolean(r.is_closed),
+              });
+            }
+          }
+          if (mapByTime.size > 0) {
+            result.set(sym, Array.from(mapByTime.values()).sort((a, b) => a.time - b.time));
+          }
+        }),
+      );
+    }
+
+    return result;
+  }
+
+  public async pruneOldMarketCandles(exchange: string, timeframe: string, keepDays = 30): Promise<number> {
+    if (this.closed) return 0;
+    const ex = exchange.toLowerCase().trim();
+    const tf = timeframe.toLowerCase().trim();
+    const cutoffSec = Math.floor(Date.now() / 1000) - Math.max(1, keepDays) * 86400;
+    const res = await this.sql`
+      DELETE FROM market_candles
+      WHERE exchange = ${ex}
+        AND timeframe = ${tf}
+        AND time_sec < ${cutoffSec}
+    `;
+    return Number((res as { count?: number }).count ?? 0);
+  }
+
   // ── Learning Engine Journal, Cooldowns & Adjustment Audit ────────────────
 
   public async upsertLearningJournalBatch(entries: LearningJournalRecord[]): Promise<void> {

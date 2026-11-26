@@ -52,6 +52,7 @@ import {
   buildSymbolIndicators,
   evaluateBenchmarkSitOut,
   fetchPortfolioUniverseAndBenchmark,
+  syncSubBar1mCandlesToPg,
 } from "./universe.js";
 
 const PORTFOLIO_DB_KEY = "__PORTFOLIO__";
@@ -867,6 +868,19 @@ export class MaFanPortfolioStrategy implements IStrategy {
     if (isBinance && syms.length > 0) {
       await binanceDerivativesCache.refreshSymbols(syms, { force, log: (m) => this.log(m) }).catch(() => {});
     }
+    if (syms.length > 0) {
+      await Promise.race([
+        syncSubBar1mCandlesToPg({
+          exchangeName: this.exchange.exchangeName,
+          symbols: syms,
+          alpacaCreds: this.resolveAlpacaCreds(),
+          pgStore: this.db.getPgStore(),
+          force,
+          log: (m) => this.log(m),
+        }).catch(() => {}),
+        new Promise<void>((r) => setTimeout(r, 15_000)),
+      ]);
+    }
     const baseMinVolR = Number.isFinite(Number(this.cfg.portfolioMinBuyVolRatio))
       ? Number(this.cfg.portfolioMinBuyVolRatio)
       : 1.3;
@@ -1403,6 +1417,15 @@ export class MaFanPortfolioStrategy implements IStrategy {
 
     if (this.exchange.exchangeName === "binance" && res.symbols.length > 0 && this.initialLearningBootstrapDone) {
       void binanceDerivativesCache.refreshSymbols(res.symbols).catch(() => {});
+    }
+    if (res.symbols.length > 0) {
+      void syncSubBar1mCandlesToPg({
+        exchangeName: this.exchange.exchangeName,
+        symbols: res.symbols,
+        alpacaCreds: this.resolveAlpacaCreds(),
+        pgStore: this.db.getPgStore(),
+        log: (m) => this.log(m),
+      }).catch(() => {});
     }
 
     if (!this.initialLearningBootstrapDone && this.snapshots.size > 0) {

@@ -39,11 +39,14 @@ import {
   classifyOvernightGapZone,
   classifyPerpBasisZone,
   classifySectorBreadthZone,
+  classifySubBarPathZone,
+  classifyLateBarStrengthZone,
   computeAtrCompressionRatioAt,
   computeCausalBetaAlphaAt,
   computeDecayedRegimeMemory,
   computeFactorRankIc,
   computeOvernightGapPctAt,
+  computeSubBar15mFeatures,
   evaluateConfidenceSizingOos,
   evaluateContextGatesOos,
   evaluateMfeGivebackAndAutoBe,
@@ -51,6 +54,7 @@ import {
   lookupCausalLongShortRatioAt,
   lookupCausalPerpBasisBpsAt,
   simulateAutoBeVariant,
+  sliceSubBarsInWindow,
   type AdvancedQuantSetupRecord,
   type ConfidenceSizingAuditSummary,
   type ContextGateOosSummary,
@@ -121,6 +125,7 @@ export interface ShadowLearningSummary {
   portfolioSim?: ShadowPortfolioReplaySummary | null;
   breadthSitOutAnalysis?: BreadthSitOutAnalysis | null;
   observeFactors?: ShadowObserveFactorsSummary | null;
+  subBar1mCoveragePct?: number;
   factorRankIc?: FactorRankIcRow[];
   mfeGivebackAudit?: MfeGivebackAutoBeSummary | null;
   contextGateOos?: ContextGateOosSummary | null;
@@ -182,6 +187,8 @@ export interface ShadowObserveFactorsSummary {
   sectorBreadthBuckets?: Record<string, BucketMetric>;
   perpBasisBuckets?: Record<string, BucketMetric>;
   longShortBuckets?: Record<string, BucketMetric>;
+  subBarPathBuckets?: Record<string, BucketMetric>;
+  lateBarStrengthBuckets?: Record<string, BucketMetric>;
   latestMacroRegime?: LatestMacroRegimeSnapshot | null;
 }
 
@@ -630,14 +637,16 @@ export function simulateMaFanCounterfactual(
   entryPrice: number,
   distTargetPct: number,
   slTriggerPct: number,
-  futureBars: Array<{ high: number; low: number; close: number }>,
+  futureBars: Array<{ time?: number; high: number; low: number; close: number }>,
   costPct = 0,
   exitOpts: CounterfactualExitOptions | number = {},
+  subBars1m?: Candle[],
 ): {
   finalRet: number;
   maePct: number;
   mfePct: number;
   hitSl: boolean;
+  usedSubBar1m: boolean;
   exitBarsHeld: number;
   checkpointRetPct: Record<number, number | null>;
   verdict: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL";
@@ -660,52 +669,80 @@ export function simulateMaFanCounterfactual(
   let peakPctSinceTp1 = 0;
   let finalRet: number | null = null;
   let hitSl = false;
+  let usedSubBar1m = false;
   let exitBarsHeld = futureBars.length;
   let staleTriggeredAtBar = 0;
 
-  for (let i = 0; i < futureBars.length; i++) {
-    const b = futureBars[i]!;
-    if (b.low < minLow) minLow = b.low;
-    if (b.high > maxHigh) maxHigh = b.high;
-    const barsHeld = i + 1;
-    const lowPct = ((b.low - entryPrice) / entryPrice) * 100;
-    const highPct = ((b.high - entryPrice) / entryPrice) * 100;
-    const closePct = ((b.close - entryPrice) / entryPrice) * 100;
+  const stepInnerBar = (sb: { high: number; low: number; close: number }, barsHeld: number): boolean => {
+    if (sb.low < minLow) minLow = sb.low;
+    if (sb.high > maxHigh) maxHigh = sb.high;
+    const lowPct = ((sb.low - entryPrice) / entryPrice) * 100;
+    const highPct = ((sb.high - entryPrice) / entryPrice) * 100;
+    const closePct = ((sb.close - entryPrice) / entryPrice) * 100;
 
     if (!tp1Hit) {
       if (lowPct <= slTriggerPct) {
         finalRet = slTriggerPct;
         hitSl = true;
         exitBarsHeld = barsHeld;
-        break;
+        return true;
       }
       if (highPct >= tp1Pct) {
         tp1Hit = true;
         peakPctSinceTp1 = Math.max(tp1Pct, closePct);
-      } else if (staleExitBars > 0 && barsHeld >= staleExitBars && closePct < staleMaxGainPct) {
-        finalRet = closePct;
-        exitBarsHeld = barsHeld;
-        staleTriggeredAtBar = barsHeld;
-        break;
       }
-    } else if (runnerTrailPct > 0) {
+      return false;
+    }
+
+    if (runnerTrailPct > 0) {
       const prevTrailStopPct = Math.max(trailFloorPct, peakPctSinceTp1 - runnerTrailPct);
       if (lowPct <= prevTrailStopPct) {
         finalRet = 0.5 * tp1Pct + 0.5 * prevTrailStopPct;
         exitBarsHeld = barsHeld;
-        break;
+        return true;
       }
       peakPctSinceTp1 = Math.max(peakPctSinceTp1, highPct);
       const nextTrailStopPct = Math.max(trailFloorPct, peakPctSinceTp1 - runnerTrailPct);
       if (closePct <= nextTrailStopPct) {
         finalRet = 0.5 * tp1Pct + 0.5 * nextTrailStopPct;
         exitBarsHeld = barsHeld;
-        break;
+        return true;
       }
-    } else if (lowPct <= beLockPct) {
+      return false;
+    }
+
+    if (lowPct <= beLockPct) {
       finalRet = 0.5 * tp1Pct + 0.5 * beLockPct;
       exitBarsHeld = barsHeld;
-      break;
+      return true;
+    }
+    return false;
+  };
+
+  for (let i = 0; i < futureBars.length; i++) {
+    const b = futureBars[i]!;
+    const barsHeld = i + 1;
+    const subs = b.time !== undefined && subBars1m?.length ? sliceSubBarsInWindow(subBars1m, b.time, b.time + 900) : [];
+    if (subs.length >= 2) usedSubBar1m = true;
+    const inner = subs.length >= 2 ? subs : [b];
+
+    let exited = false;
+    for (const sb of inner) {
+      if (stepInnerBar(sb, barsHeld)) {
+        exited = true;
+        break;
+      }
+    }
+    if (exited) break;
+
+    if (!tp1Hit && staleExitBars > 0 && barsHeld >= staleExitBars) {
+      const closePct = ((b.close - entryPrice) / entryPrice) * 100;
+      if (closePct < staleMaxGainPct) {
+        finalRet = closePct;
+        exitBarsHeld = barsHeld;
+        staleTriggeredAtBar = barsHeld;
+        break;
+      }
     }
   }
 
@@ -731,7 +768,7 @@ export function simulateMaFanCounterfactual(
   const mfePct = ((maxHigh - entryPrice) / entryPrice) * 100;
   const verdict: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL" =
     netRet >= 0.35 ? "WOULD_WIN" : netRet <= -0.35 ? "WOULD_LOSE" : "NEUTRAL";
-  return { finalRet: netRet, maePct, mfePct, hitSl, exitBarsHeld, checkpointRetPct, verdict };
+  return { finalRet: netRet, maePct, mfePct, hitSl, usedSubBar1m, exitBarsHeld, checkpointRetPct, verdict };
 }
 
 export function classifyMayerZone(mayerMultiple: number | null): string | null {
@@ -1048,6 +1085,8 @@ export interface ObserveSetupInput {
   sectorBreadthPct?: number | null;
   perpBasisBps?: number | null;
   topLongShortRatio?: number | null;
+  subBarPathShape?: string | null;
+  lateBarCloseStrength?: number | null;
   checkpointRetPct?: Record<number, number | null>;
 }
 
@@ -1102,6 +1141,8 @@ export function computeObserveFactorsFromSetups(setups: ObserveSetupInput[]): Sh
   const sectorBreadthMap = tally();
   const perpBasisMap = tally();
   const longShortMap = tally();
+  const subBarPathMap = tally();
+  const lateBarStrengthMap = tally();
 
   for (const s of setups) {
     const scoreKey = s.score < 30 ? "<30" : s.score < 50 ? "30-50" : s.score < 70 ? "50-70" : ">=70";
@@ -1179,6 +1220,12 @@ export function computeObserveFactorsFromSetups(setups: ObserveSetupInput[]): Sh
 
     const longShortZone = classifyLongShortZone(s.topLongShortRatio ?? null);
     if (longShortZone) bump(longShortMap, longShortZone, s.pnlPct);
+
+    const subPathZone = classifySubBarPathZone(s.subBarPathShape ?? null);
+    if (subPathZone) bump(subBarPathMap, subPathZone, s.pnlPct);
+
+    const lateStrZone = classifyLateBarStrengthZone(s.lateBarCloseStrength ?? null);
+    if (lateStrZone) bump(lateBarStrengthMap, lateStrZone, s.pnlPct);
   }
 
   const cpDefs = [
@@ -1242,6 +1289,8 @@ export function computeObserveFactorsFromSetups(setups: ObserveSetupInput[]): Sh
     sectorBreadthBuckets: toRec(sectorBreadthMap, ["WEAK_SECTOR (<35%)", "MID_SECTOR (35-65%)", "LEADING_SECTOR (>=65%)"]),
     perpBasisBuckets: toRec(perpBasisMap, ["DISCOUNT (<-5 bps)", "NEUTRAL (-5..+5 bps)", "PREMIUM (>+5 bps)"]),
     longShortBuckets: toRec(longShortMap, ["SHORT_CROWDED (<0.9)", "BALANCED (0.9-1.5)", "LONG_CROWDED (>1.5)"]),
+    subBarPathBuckets: toRec(subBarPathMap, ["V_RECOVERY", "NEUTRAL_PATH", "FADE_TOP"]),
+    lateBarStrengthBuckets: toRec(lateBarStrengthMap, ["FADING (<-0.2)", "BALANCED (-0.2..+0.2)", "STRONG_CLOSE (>+0.2)"]),
   };
 }
 
@@ -2476,6 +2525,9 @@ export class LearningEngine {
     const slTriggerPct = -Math.max(1.5, slPct || 3.5);
     const costPct = estimateRoundTripCostPct(exchange, syms);
 
+    const pendingReady: Array<{ p: LearningJournalRecord; futureBars: Candle[]; distTargetPct: number }> = [];
+    const subWindows: Array<{ symbol: string; startSec: number; endSec: number }> = [];
+
     for (const p of pending) {
       let bars: Candle[] = candleMap.get(p.symbol) || [];
       if (isAlpaca) {
@@ -2489,7 +2541,30 @@ export class LearningEngine {
         p.features?.distTp1Pct !== undefined && Number.isFinite(Number(p.features.distTp1Pct))
           ? Number(p.features.distTp1Pct)
           : Number(p.features?.distEma200Pct);
-      const sim = simulateMaFanCounterfactual(p.entryPrice, distTargetPct, slTriggerPct, futureBars, costPct, exitOpts);
+      pendingReady.push({ p, futureBars, distTargetPct });
+      subWindows.push({
+        symbol: p.symbol,
+        startSec: futureBars[0]!.time,
+        endSec: futureBars[futureBars.length - 1]!.time + 900,
+      });
+    }
+
+    const subBars1mMap =
+      subWindows.length > 0
+        ? await pg.loadMarketCandlesWindowsBatch(exchange, subWindows, "1m").catch(() => new Map<string, Candle[]>())
+        : new Map<string, Candle[]>();
+
+    for (const item of pendingReady) {
+      const { p, futureBars, distTargetPct } = item;
+      const sim = simulateMaFanCounterfactual(
+        p.entryPrice,
+        distTargetPct,
+        slTriggerPct,
+        futureBars,
+        costPct,
+        exitOpts,
+        subBars1mMap.get(p.symbol),
+      );
 
       updates.push({
         journalUid: p.journalUid,
@@ -2911,6 +2986,32 @@ export class LearningEngine {
       const advancedQuantRecords: AdvancedQuantSetupRecord[] = [];
       const openSessionAcc = { setups: 0, wins: 0, sumPnl: 0 };
 
+      interface PendingPrimaryShadowSetup {
+        coin: PrecalcCoin;
+        idx: number;
+        prev: number;
+        c: Candle;
+        prevBar: Candle;
+        signalBar: Candle;
+        simEntryPrice: number;
+        distTarget: number;
+        d200: number;
+        futureBars: Candle[];
+        rsi1hVal: number;
+        volR: number;
+        coinRet24: number;
+        rs24: number;
+        curAtrPct: number;
+        benchInfo?: { ret24h: number; ret4h: number; isBear: boolean };
+        bottomLowSnap: number;
+        p1d: number;
+        pUsd: number;
+        isOpening45m: boolean;
+      }
+
+      const pendingPrimarySetups: PendingPrimaryShadowSetup[] = [];
+      const lastBarTimeBySym = new Map<string, number>();
+
       let totalSetups = 0;
       let totalWins = 0;
       let totalPnlSum = 0;
@@ -2927,6 +3028,7 @@ export class LearningEngine {
 
       for (const coin of precalc) {
         const n = coin.c15.length;
+        lastBarTimeBySym.set(coin.symbol, coin.c15[n - 1]!.time);
         // Primary shadow state machine (kept identical to live strategy + backtest)
         let hadBottomFan = false;
         let fanStartIdx = -1;
@@ -2946,14 +3048,6 @@ export class LearningEngine {
         let p1 = -1;
         let p1d = -1;
         let pUsd = -1;
-
-        let sTrades = 0;
-        let sWins = 0;
-        let sWinSum = 0;
-        let sLossAbs = 0;
-        let sPnlSum = 0;
-        let sMaeSum = 0;
-        let sMfeSum = 0;
 
         for (let idx = 200; idx < n - 9; idx++) {
           const c = coin.c15[idx]!;
@@ -3106,205 +3200,35 @@ export class LearningEngine {
                 const d75 = useClosedPrimary ? dist75NextOpen : dist75;
                 const d200 = useClosedPrimary ? dist200NextOpen : dist200;
                 const distTarget = baseTpMode === "EMA25" ? d25 : baseTpMode === "EMA75" ? d75 : d200;
-                const sim = simulateMaFanCounterfactual(simEntryPrice, distTarget, slTriggerPct, futureBars, costPct, shadowExitOpts);
+
+                pendingPrimarySetups.push({
+                  coin,
+                  idx,
+                  prev,
+                  c,
+                  prevBar,
+                  signalBar: useClosedPrimary ? c : prevBar,
+                  simEntryPrice,
+                  distTarget,
+                  d200,
+                  futureBars,
+                  rsi1hVal,
+                  volR,
+                  coinRet24,
+                  rs24,
+                  curAtrPct,
+                  benchInfo,
+                  bottomLowSnap: bottomLow,
+                  p1d,
+                  pUsd,
+                  isOpening45m: isOpeningSession45mBar(coin.c15, idx, ex, false),
+                });
 
                 lastEntryIdx = idx;
                 waitingPullback = false;
                 crossWasGap = false;
                 hadBottomFan = false;
-
-                totalSetups++;
-                totalPnlSum += sim.finalRet;
-                sTrades++;
-                sPnlSum += sim.finalRet;
-                sMaeSum += sim.maePct;
-                sMfeSum += sim.mfePct;
-
-                const isWin = sim.finalRet > 0;
-                if (isWin) {
-                  totalWins++;
-                  sumWinPct += sim.finalRet;
-                  sWins++;
-                  sWinSum += sim.finalRet;
-                  winMaeAbs.push(Math.abs(sim.maePct));
-                } else {
-                  sumLossAbsPct += Math.abs(sim.finalRet);
-                  sLossAbs += Math.abs(sim.finalRet);
-                }
-
-                if (benchInfo?.isBear) {
-                  bearSetups++;
-                  if (isWin) bearWins++;
-                  bearPnlSum += sim.finalRet;
-                }
-
-                const bStats = breadthByTime.get(prevBar.time);
-                const barBreadthPct = bStats && bStats.total >= 5 ? (bStats.above25 / bStats.total) * 100 : 50;
-                const prevBStats = breadthByTime.get(coin.c15[Math.max(0, prev - 16)]!.time);
-                const prevBreadthPct = prevBStats && prevBStats.total >= 5 ? (prevBStats.above25 / prevBStats.total) * 100 : barBreadthPct;
-                const breadthDelta4h = barBreadthPct - prevBreadthPct;
-                const benchmarkRet4h = benchInfo?.ret4h ?? 0;
-                const distFromBottomLowPct = Number.isFinite(bottomLow) && bottomLow > 0 ? ((simEntryPrice - bottomLow) / bottomLow) * 100 : 0;
-                const upperWickRatioPct = c.high > c.low ? ((c.high - Math.max(c.open, c.close)) / (c.high - c.low)) * 100 : 0;
-                const macroEv = getMacroEventContext(c.time);
-                const hasShock24h = detectRecentShock24h(coin.c15, prev, curAtrPct);
                 bottomLow = Infinity;
-                if (bStats && bStats.total >= 5 && barBreadthPct < 30) {
-                  lowBreadthSetups++;
-                  if (isWin) lowBreadthWins++;
-                  lowBreadthPnlSum += sim.finalRet;
-                }
-
-                const bKey = computeFeatureBucketKey(rs24, volR, d200, rsi1hVal);
-                const fb = featureBucketAcc.get(bKey) || { setups: 0, wins: 0, sumPnl: 0 };
-                fb.setups++;
-                if (isWin) fb.wins++;
-                fb.sumPnl += sim.finalRet;
-                featureBucketAcc.set(bKey, fb);
-
-                const regKey = `${benchInfo?.isBear ? "BEAR" : "BULL"}:${bKey}`;
-                const rfb = regimeBucketAcc.get(regKey) || { setups: 0, wins: 0, sumPnl: 0 };
-                rfb.setups++;
-                if (isWin) rfb.wins++;
-                rfb.sumPnl += sim.finalRet;
-                regimeBucketAcc.set(regKey, rfb);
-
-                const sessKey = getSessionBucketLabel(c.time, ex);
-                const ss = sessionAcc.get(sessKey) || { setups: 0, wins: 0, sumPnl: 0 };
-                ss.setups++;
-                if (isWin) ss.wins++;
-                ss.sumPnl += sim.finalRet;
-                sessionAcc.set(sessKey, ss);
-
-                const upSpread = coin.m200[prev]! > 0 ? ((coin.m200[prev]! - coin.m75[prev]!) / coin.m200[prev]!) * 100 : 0;
-                const candScore = Math.min(3, volR) * 20 + Math.max(-5, Math.min(10, rs24)) * 3 - upSpread * 10;
-                const exitBar = futureBars[Math.min(futureBars.length - 1, Math.max(0, sim.exitBarsHeld - 1))];
-                primaryReplaySetups.push({
-                  symbol: coin.symbol,
-                  entryTimeSec: c.time,
-                  exitTimeSec: exitBar ? exitBar.time : c.time + 900,
-                  score: candScore,
-                  pnlPct: sim.finalRet,
-                  isBearMacro: Boolean(benchInfo?.isBear),
-                  breadthPct: barBreadthPct,
-                });
-                const dMacro = p1d >= 0 ? bench1dRegimes[p1d] : undefined;
-                const dUsdRet = pUsd >= 0 ? usd1dRets[pUsd] : null;
-                const symFundingSeries = !isAlpaca ? opts.fundingBySymbol?.get(coin.symbol) : undefined;
-                const symOiSeries = !isAlpaca ? opts.oiBySymbol?.get(coin.symbol) : undefined;
-                const symBasisSeries = !isAlpaca ? opts.basisBySymbol?.get(coin.symbol) : undefined;
-                const symLsSeries = !isAlpaca ? opts.longShortBySymbol?.get(coin.symbol) : undefined;
-
-                const causalVwap = isAlpaca ? computeIntradayVwapDistPctAt(coin.c15, prev) : null;
-                const causalTaker = !isAlpaca ? computeTrueTakerBuyPct12At(coin.c15, prev) : null;
-                const causalFunding = !isAlpaca ? lookupCausalFundingBpsAt(symFundingSeries, c.time) : null;
-                const causalOi = !isAlpaca ? lookupCausalOiDelta4hPctAt(symOiSeries, c.time) : null;
-                const causalBasis = !isAlpaca ? lookupCausalPerpBasisBpsAt(symBasisSeries, c.time) : null;
-                const causalLs = !isAlpaca ? lookupCausalLongShortRatioAt(symLsSeries, c.time) : null;
-                const betaAlphaRes = computeCausalBetaAlphaAt(
-                  coin.c15,
-                  prev,
-                  bench15,
-                  benchIdxByTime,
-                  coinRet24,
-                  benchInfo?.ret24h ?? 0,
-                  48,
-                );
-                const causalBetaAlpha = betaAlphaRes ? betaAlphaRes.betaAlpha24h : null;
-                const causalAtrSqueeze = computeAtrCompressionRatioAt(coin.c15, prev);
-                const causalGapPct = isAlpaca ? computeOvernightGapPctAt(coin.c15, prev) : null;
-                const sectorName = isAlpaca ? getEquitySector(coin.symbol) : null;
-                const secStats = sectorName ? sectorBreadthByTime.get(sectorName)?.get(prevBar.time) : undefined;
-                const causalSectorBreadth =
-                  secStats && secStats.total >= 2 ? Number(((secStats.above25 / secStats.total) * 100).toFixed(1)) : null;
-
-                const autoBeReturns: Record<string, number> = {};
-                const autoBeHitSl: Record<string, boolean> = {};
-                for (const beTrig of AUTO_BE_TRIGGER_CANDIDATES) {
-                  const beSim = simulateAutoBeVariant(
-                    simEntryPrice,
-                    distTarget,
-                    slTriggerPct,
-                    futureBars,
-                    costPct,
-                    {
-                      tp1FloorPct: shadowTp1FloorPct,
-                      runnerTrailPct: shadowRunnerTrailPct,
-                      staleExitBars: shadowStaleExitBars,
-                      staleExitMaxGainPct: shadowStaleMaxGainPct,
-                    },
-                    beTrig,
-                  );
-                  const beKey = beTrig.toFixed(1);
-                  autoBeReturns[beKey] = beSim.finalRet;
-                  autoBeHitSl[beKey] = beSim.hitSl;
-                }
-
-                observeSetupRecords.push({
-                  entryTimeSec: c.time,
-                  score: candScore,
-                  pnlPct: sim.finalRet,
-                  distFromBottomLowPct,
-                  upperWickRatioPct,
-                  breadthDelta4h,
-                  benchmarkRet4h,
-                  macroEventInWindow: macroEv.inWindow,
-                  macroEventDay: macroEv.isEventDay,
-                  hasShock24h,
-                  mayerMultiple: dMacro?.mayerMultiple ?? null,
-                  macroRiskIndex: dMacro?.macroRiskIndex ?? null,
-                  usdRet5dPct: dUsdRet ?? null,
-                  vwapDistPct: causalVwap,
-                  takerBuyPct12: causalTaker,
-                  fundingRateBps: causalFunding,
-                  oiDelta4hPct: causalOi,
-                  betaAlpha24h: causalBetaAlpha,
-                  atrCompressionRatio: causalAtrSqueeze,
-                  overnightGapPct: causalGapPct,
-                  sectorBreadthPct: causalSectorBreadth,
-                  perpBasisBps: causalBasis,
-                  topLongShortRatio: causalLs,
-                  checkpointRetPct: sim.checkpointRetPct,
-                });
-
-                advancedQuantRecords.push({
-                  entryTimeSec: c.time,
-                  symbol: coin.symbol,
-                  pnlPct: sim.finalRet,
-                  score: candScore,
-                  buyVolRatio12: volR,
-                  rawRs24h: rs24,
-                  betaAlpha24h: causalBetaAlpha,
-                  rsi1h: rsi1hVal,
-                  atrCompressionRatio: causalAtrSqueeze,
-                  distFromBottomLowPct,
-                  upperWickRatioPct,
-                  breadthDelta4h,
-                  concurrentSignals: 1,
-                  usdRet5dPct: dUsdRet ?? null,
-                  sessionBucket: sessKey,
-                  vwapDistPct: causalVwap,
-                  overnightGapPct: causalGapPct,
-                  sectorName,
-                  sectorBreadthPct: causalSectorBreadth,
-                  takerBuyPct12: causalTaker,
-                  oiDelta4hPct: causalOi,
-                  fundingRateBps: causalFunding,
-                  perpBasisBps: causalBasis,
-                  topLongShortRatio: causalLs,
-                  macroEventDay: macroEv.isEventDay,
-                  macroEventInWindow: macroEv.inWindow,
-                  hitSl: sim.hitSl,
-                  mfePct: sim.mfePct,
-                  autoBeReturns,
-                  autoBeHitSl,
-                });
-
-                if (isOpeningSession45mBar(coin.c15, idx, ex, false)) {
-                  openSessionAcc.setups++;
-                  if (isWin) openSessionAcc.wins++;
-                  openSessionAcc.sumPnl += sim.finalRet;
-                }
               }
             }
           }
@@ -3353,41 +3277,281 @@ export class LearningEngine {
             }
           }
         }
+      }
 
-        if (sTrades > 0) {
-          const wr = (sWins / sTrades) * 100;
-          const avgPnl = sPnlSum / sTrades;
-          const pf = sLossAbs > 0 ? sWinSum / sLossAbs : sWinSum > 0 ? 99 : 0;
-          let scoreAdj = 0;
-          let avoidInDefensive = false;
-          if (sTrades >= 4 && wr < 35 && avgPnl < -0.5) {
-            scoreAdj = -20;
-            avoidInDefensive = true;
-          } else if (sTrades >= 4 && wr < 45 && avgPnl < -0.25) {
-            scoreAdj = -10;
-            avoidInDefensive = true;
-          } else if (sTrades >= 4 && wr >= 60 && avgPnl > 0.4) {
-            scoreAdj = 10;
-          } else if (sTrades >= 3 && wr >= 55 && avgPnl > 0.2) {
-            scoreAdj = 5;
-          }
+      const subBarWindows = pendingPrimarySetups.map((ps) => ({
+        symbol: ps.coin.symbol,
+        startSec: ps.signalBar.time,
+        endSec: ps.futureBars[ps.futureBars.length - 1]!.time + 900,
+      }));
+      const subBars1mMap =
+        pg && subBarWindows.length > 0
+          ? await pg.loadMarketCandlesWindowsBatch(ex, subBarWindows, "1m").catch(() => new Map<string, Candle[]>())
+          : new Map<string, Candle[]>();
 
-          bySymbol[coin.symbol] = {
-            symbol: coin.symbol,
-            trades: sTrades,
-            wins: sWins,
-            losses: sTrades - sWins,
-            winRatePct: Number(wr.toFixed(1)),
-            avgPnlPct: Number(avgPnl.toFixed(2)),
-            profitFactor: Number(pf.toFixed(2)),
-            avgMaePct: Number((sMaeSum / sTrades).toFixed(2)),
-            avgMfePct: Number((sMfeSum / sTrades).toFixed(2)),
-            scoreAdj,
-            avoidInDefensive,
-            lastBarTimeSec: coin.c15[n - 1]!.time,
-          };
+      let subBar1mUsedCount = 0;
+      const symAccMap = new Map<
+        string,
+        { trades: number; wins: number; winSum: number; lossAbs: number; pnlSum: number; maeSum: number; mfeSum: number }
+      >();
+
+      for (const ps of pendingPrimarySetups) {
+        const { coin, prev, c, prevBar, signalBar, simEntryPrice, distTarget, d200, futureBars, rsi1hVal, volR, coinRet24, rs24, curAtrPct, benchInfo, bottomLowSnap, p1d, pUsd, isOpening45m } = ps;
+        const symSubBars1m = subBars1mMap.get(coin.symbol);
+        const sim = simulateMaFanCounterfactual(
+          simEntryPrice,
+          distTarget,
+          slTriggerPct,
+          futureBars,
+          costPct,
+          shadowExitOpts,
+          symSubBars1m,
+        );
+        if (sim.usedSubBar1m) subBar1mUsedCount++;
+
+        let sa = symAccMap.get(coin.symbol);
+        if (!sa) {
+          sa = { trades: 0, wins: 0, winSum: 0, lossAbs: 0, pnlSum: 0, maeSum: 0, mfeSum: 0 };
+          symAccMap.set(coin.symbol, sa);
+        }
+
+        totalSetups++;
+        totalPnlSum += sim.finalRet;
+        sa.trades++;
+        sa.pnlSum += sim.finalRet;
+        sa.maeSum += sim.maePct;
+        sa.mfeSum += sim.mfePct;
+
+        const isWin = sim.finalRet > 0;
+        if (isWin) {
+          totalWins++;
+          sumWinPct += sim.finalRet;
+          sa.wins++;
+          sa.winSum += sim.finalRet;
+          winMaeAbs.push(Math.abs(sim.maePct));
+        } else {
+          sumLossAbsPct += Math.abs(sim.finalRet);
+          sa.lossAbs += Math.abs(sim.finalRet);
+        }
+
+        if (benchInfo?.isBear) {
+          bearSetups++;
+          if (isWin) bearWins++;
+          bearPnlSum += sim.finalRet;
+        }
+
+        const bStats = breadthByTime.get(prevBar.time);
+        const barBreadthPct = bStats && bStats.total >= 5 ? (bStats.above25 / bStats.total) * 100 : 50;
+        const prevBStats = breadthByTime.get(coin.c15[Math.max(0, prev - 16)]!.time);
+        const prevBreadthPct = prevBStats && prevBStats.total >= 5 ? (prevBStats.above25 / prevBStats.total) * 100 : barBreadthPct;
+        const breadthDelta4h = barBreadthPct - prevBreadthPct;
+        const benchmarkRet4h = benchInfo?.ret4h ?? 0;
+        const distFromBottomLowPct = Number.isFinite(bottomLowSnap) && bottomLowSnap > 0 ? ((simEntryPrice - bottomLowSnap) / bottomLowSnap) * 100 : 0;
+        const upperWickRatioPct = c.high > c.low ? ((c.high - Math.max(c.open, c.close)) / (c.high - c.low)) * 100 : 0;
+        const macroEv = getMacroEventContext(c.time);
+        const hasShock24h = detectRecentShock24h(coin.c15, prev, curAtrPct);
+        if (bStats && bStats.total >= 5 && barBreadthPct < 30) {
+          lowBreadthSetups++;
+          if (isWin) lowBreadthWins++;
+          lowBreadthPnlSum += sim.finalRet;
+        }
+
+        const bKey = computeFeatureBucketKey(rs24, volR, d200, rsi1hVal);
+        const fb = featureBucketAcc.get(bKey) || { setups: 0, wins: 0, sumPnl: 0 };
+        fb.setups++;
+        if (isWin) fb.wins++;
+        fb.sumPnl += sim.finalRet;
+        featureBucketAcc.set(bKey, fb);
+
+        const regKey = `${benchInfo?.isBear ? "BEAR" : "BULL"}:${bKey}`;
+        const rfb = regimeBucketAcc.get(regKey) || { setups: 0, wins: 0, sumPnl: 0 };
+        rfb.setups++;
+        if (isWin) rfb.wins++;
+        rfb.sumPnl += sim.finalRet;
+        regimeBucketAcc.set(regKey, rfb);
+
+        const sessKey = getSessionBucketLabel(c.time, ex);
+        const ss = sessionAcc.get(sessKey) || { setups: 0, wins: 0, sumPnl: 0 };
+        ss.setups++;
+        if (isWin) ss.wins++;
+        ss.sumPnl += sim.finalRet;
+        sessionAcc.set(sessKey, ss);
+
+        const upSpread = coin.m200[prev]! > 0 ? ((coin.m200[prev]! - coin.m75[prev]!) / coin.m200[prev]!) * 100 : 0;
+        const candScore = Math.min(3, volR) * 20 + Math.max(-5, Math.min(10, rs24)) * 3 - upSpread * 10;
+        const exitBar = futureBars[Math.min(futureBars.length - 1, Math.max(0, sim.exitBarsHeld - 1))];
+        primaryReplaySetups.push({
+          symbol: coin.symbol,
+          entryTimeSec: c.time,
+          exitTimeSec: exitBar ? exitBar.time : c.time + 900,
+          score: candScore,
+          pnlPct: sim.finalRet,
+          isBearMacro: Boolean(benchInfo?.isBear),
+          breadthPct: barBreadthPct,
+        });
+        const dMacro = p1d >= 0 ? bench1dRegimes[p1d] : undefined;
+        const dUsdRet = pUsd >= 0 ? usd1dRets[pUsd] : null;
+        const symFundingSeries = !isAlpaca ? opts.fundingBySymbol?.get(coin.symbol) : undefined;
+        const symOiSeries = !isAlpaca ? opts.oiBySymbol?.get(coin.symbol) : undefined;
+        const symBasisSeries = !isAlpaca ? opts.basisBySymbol?.get(coin.symbol) : undefined;
+        const symLsSeries = !isAlpaca ? opts.longShortBySymbol?.get(coin.symbol) : undefined;
+
+        const causalVwap = isAlpaca ? computeIntradayVwapDistPctAt(coin.c15, prev) : null;
+        const causalTaker = !isAlpaca ? computeTrueTakerBuyPct12At(coin.c15, prev) : null;
+        const causalFunding = !isAlpaca ? lookupCausalFundingBpsAt(symFundingSeries, c.time) : null;
+        const causalOi = !isAlpaca ? lookupCausalOiDelta4hPctAt(symOiSeries, c.time) : null;
+        const causalBasis = !isAlpaca ? lookupCausalPerpBasisBpsAt(symBasisSeries, c.time) : null;
+        const causalLs = !isAlpaca ? lookupCausalLongShortRatioAt(symLsSeries, c.time) : null;
+        const betaAlphaRes = computeCausalBetaAlphaAt(
+          coin.c15,
+          prev,
+          bench15,
+          benchIdxByTime,
+          coinRet24,
+          benchInfo?.ret24h ?? 0,
+          48,
+        );
+        const causalBetaAlpha = betaAlphaRes ? betaAlphaRes.betaAlpha24h : null;
+        const causalAtrSqueeze = computeAtrCompressionRatioAt(coin.c15, prev);
+        const causalGapPct = isAlpaca ? computeOvernightGapPctAt(coin.c15, prev) : null;
+        const sectorName = isAlpaca ? getEquitySector(coin.symbol) : null;
+        const secStats = sectorName ? sectorBreadthByTime.get(sectorName)?.get(prevBar.time) : undefined;
+        const causalSectorBreadth =
+          secStats && secStats.total >= 2 ? Number(((secStats.above25 / secStats.total) * 100).toFixed(1)) : null;
+
+        const subBarFeat = computeSubBar15mFeatures(signalBar, symSubBars1m);
+
+        const autoBeReturns: Record<string, number> = {};
+        const autoBeHitSl: Record<string, boolean> = {};
+        for (const beTrig of AUTO_BE_TRIGGER_CANDIDATES) {
+          const beSim = simulateAutoBeVariant(
+            simEntryPrice,
+            distTarget,
+            slTriggerPct,
+            futureBars,
+            costPct,
+            {
+              tp1FloorPct: shadowTp1FloorPct,
+              runnerTrailPct: shadowRunnerTrailPct,
+              staleExitBars: shadowStaleExitBars,
+              staleExitMaxGainPct: shadowStaleMaxGainPct,
+            },
+            beTrig,
+            symSubBars1m,
+          );
+          const beKey = beTrig.toFixed(1);
+          autoBeReturns[beKey] = beSim.finalRet;
+          autoBeHitSl[beKey] = beSim.hitSl;
+        }
+
+        observeSetupRecords.push({
+          entryTimeSec: c.time,
+          score: candScore,
+          pnlPct: sim.finalRet,
+          distFromBottomLowPct,
+          upperWickRatioPct,
+          breadthDelta4h,
+          benchmarkRet4h,
+          macroEventInWindow: macroEv.inWindow,
+          macroEventDay: macroEv.isEventDay,
+          hasShock24h,
+          mayerMultiple: dMacro?.mayerMultiple ?? null,
+          macroRiskIndex: dMacro?.macroRiskIndex ?? null,
+          usdRet5dPct: dUsdRet ?? null,
+          vwapDistPct: causalVwap,
+          takerBuyPct12: causalTaker,
+          fundingRateBps: causalFunding,
+          oiDelta4hPct: causalOi,
+          betaAlpha24h: causalBetaAlpha,
+          atrCompressionRatio: causalAtrSqueeze,
+          overnightGapPct: causalGapPct,
+          sectorBreadthPct: causalSectorBreadth,
+          perpBasisBps: causalBasis,
+          topLongShortRatio: causalLs,
+          subBarPathShape: subBarFeat?.pathShape ?? null,
+          lateBarCloseStrength: subBarFeat?.lateBarCloseStrength ?? null,
+          checkpointRetPct: sim.checkpointRetPct,
+        });
+
+        advancedQuantRecords.push({
+          entryTimeSec: c.time,
+          symbol: coin.symbol,
+          pnlPct: sim.finalRet,
+          score: candScore,
+          buyVolRatio12: volR,
+          rawRs24h: rs24,
+          betaAlpha24h: causalBetaAlpha,
+          rsi1h: rsi1hVal,
+          atrCompressionRatio: causalAtrSqueeze,
+          distFromBottomLowPct,
+          upperWickRatioPct,
+          breadthDelta4h,
+          concurrentSignals: 1,
+          usdRet5dPct: dUsdRet ?? null,
+          sessionBucket: sessKey,
+          vwapDistPct: causalVwap,
+          overnightGapPct: causalGapPct,
+          sectorName,
+          sectorBreadthPct: causalSectorBreadth,
+          takerBuyPct12: causalTaker,
+          oiDelta4hPct: causalOi,
+          fundingRateBps: causalFunding,
+          perpBasisBps: causalBasis,
+          topLongShortRatio: causalLs,
+          macroEventDay: macroEv.isEventDay,
+          macroEventInWindow: macroEv.inWindow,
+          hitSl: sim.hitSl,
+          mfePct: sim.mfePct,
+          subBarPathShape: subBarFeat?.pathShape ?? null,
+          lateBarCloseStrength: subBarFeat?.lateBarCloseStrength ?? null,
+          usedSubBar1m: sim.usedSubBar1m,
+          autoBeReturns,
+          autoBeHitSl,
+        });
+
+        if (isOpening45m) {
+          openSessionAcc.setups++;
+          if (isWin) openSessionAcc.wins++;
+          openSessionAcc.sumPnl += sim.finalRet;
         }
       }
+
+      for (const [sym, sa] of symAccMap.entries()) {
+        if (sa.trades <= 0) continue;
+        const wr = (sa.wins / sa.trades) * 100;
+        const avgPnl = sa.pnlSum / sa.trades;
+        const pf = sa.lossAbs > 0 ? sa.winSum / sa.lossAbs : sa.winSum > 0 ? 99 : 0;
+        let scoreAdj = 0;
+        let avoidInDefensive = false;
+        if (sa.trades >= 4 && wr < 35 && avgPnl < -0.5) {
+          scoreAdj = -20;
+          avoidInDefensive = true;
+        } else if (sa.trades >= 4 && wr < 45 && avgPnl < -0.25) {
+          scoreAdj = -10;
+          avoidInDefensive = true;
+        } else if (sa.trades >= 4 && wr >= 60 && avgPnl > 0.4) {
+          scoreAdj = 10;
+        } else if (sa.trades >= 3 && wr >= 55 && avgPnl > 0.2) {
+          scoreAdj = 5;
+        }
+
+        bySymbol[sym] = {
+          symbol: sym,
+          trades: sa.trades,
+          wins: sa.wins,
+          losses: sa.trades - sa.wins,
+          winRatePct: Number(wr.toFixed(1)),
+          avgPnlPct: Number(avgPnl.toFixed(2)),
+          profitFactor: Number(pf.toFixed(2)),
+          avgMaePct: Number((sa.maeSum / sa.trades).toFixed(2)),
+          avgMfePct: Number((sa.mfeSum / sa.trades).toFixed(2)),
+          scoreAdj,
+          avoidInDefensive,
+          lastBarTimeSec: lastBarTimeBySym.get(sym) ?? 0,
+        };
+      }
+
+      const subBar1mCoveragePct = totalSetups > 0 ? Number(((subBar1mUsedCount / totalSetups) * 100).toFixed(1)) : 0;
 
       const profiles = Object.values(bySymbol);
       const topProvenSymbols = profiles
@@ -3497,6 +3661,7 @@ export class LearningEngine {
         portfolioSim,
         breadthSitOutAnalysis,
         observeFactors,
+        subBar1mCoveragePct,
         factorRankIc,
         mfeGivebackAudit,
         contextGateOos,

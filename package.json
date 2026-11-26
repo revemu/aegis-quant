@@ -1,6 +1,6 @@
 {
   "name": "aegis-quant",
-  "version": "0.3.1.20",
+  "version": "0.3.1.21",
   "private": true,
   "type": "module",
   "scripts": {

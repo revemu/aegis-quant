@@ -10414,3 +10414,18 @@ When investigating live production behavior, debugging issues, or analyzing trad
   4. **Dashboard UI ([`public/app.js`](file:///c:/Sites/github/aegis-quant/public/app.js#L9999-L10085))**:
      - เพิ่มการ์ดแสดงผล 4 ชุดใน Learning Report Modal: Quant Alpha & Microstructure + 14D Decayed Memory, Walk-Forward Factor Rank IC, MFE Giveback & Auto-BE OOS Audit, และ Context-Gate Promotion & Confidence Sizing OOS
 - **Version Bump**: **`0.3.1.20`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 365. `1m` Sub-Bar Path Reconstruction & Precision Intra-Bar Replay (`v0.3.1.21`)
+- **แนวคิดและปัญหาที่แก้ไข**:
+  - การเทรดจริงยังคงอยู่ที่ Timeframe `15m` เพื่อกันสัญญาณรบกวน แต่ในการจำลอง Backtest/Shadow Learning (`simulateMaFanCounterfactual`, `simulateAutoBeVariant`, `evaluatePendingBlockedSignals`) เดิมเห็นเฉพาะ OHLC ของ `15m` ทำให้เมื่อแท่งเดียวกันแตะทั้ง TP1/BE และ SL ต้องเดาแบบ conservative และแยกไม่ออกว่าแท่ง `15m` ที่ปิดเหมือนกันเกิดแรงซื้อท้ายแท่ง (`V_RECOVERY`) หรือถูกเทขายท้ายแท่ง (`FADE_TOP`)
+- **สิ่งที่พัฒนา (`v0.3.1.21`)**:
+  1. **On-Demand `1m` Window Query & Retention ([`src/pg-store.ts`](file:///c:/Sites/github/aegis-quant/src/pg-store.ts#L931-L1064))**:
+     - เพิ่ม `loadLatestMarketCandleTimes`, `loadMarketCandlesWindowsBatch` (รวมหน้าต่างทับซ้อนแล้ว query เฉพาะช่วง `[entry - 15m .. exit]` ไม่โหลดทั้งเดือนเข้า RAM) และ `pruneOldMarketCandles(..., 30)` จำกัดเก็บ `1m` ย้อนหลัง 30 วัน
+  2. **Incremental `1m` Sync ([`src/strategy/ma-fan-portfolio/universe.ts`](file:///c:/Sites/github/aegis-quant/src/strategy/ma-fan-portfolio/universe.ts#L841-L968))**:
+     - เพิ่ม `syncSubBar1mCandlesToPg` เก็บแท่ง `1m` ของทั้ง Binance (`interval=1m`, cold start 3,000 แท่ง แล้วเติมต่อทุกรอบ) และ Alpaca (`interval=1m` RTH) แบบ non-blocking ในพื้นหลัง (throttle 14 นาที) พร้อม fallback กลับไปใช้ `15m` อัตโนมัติช่วงที่ยังไม่มี `1m`
+  3. **Sub-Bar Microstructure & Precision Replay ([`src/quant-learning-analytics.ts`](file:///c:/Sites/github/aegis-quant/src/quant-learning-analytics.ts), [`src/learning-engine.ts`](file:///c:/Sites/github/aegis-quant/src/learning-engine.ts))**:
+     - `sliceSubBarsInWindow` และ `computeSubBar15mFeatures` วัด `subBarPathShape` (`V_RECOVERY` vs `FADE_TOP` vs `NEUTRAL_PATH`) และ `lateBarCloseStrength` (แรงปิด 5 นาทีท้ายเทียบช่วงแท่ง 15m)
+     - อัปเกรดทั้ง `simulateMaFanCounterfactual` และ `simulateAutoBeVariant` ให้เดินราคาทีละนาทีเมื่อมีแท่ง `1m` ครบ `>= 2` แท่งต่อแท่ง `15m` พร้อมคำนวณ `subBar1mCoveragePct` และแสดงผลบน Learning Dashboard ([`public/app.js`](file:///c:/Sites/github/aegis-quant/public/app.js#L10003-L10040))
+- **Version Bump**: **`0.3.1.21`** (`package.json`, `src/version.ts`, `public/index.html`)

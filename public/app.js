@@ -10002,8 +10002,11 @@
                   const hasSec = of.sectorBreadthBuckets && Object.keys(of.sectorBreadthBuckets).length > 0;
                   const hasBasis = of.perpBasisBuckets && Object.keys(of.perpBasisBuckets).length > 0;
                   const hasLs = of.longShortBuckets && Object.keys(of.longShortBuckets).length > 0;
+                  const hasSubPath = of.subBarPathBuckets && Object.keys(of.subBarPathBuckets).length > 0;
+                  const hasLateStr = of.lateBarStrengthBuckets && Object.keys(of.lateBarStrengthBuckets).length > 0;
+                  const subCov = shad?.subBar1mCoveragePct;
                   const drm = shad?.decayedRegimeMemory;
-                  if (!hasBeta && !hasSq && !hasGap && !hasSec && !hasBasis && !hasLs && !drm) return "";
+                  if (!hasBeta && !hasSq && !hasGap && !hasSec && !hasBasis && !hasLs && !hasSubPath && !hasLateStr && !drm) return "";
                   let drmLine = "";
                   if (drm && Number(drm.effectiveN || 0) > 0) {
                     const dCol = drm.drift === "IMPROVING" ? "#4ade80" : drm.drift === "DETERIORATING" ? "#f87171" : "#94a3b8";
@@ -10013,6 +10016,7 @@
                       <strong>⏳ ${drm.halfLifeDays}D Decayed Memory:</strong>
                       <span style="padding:2px 6px; border-radius:4px; background:rgba(148,163,184,0.12); color:${dCol}; font-weight:700;">${drm.drift}</span>
                       <span style="padding:2px 6px; border-radius:4px; background:rgba(148,163,184,0.1); color:#cbd5e1;">Recent: WR ${drm.decayedWinRatePct}% (${dAvg >= 0 ? "+" : ""}${dAvg.toFixed(2)}%, PF ${drm.decayedProfitFactor}) vs Full: WR ${drm.fullWinRatePct}% (${fAvg >= 0 ? "+" : ""}${fAvg.toFixed(2)}%, PF ${drm.fullProfitFactor}) • EffN ${drm.effectiveN}</span>
+                      ${subCov != null ? `<span style="padding:2px 6px; border-radius:4px; background:rgba(56,189,248,0.12); color:#7dd3fc; font-weight:700;">🔬 1m Replay Coverage: ${Number(subCov).toFixed(1)}%</span>` : ""}
                     </div>`;
                   }
                   return `
@@ -10020,6 +10024,8 @@
                       <div class="lr-kpi-label">📐 Quant Alpha, Volatility Squeeze &amp; Microstructure (Observe-Only)</div>
                       ${hasBeta ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Beta-Alpha 24h:</strong> ${renderChips(of.betaAlphaBuckets)}</div>` : ""}
                       ${hasSq ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>ATR Squeeze (14/96):</strong> ${renderChips(of.atrSqueezeBuckets)}</div>` : ""}
+                      ${hasSubPath ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Sub-Bar 1m Path:</strong> ${renderChips(of.subBarPathBuckets)}</div>` : ""}
+                      ${hasLateStr ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Late-5m Close Strength:</strong> ${renderChips(of.lateBarStrengthBuckets)}</div>` : ""}
                       ${hasGap ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Overnight Gap:</strong> ${renderChips(of.overnightGapBuckets)}</div>` : ""}
                       ${hasSec ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Sector Breadth:</strong> ${renderChips(of.sectorBreadthBuckets)}</div>` : ""}
                       ${hasBasis ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Perp Basis:</strong> ${renderChips(of.perpBasisBuckets)}</div>` : ""}

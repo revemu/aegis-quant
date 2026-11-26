@@ -136,8 +136,19 @@ export interface AdvancedQuantSetupRecord {
   macroEventInWindow: boolean;
   hitSl: boolean;
   mfePct: number;
+  subBarPathShape: string | null;
+  lateBarCloseStrength: number | null;
+  usedSubBar1m: boolean;
   autoBeReturns: Record<string, number>;
   autoBeHitSl: Record<string, boolean>;
+}
+
+export interface SubBar15mFeatures {
+  pathShape: "V_RECOVERY" | "FADE_TOP" | "NEUTRAL_PATH";
+  lowBeforeHigh: boolean;
+  lateBarCloseStrength: number;
+  late5mVolSharePct: number;
+  barCount: number;
 }
 
 export const AUTO_BE_TRIGGER_CANDIDATES = [0.6, 0.8, 1.0, 1.2, 1.5] as const;
@@ -420,15 +431,110 @@ export function classifyLongShortZone(lsRatio: number | null | undefined): strin
   return "LONG_CROWDED (>1.5)";
 }
 
+export function classifySubBarPathZone(shape: string | null | undefined): string | null {
+  if (!shape) return null;
+  if (shape === "V_RECOVERY" || shape === "FADE_TOP" || shape === "NEUTRAL_PATH") return shape;
+  return null;
+}
+
+export function classifyLateBarStrengthZone(val: number | null | undefined): string | null {
+  if (val === null || val === undefined || !Number.isFinite(val)) return null;
+  if (val < -0.2) return "FADING (<-0.2)";
+  if (val <= 0.2) return "BALANCED (-0.2..+0.2)";
+  return "STRONG_CLOSE (>+0.2)";
+}
+
+/**
+ * Binary-search slice of sub-bars strictly within `[startSec, endSec)`.
+ */
+export function sliceSubBarsInWindow(
+  subBars: Candle[] | undefined,
+  startSec: number,
+  endSec: number,
+): Candle[] {
+  if (!subBars || subBars.length === 0 || endSec <= startSec) return [];
+  let lo = 0;
+  let hi = subBars.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (subBars[mid]!.time < startSec) lo = mid + 1;
+    else hi = mid;
+  }
+  const out: Candle[] = [];
+  for (let i = lo; i < subBars.length; i++) {
+    const c = subBars[i]!;
+    if (c.time >= endSec) break;
+    out.push(c);
+  }
+  return out;
+}
+
+/**
+ * Reconstructs intra-bar 15m microstructure from closed 1m sub-bars:
+ * detects whether Low occurred before High (`V_RECOVERY` vs `FADE_TOP`) and measures late-5m close strength.
+ */
+export function computeSubBar15mFeatures(
+  c15Bar: Candle,
+  subBars1m: Candle[] | undefined,
+): SubBar15mFeatures | null {
+  const subs = sliceSubBarsInWindow(subBars1m, c15Bar.time, c15Bar.time + 900);
+  if (subs.length < 3) return null;
+
+  let lowIdx = 0;
+  let highIdx = 0;
+  let minLow = subs[0]!.low;
+  let maxHigh = subs[0]!.high;
+  let totalVol = 0;
+
+  for (let i = 0; i < subs.length; i++) {
+    const b = subs[i]!;
+    totalVol += Math.max(0, b.volume || 0);
+    if (b.low < minLow) {
+      minLow = b.low;
+      lowIdx = i;
+    }
+    if (b.high > maxHigh) {
+      maxHigh = b.high;
+      highIdx = i;
+    }
+  }
+
+  const lowBeforeHigh = lowIdx <= highIdx;
+  const lateCutoff = c15Bar.time + 600;
+  let lateBars = subs.filter((b) => b.time >= lateCutoff);
+  if (lateBars.length === 0) {
+    lateBars = subs.slice(Math.max(0, Math.floor((subs.length * 2) / 3)));
+  }
+
+  const last5Open = lateBars[0]!.open;
+  const last5Close = lateBars[lateBars.length - 1]!.close;
+  const range15 = Math.max(c15Bar.high - c15Bar.low, 1e-8);
+  const lateBarCloseStrength = roundTo(clamp((last5Close - last5Open) / range15, -1, 1), 3);
+  const lateVol = lateBars.reduce((s, b) => s + Math.max(0, b.volume || 0), 0);
+  const late5mVolSharePct = totalVol > 0 ? roundTo((lateVol / totalVol) * 100, 1) : 33.3;
+
+  let pathShape: SubBar15mFeatures["pathShape"] = "NEUTRAL_PATH";
+  if (lowBeforeHigh && lateBarCloseStrength >= 0.2) pathShape = "V_RECOVERY";
+  else if (!lowBeforeHigh && lateBarCloseStrength <= -0.2) pathShape = "FADE_TOP";
+
+  return {
+    pathShape,
+    lowBeforeHigh,
+    lateBarCloseStrength,
+    late5mVolSharePct,
+    barCount: subs.length,
+  };
+}
+
 /**
  * Causal bar-by-bar simulator for pre-TP1 Auto-Breakeven locking.
- * Checks SL against the active stop *before* promoting the stop on that bar's high.
+ * When `subBars1m` covers a 15m bar (`>= 2` 1m bars), walks minute-by-minute for exact SL vs TP1/BE ordering.
  */
 export function simulateAutoBeVariant(
   entryPrice: number,
   distTargetPct: number,
   slTriggerPct: number,
-  futureBars: Array<{ high: number; low: number; close: number }>,
+  futureBars: Array<{ time?: number; high: number; low: number; close: number }>,
   costPct: number,
   exitOpts: {
     tp1FloorPct: number;
@@ -437,6 +543,7 @@ export function simulateAutoBeVariant(
     staleExitMaxGainPct: number;
   },
   beTriggerPct: number,
+  subBars1m?: Candle[],
 ): { finalRet: number; hitSl: boolean } {
   const minFloor = Math.max(0.5, exitOpts.tp1FloorPct);
   const tp1Pct =
@@ -456,47 +563,70 @@ export function simulateAutoBeVariant(
   let finalRet: number | null = null;
   let hitSl = false;
 
-  for (let i = 0; i < futureBars.length; i++) {
-    const b = futureBars[i]!;
-    const barsHeld = i + 1;
-    const lowPct = ((b.low - entryPrice) / entryPrice) * 100;
-    const highPct = ((b.high - entryPrice) / entryPrice) * 100;
-    const closePct = ((b.close - entryPrice) / entryPrice) * 100;
+  const stepBar = (sb: { high: number; low: number; close: number }): boolean => {
+    const lowPct = ((sb.low - entryPrice) / entryPrice) * 100;
+    const highPct = ((sb.high - entryPrice) / entryPrice) * 100;
+    const closePct = ((sb.close - entryPrice) / entryPrice) * 100;
 
     if (!tp1Hit) {
       const activeStopPct = preTp1BeLocked ? preTp1BeStopPct : slTriggerPct;
       if (lowPct <= activeStopPct) {
         finalRet = activeStopPct;
         hitSl = !preTp1BeLocked;
-        break;
+        return true;
       }
       if (highPct >= tp1Pct) {
         tp1Hit = true;
         peakPctSinceTp1 = Math.max(tp1Pct, closePct);
-      } else {
-        if (beTriggerPct > 0 && highPct >= beTriggerPct) {
-          preTp1BeLocked = true;
-        }
-        if (staleExitBars > 0 && barsHeld >= staleExitBars && closePct < staleMaxGainPct) {
-          finalRet = closePct;
-          break;
-        }
+      } else if (beTriggerPct > 0 && highPct >= beTriggerPct) {
+        preTp1BeLocked = true;
       }
-    } else if (runnerTrailPct > 0) {
+      return false;
+    }
+
+    if (runnerTrailPct > 0) {
       const prevTrailStopPct = Math.max(trailFloorPct, peakPctSinceTp1 - runnerTrailPct);
       if (lowPct <= prevTrailStopPct) {
         finalRet = 0.5 * tp1Pct + 0.5 * prevTrailStopPct;
-        break;
+        return true;
       }
       peakPctSinceTp1 = Math.max(peakPctSinceTp1, highPct);
       const nextTrailStopPct = Math.max(trailFloorPct, peakPctSinceTp1 - runnerTrailPct);
       if (closePct <= nextTrailStopPct) {
         finalRet = 0.5 * tp1Pct + 0.5 * nextTrailStopPct;
+        return true;
+      }
+      return false;
+    }
+
+    if (lowPct <= beLockAfterTp1Pct) {
+      finalRet = 0.5 * tp1Pct + 0.5 * beLockAfterTp1Pct;
+      return true;
+    }
+    return false;
+  };
+
+  for (let i = 0; i < futureBars.length; i++) {
+    const b = futureBars[i]!;
+    const barsHeld = i + 1;
+    const subs = b.time !== undefined && subBars1m?.length ? sliceSubBarsInWindow(subBars1m, b.time, b.time + 900) : [];
+    const inner = subs.length >= 2 ? subs : [b];
+
+    let exited = false;
+    for (const sb of inner) {
+      if (stepBar(sb)) {
+        exited = true;
         break;
       }
-    } else if (lowPct <= beLockAfterTp1Pct) {
-      finalRet = 0.5 * tp1Pct + 0.5 * beLockAfterTp1Pct;
-      break;
+    }
+    if (exited) break;
+
+    if (!tp1Hit && staleExitBars > 0 && barsHeld >= staleExitBars) {
+      const closePct = ((b.close - entryPrice) / entryPrice) * 100;
+      if (closePct < staleMaxGainPct) {
+        finalRet = closePct;
+        break;
+      }
     }
   }
 
@@ -595,6 +725,7 @@ export function computeFactorRankIc(
     { factor: "fundingRateBps", label: "Funding Rate (bps)", market: "crypto", get: (r) => r.fundingRateBps },
     { factor: "perpBasisBps", label: "Perp-Spot Basis (bps)", market: "crypto", get: (r) => r.perpBasisBps },
     { factor: "topLongShortRatio", label: "Top-Trader L/S Ratio", market: "crypto", get: (r) => r.topLongShortRatio },
+    { factor: "lateBarCloseStrength", label: "Late-5m Close Strength", market: "all", get: (r) => r.lateBarCloseStrength },
   ];
 
   const calcIc = (subset: AdvancedQuantSetupRecord[], getFn: (r: AdvancedQuantSetupRecord) => number | null) => {
@@ -842,6 +973,12 @@ function getContextGateRuleDefs(): ContextGateRuleDef[] {
       label: "Overnight Gap Up (>+0.5%)",
       market: "alpaca",
       matches: (r) => r.overnightGapPct !== null && r.overnightGapPct > 0.5,
+    },
+    {
+      id: "SUBBAR_FADE_TOP",
+      label: "1m Sub-Bar Fade Top",
+      market: "all",
+      matches: (r) => r.subBarPathShape === "FADE_TOP",
     },
   ];
 }
