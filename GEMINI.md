@@ -10429,3 +10429,17 @@ When investigating live production behavior, debugging issues, or analyzing trad
      - `sliceSubBarsInWindow` และ `computeSubBar15mFeatures` วัด `subBarPathShape` (`V_RECOVERY` vs `FADE_TOP` vs `NEUTRAL_PATH`) และ `lateBarCloseStrength` (แรงปิด 5 นาทีท้ายเทียบช่วงแท่ง 15m)
      - อัปเกรดทั้ง `simulateMaFanCounterfactual` และ `simulateAutoBeVariant` ให้เดินราคาทีละนาทีเมื่อมีแท่ง `1m` ครบ `>= 2` แท่งต่อแท่ง `15m` พร้อมคำนวณ `subBar1mCoveragePct` และแสดงผลบน Learning Dashboard ([`public/app.js`](file:///c:/Sites/github/aegis-quant/public/app.js#L10003-L10040))
 - **Version Bump**: **`0.3.1.21`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 366. Smart Safe-Boot Pause Persistence & Orchestrator Process Guards (`v0.3.1.22`)
+- **สาเหตุของปัญหา**:
+  - เมื่อ Ubuntu `unattended-upgrades` / `needrestart` อัปเดตแพ็กเกจระบบ (เช่น `libexpat1`) แล้วสั่งรีสตาร์ต PM2 Daemon อัตโนมัติ ตัวบอทเข้าโหมด `[SAFE BOOT]` ที่บังคับ `grid.setPaused(true)` เสมอทุกครั้ง ทำให้บอทค้างอยู่ในสถานะ `PAUSED` เงียบๆ แม้ก่อนรีสตาร์ตกำลังเปิดทำงานอยู่และเป็นโค้ดเวอร์ชันเดิม
+- **สิ่งที่แก้ไข (`v0.3.1.22`)**:
+  1. **Smart Safe-Boot ([`src/index.ts`](file:///c:/Sites/github/aegis-quant/src/index.ts#L397-L420), [`onPauseBot`](file:///c:/Sites/github/aegis-quant/src/index.ts#L898-L907))**:
+     - บันทึก `lastRunVersion` และ `lastRuntimePaused` ลง DB (`setSettings` + `flushSettingsSync()`) ทุกครั้งที่บูตและทุกครั้งที่มีการกด Pause/Resume
+     - เมื่อรีสตาร์ตด้วย **เวอร์ชันเดิม** และก่อนรีสตาร์ตบอททำงานอยู่ (`lastRuntimePaused === false`) ➔ Auto-Resume ทำงานต่ออัตโนมัติ (`▶️ [SMART SAFE BOOT] Auto-resumed ACTIVE state`)
+     - เมื่ออัปเดต **เวอร์ชันใหม่**, เปิดบอทครั้งแรก, หรือผู้ใช้กด Pause ค้างไว้ก่อนหน้า ➔ เข้า `⏸️ [SAFE BOOT]` (`PAUSED`) ตามมาตรฐานความปลอดภัยเดิม
+  2. **Orchestrator Process Exception Guards ([`src/orchestrator.ts`](file:///c:/Sites/github/aegis-quant/src/orchestrator.ts#L1089-L1096))**:
+     - เพิ่มตัวดัก `unhandledRejection` และ `uncaughtException` เพื่อ log สาเหตุลง `orchLog` แทนการปิดโปรเซสโดยไม่มี log
+- **Version Bump**: **`0.3.1.22`** (`package.json`, `src/version.ts`, `public/index.html`)

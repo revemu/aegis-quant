@@ -1088,6 +1088,12 @@ async function bootstrap(): Promise<void> {
   };
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
+  process.on("unhandledRejection", (reason) => {
+    orchLog(`⚠️ [Orchestrator] Unhandled rejection: ${reason instanceof Error ? reason.stack || reason.message : String(reason)}`);
+  });
+  process.on("uncaughtException", (err) => {
+    orchLog(`❌ [Orchestrator] Uncaught exception: ${err?.stack || err?.message || String(err)}`);
+  });
 }
 
 bootstrap().catch((err) => {

@@ -15,6 +15,7 @@ import { DowStructureEngine, type Candle } from "./market-structure.js";
 import { DashboardServer } from "./server.js";
 import { AutonomousPairRotator } from "./pair-rotator.js";
 import type { AtrSource } from "./types.js";
+import { APP_VERSION_INFO } from "./version.js";
 
 function formatTimestamp(d = new Date()): string {
   try {
@@ -394,9 +395,30 @@ async function main(): Promise<void> {
   }
   await grid.refreshWalletBalances();
 
-  // 🛡️ Safe Boot: Always ensure bot starts in PAUSED mode on startup across all strategies
-  grid.setPaused(true);
-  log("⏸️ [SAFE BOOT] Bot started in PAUSED mode as requested. Resume trading via dashboard or API.");
+  // 🛡️ Smart Safe Boot: Auto-resume only when restarting on the exact same version while previously active;
+  // always boot PAUSED on initial setup, version upgrades, or if manually paused before restart.
+  const safeBootDb = grid.getDatabase();
+  const prevRunVersion = safeBootDb.getSetting<string>("lastRunVersion");
+  const prevPaused = safeBootDb.getSetting<boolean>("lastRuntimePaused");
+  const currentVersion = APP_VERSION_INFO.version;
+  const shouldAutoResume = Boolean(prevRunVersion) && prevRunVersion === currentVersion && prevPaused === false;
+  if (shouldAutoResume) {
+    grid.setPaused(false);
+    log(`▶️ [SMART SAFE BOOT] Auto-resumed ACTIVE state (same version ${currentVersion}, bot was active before restart).`);
+  } else {
+    grid.setPaused(true);
+    const reason = !prevRunVersion
+      ? "initial boot"
+      : prevRunVersion !== currentVersion
+        ? `version updated ${prevRunVersion} -> ${currentVersion}`
+        : "previously paused";
+    log(`⏸️ [SAFE BOOT] Bot started in PAUSED mode (${reason}). Resume trading via dashboard or API.`);
+  }
+  safeBootDb.setSettings({
+    lastRunVersion: currentVersion,
+    lastRuntimePaused: grid.getIsPaused(),
+  });
+  safeBootDb.flushSettingsSync();
 
   let wakeSleep: (() => void) | null = null;
   const interruptibleSleep = (ms: number): Promise<void> => {
@@ -876,7 +898,16 @@ async function main(): Promise<void> {
       grid.reconcileLearningJournal
         ? grid.reconcileLearningJournal()
         : Promise.resolve({ updatedTrades: 0, updatedSymbols: 0 }),
-    onPauseBot: (paused) => grid.setPaused(paused),
+    onPauseBot: (paused) => {
+      const nextPaused = grid.setPaused(paused);
+      const db = grid.getDatabase();
+      db.setSettings({
+        lastRunVersion: APP_VERSION_INFO.version,
+        lastRuntimePaused: nextPaused,
+      });
+      db.flushSettingsSync();
+      return nextPaused;
+    },
     getIsPaused: () => grid.getIsPaused(),
     onCancelAll: () => grid.cancelAllOrdersUser(),
     onSellAll: () => grid.sellAllUser(),
