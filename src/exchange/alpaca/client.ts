@@ -9,6 +9,7 @@ import {
   ExchangeAccountBalances,
   ExchangeOpenOrder,
   ExchangeOrderResult,
+  ExchangeLiveHolding,
   ExchangeTopOfBook,
   PlaceOrderParams,
   ExchangeTrade,
@@ -48,10 +49,32 @@ function mapAlpacaOrderStatus(rawStatus?: string): ExchangeOrderResult["status"]
   if (s === "filled") return "FILLED";
   if (s === "partially_filled") return "PARTIALLY_FILLED";
   if (s === "new" || s === "accepted" || s === "pending_new" || s === "pending_cancel") return "NEW";
-  if (s === "canceled") return "CANCELED";
-  if (s === "expired") return "EXPIRED";
+  if (s === "canceled" || s === "stopped" || s === "suspended") return "CANCELED";
+  if (s === "expired" || s === "done_for_day") return "EXPIRED";
   if (s === "rejected") return "REJECTED";
   return "NEW";
+}
+
+function mapAlpacaRawOrderToOpenOrder(o: any): ExchangeOpenOrder {
+  const status = mapAlpacaOrderStatus(o.status);
+  const submittedSec = Math.floor(new Date(o.submitted_at).getTime() / 1000);
+  const updatedSec = Math.floor(new Date(o.updated_at || o.submitted_at).getTime() / 1000);
+  return {
+    symbol: o.symbol,
+    orderId: o.id,
+    clientOrderId: o.client_order_id,
+    price: parseFloat(o.limit_price || o.filled_avg_price) || 0,
+    origQty: parseFloat(o.qty) || 0,
+    executedQty: parseFloat(o.filled_qty) || 0,
+    cummulativeQuoteQty: parseFloat(o.filled_avg_price || 0) * parseFloat(o.filled_qty || 0),
+    status,
+    timeInForce: o.time_in_force?.toUpperCase() || "DAY",
+    type: o.type?.toUpperCase() || "LIMIT",
+    side: o.side?.toUpperCase() === "BUY" ? "BUY" : "SELL",
+    time: submittedSec,
+    updateTime: updatedSec,
+    isWorking: !isAlpacaTerminalStatus(o.status),
+  };
 }
 
 function formatAlpacaQty(qty: number): string {
@@ -300,25 +323,53 @@ export class AlpacaClient implements IExchangeClient {
     const res = await fetch(`${this.baseUrl}/v2/orders/${orderId}`, { headers: this.getHeaders() });
     if (!res.ok) throw new Error(`Failed to fetch order ${orderId}: HTTP ${res.status}`);
     const o = await res.json();
-    const status = mapAlpacaOrderStatus(o.status);
-    const submittedSec = Math.floor(new Date(o.submitted_at).getTime() / 1000);
-    const updatedSec = Math.floor(new Date(o.updated_at || o.submitted_at).getTime() / 1000);
+    return mapAlpacaRawOrderToOpenOrder(o);
+  }
 
+  /**
+   * Query an order by client_order_id. Returns null ONLY on HTTP 404 (not found); throws on transient/API errors.
+   */
+  public async getOrderByClientId(_symbol: string, clientOrderId: string): Promise<ExchangeOpenOrder | ExchangeOrderResult | null> {
+    const url = `${this.baseUrl}/v2/orders:by_client_order_id?client_order_id=${encodeURIComponent(clientOrderId)}`;
+    const res = await fetch(url, { headers: this.getHeaders() });
+    if (res.status === 404) return null;
+    if (!res.ok) {
+      throw new Error(`Failed to fetch order by clientOrderId ${clientOrderId}: HTTP ${res.status}`);
+    }
+    const o = await res.json();
+    return mapAlpacaRawOrderToOpenOrder(o);
+  }
+
+  /**
+   * Fetch live position for a symbol. Returns qty=0 on HTTP 404 (flat); throws on transient/API errors (fail-closed).
+   */
+  public async getLiveHolding(symbol: string): Promise<ExchangeLiveHolding> {
+    const cleanSym = normalizeStockSymbol(symbol);
+    const res = await fetch(`${this.baseUrl}/v2/positions/${encodeURIComponent(cleanSym)}`, {
+      headers: this.getHeaders(),
+    });
+    if (res.status === 404) {
+      return {
+        symbol: cleanSym,
+        qty: 0,
+        qtyAvailable: 0,
+        avgEntryPrice: 0,
+        marketValue: 0,
+      };
+    }
+    if (!res.ok) {
+      throw new Error(`Failed to fetch Alpaca position ${cleanSym}: HTTP ${res.status}`);
+    }
+    const p = (await res.json()) as any;
+    const qty = parseFloat(p.qty) || 0;
+    const qtyAvailable = p.qty_available !== undefined ? parseFloat(p.qty_available) || 0 : qty;
     return {
-      symbol: o.symbol,
-      orderId: o.id,
-      clientOrderId: o.client_order_id,
-      price: parseFloat(o.limit_price || o.filled_avg_price) || 0,
-      origQty: parseFloat(o.qty) || 0,
-      executedQty: parseFloat(o.filled_qty) || 0,
-      cummulativeQuoteQty: parseFloat(o.filled_avg_price || 0) * parseFloat(o.filled_qty || 0),
-      status,
-      timeInForce: o.time_in_force?.toUpperCase() || "DAY",
-      type: o.type?.toUpperCase() || "LIMIT",
-      side: o.side?.toUpperCase() === "BUY" ? "BUY" : "SELL",
-      time: submittedSec,
-      updateTime: updatedSec,
-      isWorking: status === "NEW" || status === "PARTIALLY_FILLED",
+      symbol: cleanSym,
+      qty,
+      qtyAvailable,
+      avgEntryPrice: parseFloat(p.avg_entry_price) || 0,
+      currentPrice: parseFloat(p.current_price) || undefined,
+      marketValue: parseFloat(p.market_value) || 0,
     };
   }
 
@@ -414,14 +465,24 @@ export class AlpacaClient implements IExchangeClient {
       const finalStatus = mapAlpacaOrderStatus(o.status);
       const finalFilledQty = parseFloat(o.filled_qty || 0);
       if (isProtectiveIoc && finalFilledQty <= 0) {
-        throw new Error(`Alpaca protective limit ${cleanSym} @ $${body.limit_price} unfilled within timeout (${o.status || "canceled"})`);
+        const err = new Error(
+          `Alpaca protective limit ${cleanSym} @ $${body.limit_price} unfilled within timeout (${o.status || "canceled"})`,
+        ) as any;
+        err.orderId = o?.id;
+        err.orderStatus = o?.status;
+        err.isTerminal = isAlpacaTerminalStatus(o?.status);
+        throw err;
       }
       if (
         type === "market" &&
         (finalStatus === "CANCELED" || finalStatus === "REJECTED" || finalStatus === "EXPIRED") &&
         finalFilledQty <= 0
       ) {
-        throw new Error(`Alpaca market order ${o.id} ${o.status} without fill`);
+        const err = new Error(`Alpaca market order ${o.id} ${o.status} without fill`) as any;
+        err.orderId = o?.id;
+        err.orderStatus = o?.status;
+        err.isTerminal = isAlpacaTerminalStatus(o?.status);
+        throw err;
       }
     }
     return {

@@ -49,6 +49,25 @@ export interface LockedChannel {
   lockedAt: number;
 }
 
+export interface CorePendingOrderRecord {
+  clientOrderId: string;
+  orderId?: string;
+  symbol: string;
+  side: "BUY" | "SELL";
+  intent: "ENTRY" | "TOP_UP" | "EXIT_TP1" | "EXIT_FULL";
+  targetCapital: number;        // Hard single-slot USD cap for BUY (never exceeded)
+  requestedQty: number;
+  filledQtyAccounted: number;   // Cumulative qty already accounted into slot/strategy (prevents double-count)
+  lastFillPrice?: number;
+  refPrice: number;
+  createdAt: number;
+  updatedAt: number;
+  status: "SUBMITTING" | "OPEN" | "PARTIALLY_FILLED" | "CANCELING";
+  slotIndex?: number;
+  reason?: string;
+  notFoundChecks?: number;
+}
+
 export interface PortfolioSlotRecord {
   slotIndex: number;
   symbol: string;
@@ -56,6 +75,10 @@ export interface PortfolioSlotRecord {
   entryIdx?: number;
   entryPrice: number;
   allocatedCapital: number;
+  targetCapital?: number;
+  topUpAttempts?: number;
+  topUpDeadlineMs?: number;
+  lastBuyAttemptMs?: number;
   stopLossPrice: number;
   qty: number;
   initialQty: number;
@@ -136,6 +159,7 @@ export interface StrategyStateRecord {
   soldSellIndices?: number[];
   maFanPosition?: any;
   portfolioSlots?: PortfolioSlotRecord[];
+  portfolioPendingOrders?: CorePendingOrderRecord[];
   portfolioCash?: number;
   portfolioInitialCapital?: number;
   lastUpdated: number;

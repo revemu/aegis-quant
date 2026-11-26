@@ -10443,3 +10443,24 @@ When investigating live production behavior, debugging issues, or analyzing trad
   2. **Orchestrator Process Exception Guards ([`src/orchestrator.ts`](file:///c:/Sites/github/aegis-quant/src/orchestrator.ts#L1089-L1096))**:
      - เพิ่มตัวดัก `unhandledRejection` และ `uncaughtException` เพื่อ log สาเหตุลง `orchLog` แทนการปิดโปรเซสโดยไม่มี log
 - **Version Bump**: **`0.3.1.22`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 367. Shared Core Order Management System (OMS) & Delta Execution (`v0.3.1.23`)
+- **สาเหตุของปัญหา**:
+  - กลยุทธ์ `ma_fan_portfolio` เรียก `exchange.placeOrder()` โดยตรง ไม่มี Write-Ahead Pending Order Ledger และไม่มี Order Reconciler กลางแบบ `dynamic_grid` ทำให้เกิดทั้ง **ซื้อขาดจาก Partial Fill** (เช่น `NVDA $5,168` / `VOO $3,945` แทนที่จะเป็น `$16,667` แล้วปล่อยค้างไม่เติมส่วนต่าง) และ **ซื้อเกิน/เบิ้ล** (เช่น `VOO $64,877` เมื่อไม่หักลบหุ้นจริงบนกระดานก่อนยิงซ้ำ)
+  - นอกจากนี้ได้ตรวจแก้ 5 บักแฝงจาก OMS เดิมของ `dynamic_grid` (double-counted partial fill, fail-open เมื่อ `getOrder()` ล่ม, บันทึก order หลังยิงแทนที่จะก่อนยิง, ลบออเดอร์เมื่อ cancel fail, และไม่เช็กยอดถือครองจริงก่อนยิง) มาสร้างเป็น Core กลางแทน
+- **สิ่งที่แก้ไข (`v0.3.1.23`)**:
+  1. **Standardized Exchange OMS Hooks ([`src/exchange/types.ts`](file:///c:/Sites/github/aegis-quant/src/exchange/types.ts), [`src/exchange/alpaca/client.ts`](file:///c:/Sites/github/aegis-quant/src/exchange/alpaca/client.ts), [`src/exchange/binance/client.ts`](file:///c:/Sites/github/aegis-quant/src/exchange/binance/client.ts))**:
+     - เพิ่ม `getOrderByClientId(symbol, clientOrderId)` (คืน `null` เฉพาะ 404/`-2013` และ throw เมื่อเน็ต/5xx ล่มเพื่อ Fail-Closed) และ `getLiveHolding(symbol)` (`ExchangeLiveHolding`)
+     - แนบ `orderId`/`orderStatus`/`isTerminal` ใน `AlpacaClient.placeOrder` error เพื่อให้ OMS ติดตามออเดอร์ที่หลุด timeout ต่อได้ทันที
+  2. **Shared Core OMS ([`src/core/order-manager.ts`](file:///c:/Sites/github/aegis-quant/src/core/order-manager.ts)) + DB Persistence ([`src/db.ts`](file:///c:/Sites/github/aegis-quant/src/db.ts))**:
+     - **Write-Ahead `portfolioPendingOrders`**: จด `CorePendingOrderRecord` (`clientOrderId`, `targetCapital`, `filledQtyAccounted`, status `SUBMITTING`) ลง `BotDatabase` (`JSON` + `PostgreSQL`) **ก่อน** ยิง `placeOrder()` ทุกครั้ง
+     - **5 Hard Locks แบบ Fail-Closed**: (1) บล็อกถ้ามี `pendingOrders` หรือ `getOpenOrders()` BUY ค้าง, (2) Abort ถ้า `getOpenOrders()`/`getLiveHolding()` ล่ม, (3) `computeDeltaBuyPlan` คำนวณเฉพาะส่วนต่าง `min(targetCapital, hardSlotCap) - max(marketVal, costBasis)` เพื่อกันซื้อเกิน `1.0x` แม้ราคาตก, (4) บันทึก `recentEntryTargets` ข้ามการ adopt, (5) Cooldown 60s เมื่อ error / 15s เมื่อ partial
+     - **5-State Reconciler**: แยกจัดการ `OPEN`, `PARTIALLY_FILLED` (นับเฉพาะ `deltaFill` กัน double-count), `TERMINAL`, `ORDER_DISAPPEARED` (404 + `getOpenOrders` ว่างเกิน grace window 15s), และ `API_ERROR` (Fail-Closed คงล็อกไว้เสมอ); ยกเลิก BUY ค้างเกิน 30s โดยคงสถานะ `CANCELING` จนกว่ากระดานจะยืนยัน terminal จริง
+  3. **Integration ใน `MaFanPortfolioStrategy` ([`src/strategy/ma-fan-portfolio/index.ts`](file:///c:/Sites/github/aegis-quant/src/strategy/ma-fan-portfolio/index.ts))**:
+     - โหลด/บันทึก `portfolioPendingOrders` ผ่าน `reloadState`/`saveState` และรีคอนไซล์ทุก 5s เมื่อมีออเดอร์ค้าง (และทุก 20s ใน `syncOnChainOrders`)
+     - ย้ายทั้ง `executeEntrySlot`, `executeExitSlot` และเพิ่ม `evaluatePartialFillTopUps` (เติมเฉพาะส่วนต่างภายใน 15 นาที, สูงสุด 3 ครั้ง, ราคาไม่เกิน `+0.5%`, ไม่ใช่ `tp1Done`/`beLocked`) ให้วิ่งผ่าน `CoreOrderManager`
+  4. **Unit Tests ([`tests/core-order-manager.test.ts`](file:///c:/Sites/github/aegis-quant/tests/core-order-manager.test.ts))**:
+     - ทดสอบครบ 6 ชุด (Delta sizing + cost cap, Lock 1 open BUY block, Lock 2 fail-closed on API errors, Lock 3 live holding anti-double-buy `VOO`, Write-Ahead + restart recovery + fail-closed reconcile + partial anti-double-count + 404 disappeared + stale cancel, และ Partial fill ➔ Delta top-up)
+- **Version Bump**: **`0.3.1.23`** (`package.json`, `src/version.ts`, `public/index.html`)

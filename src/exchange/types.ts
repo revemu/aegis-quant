@@ -122,6 +122,15 @@ export interface ExchangeTrade {
   isMaker?: boolean;
 }
 
+export interface ExchangeLiveHolding {
+  symbol: string;
+  qty: number;
+  qtyAvailable: number;
+  avgEntryPrice: number;
+  currentPrice?: number;
+  marketValue?: number;
+}
+
 export interface IExchangeClient {
   readonly exchangeName: string;
   readonly isDex: boolean;
@@ -137,6 +146,8 @@ export interface IExchangeClient {
   getAccountBalances(symbol: string): Promise<ExchangeAccountBalances>;
   getOpenOrders(symbol?: string): Promise<ExchangeOpenOrder[]>;
   getOrder(symbol: string, orderId: string | number): Promise<ExchangeOpenOrder | ExchangeOrderResult>;
+  getOrderByClientId?(symbol: string, clientOrderId: string): Promise<ExchangeOpenOrder | ExchangeOrderResult | null>;
+  getLiveHolding?(symbol: string): Promise<ExchangeLiveHolding>;
   getTopOfBook(symbol: string, forceFresh?: boolean): Promise<ExchangeTopOfBook | undefined>;
   placeOrder(params: PlaceOrderParams): Promise<ExchangeOrderResult>;
   cancelOrder(symbol: string, orderId: string | number): Promise<any>;

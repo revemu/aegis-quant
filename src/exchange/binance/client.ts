@@ -486,6 +486,39 @@ export class BinanceClient implements IExchangeClient {
   }
 
   /**
+   * Query a single order by clientOrderId. Returns null ONLY when Binance confirms the order does not exist (-2013).
+   */
+  public async getOrderByClientId(symbol: string, clientOrderId: string): Promise<BinanceOpenOrder | null> {
+    try {
+      return await this.getOrder(symbol, clientOrderId);
+    } catch (err) {
+      const msg = (err as Error).message || "";
+      if (msg.includes("-2013") || /order does not exist/i.test(msg)) {
+        return null;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Fetch live base asset holding for this symbol. Throws on API failure for fail-closed OMS checks.
+   */
+  public async getLiveHolding(symbol: string): Promise<{
+    symbol: string;
+    qty: number;
+    qtyAvailable: number;
+    avgEntryPrice: number;
+  }> {
+    const bal = await this.getAccountBalances(symbol);
+    return {
+      symbol: symbol.toUpperCase().replace(/[\/\-_:]/g, ""),
+      qty: bal.baseTotal || 0,
+      qtyAvailable: bal.baseFree || 0,
+      avgEntryPrice: 0,
+    };
+  }
+
+  /**
    * Fetch recent trade executions for a symbol.
    */
   public async getMyTrades(symbol: string, limit = 50): Promise<BinanceTrade[]> {
