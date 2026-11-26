@@ -9995,6 +9995,95 @@
                     </div>
                   `;
                 })()}
+                ${(() => {
+                  const hasBeta = of.betaAlphaBuckets && Object.keys(of.betaAlphaBuckets).length > 0;
+                  const hasSq = of.atrSqueezeBuckets && Object.keys(of.atrSqueezeBuckets).length > 0;
+                  const hasGap = of.overnightGapBuckets && Object.keys(of.overnightGapBuckets).length > 0;
+                  const hasSec = of.sectorBreadthBuckets && Object.keys(of.sectorBreadthBuckets).length > 0;
+                  const hasBasis = of.perpBasisBuckets && Object.keys(of.perpBasisBuckets).length > 0;
+                  const hasLs = of.longShortBuckets && Object.keys(of.longShortBuckets).length > 0;
+                  const drm = shad?.decayedRegimeMemory;
+                  if (!hasBeta && !hasSq && !hasGap && !hasSec && !hasBasis && !hasLs && !drm) return "";
+                  let drmLine = "";
+                  if (drm && Number(drm.effectiveN || 0) > 0) {
+                    const dCol = drm.drift === "IMPROVING" ? "#4ade80" : drm.drift === "DETERIORATING" ? "#f87171" : "#94a3b8";
+                    const dAvg = Number(drm.decayedAvgPnlPct || 0);
+                    const fAvg = Number(drm.fullAvgPnlPct || 0);
+                    drmLine = `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:5px; font-size:11px; align-items:center;">
+                      <strong>⏳ ${drm.halfLifeDays}D Decayed Memory:</strong>
+                      <span style="padding:2px 6px; border-radius:4px; background:rgba(148,163,184,0.12); color:${dCol}; font-weight:700;">${drm.drift}</span>
+                      <span style="padding:2px 6px; border-radius:4px; background:rgba(148,163,184,0.1); color:#cbd5e1;">Recent: WR ${drm.decayedWinRatePct}% (${dAvg >= 0 ? "+" : ""}${dAvg.toFixed(2)}%, PF ${drm.decayedProfitFactor}) vs Full: WR ${drm.fullWinRatePct}% (${fAvg >= 0 ? "+" : ""}${fAvg.toFixed(2)}%, PF ${drm.fullProfitFactor}) • EffN ${drm.effectiveN}</span>
+                    </div>`;
+                  }
+                  return `
+                    <div class="lr-kpi-card" style="grid-column:1/-1;">
+                      <div class="lr-kpi-label">📐 Quant Alpha, Volatility Squeeze &amp; Microstructure (Observe-Only)</div>
+                      ${hasBeta ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Beta-Alpha 24h:</strong> ${renderChips(of.betaAlphaBuckets)}</div>` : ""}
+                      ${hasSq ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>ATR Squeeze (14/96):</strong> ${renderChips(of.atrSqueezeBuckets)}</div>` : ""}
+                      ${hasGap ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Overnight Gap:</strong> ${renderChips(of.overnightGapBuckets)}</div>` : ""}
+                      ${hasSec ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Sector Breadth:</strong> ${renderChips(of.sectorBreadthBuckets)}</div>` : ""}
+                      ${hasBasis ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Perp Basis:</strong> ${renderChips(of.perpBasisBuckets)}</div>` : ""}
+                      ${hasLs ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;"><strong>Top-Trader L/S:</strong> ${renderChips(of.longShortBuckets)}</div>` : ""}
+                      ${drmLine}
+                    </div>
+                  `;
+                })()}
+                ${(() => {
+                  const icRows = Array.isArray(shad?.factorRankIc) ? shad.factorRankIc : [];
+                  if (icRows.length === 0) return "";
+                  const vCol = { HIGH_SIGNAL: "#4ade80", INVERTED: "#f87171", UNSTABLE: "#fbbf24", NOISE: "#94a3b8", LOW_N: "#64748b" };
+                  const chips = icRows.slice(0, 8).map((r) => {
+                    const c = vCol[r.verdict] || "#94a3b8";
+                    return `<span title="${r.hint}" style="padding:2px 6px; border-radius:4px; background:rgba(148,163,184,0.1); color:${c};"><strong>${r.label}</strong>: Train ${r.trainIc >= 0 ? "+" : ""}${r.trainIc} / OOS ${r.testIc >= 0 ? "+" : ""}${r.testIc} (${r.verdict})</span>`;
+                  }).join(" ");
+                  return `
+                    <div class="lr-kpi-card" style="grid-column:1/-1;">
+                      <div class="lr-kpi-label">📊 Walk-Forward Factor Rank IC (อำนาจทำนาย Train vs OOS)</div>
+                      <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;">${chips}</div>
+                    </div>
+                  `;
+                })()}
+                ${(() => {
+                  const mfe = shad?.mfeGivebackAudit;
+                  if (!mfe || Number(mfe.totalTrades || 0) === 0) return "";
+                  const chips = Array.isArray(mfe.candidates)
+                    ? mfe.candidates.map((c) => {
+                        const isBest = mfe.bestTriggerPct !== null && Number(c.triggerPct) === Number(mfe.bestTriggerPct);
+                        const col = isBest ? "#4ade80" : Number(c.testAvgPnlPct) >= 0 ? "#cbd5e1" : "#fca5a5";
+                        const bg = isBest ? "rgba(74,222,128,0.14)" : "rgba(148,163,184,0.1)";
+                        return `<span style="padding:2px 6px; border-radius:4px; background:${bg}; color:${col};">${c.label}: OOS ${c.testAvgPnlPct >= 0 ? "+" : ""}${c.testAvgPnlPct}% (PF ${c.testProfitFactor}, Saved ${c.testSavedSlCount} SL)</span>`;
+                      }).join(" ")
+                    : "";
+                  return `
+                    <div class="lr-kpi-card" style="grid-column:1/-1;">
+                      <div class="lr-kpi-label">🛡️ MFE Giveback &amp; Auto-BE OOS Audit</div>
+                      <div style="font-size:11px; color:#cbd5e1; margin-top:3px;">SL ${mfe.slTrades} ไม้ • เคยบวก &ge;+0.8%: <strong>${mfe.slGivebackAt08Pct}%</strong> (${mfe.slGivebackAt08Count} ไม้) • &ge;+1.0%: <strong>${mfe.slGivebackAt10Pct}%</strong> • Avg MFE ก่อนโดน SL: +${mfe.avgMfeBeforeSlPct}%</div>
+                      <div style="font-size:11px; color:#94a3b8; margin-top:2px;">${mfe.verdict || ""}</div>
+                      ${chips ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;">${chips}</div>` : ""}
+                    </div>
+                  `;
+                })()}
+                ${(() => {
+                  const cg = shad?.contextGateOos;
+                  const cs = shad?.confidenceSizingAudit;
+                  if (!cg && !cs) return "";
+                  const rules = Array.isArray(cg?.rules) ? cg.rules.slice(0, 6) : [];
+                  const ruleHtml = rules.map((r) => {
+                    const col = r.status === "PROMOTE_READY" ? "#4ade80" : r.status === "OBSERVE" ? "#fbbf24" : "#94a3b8";
+                    return `<span title="${r.reason}" style="padding:2px 6px; border-radius:4px; background:rgba(148,163,184,0.1); color:${col};"><strong>${r.id}</strong> [${r.status}${r.recommendedAction !== "NONE" ? `:${r.recommendedAction}` : ""}] Hard ${r.hardGate.testDeltaPct >= 0 ? "+" : ""}${r.hardGate.testDeltaPct}pp / Half ${r.halfSize.testDeltaPct >= 0 ? "+" : ""}${r.halfSize.testDeltaPct}pp (OOS n=${r.affectedTest})</span>`;
+                  }).join(" ");
+                  const csHtml = cs && Number(cs.testTrades || 0) > 0
+                    ? `<div style="font-size:11px; color:#cbd5e1; margin-top:5px;"><strong>⚖️ Confidence Sizing OOS (${cs.testTrades}t):</strong> Equal PF ${cs.equalWeight.profitFactor} / DD ${cs.equalWeight.maxDrawdownPct}% / Sharpe ${cs.equalWeight.sharpeProxy} ➔ Scaled PF ${cs.confidenceScaled.profitFactor} / DD ${cs.confidenceScaled.maxDrawdownPct}% / Sharpe ${cs.confidenceScaled.sharpeProxy} — <span style="color:#94a3b8;">${cs.verdict}</span></div>`
+                    : "";
+                  return `
+                    <div class="lr-kpi-card" style="grid-column:1/-1;">
+                      <div class="lr-kpi-label">🚦 Context-Gate Promotion &amp; Confidence Sizing OOS</div>
+                      ${cg ? `<div style="font-size:11px; color:#94a3b8; margin-top:2px;">${cg.verdict || ""}</div>` : ""}
+                      ${ruleHtml ? `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; font-size:11px;">${ruleHtml}</div>` : ""}
+                      ${csHtml}
+                    </div>
+                  `;
+                })()}
               `;
             })()}
           `;

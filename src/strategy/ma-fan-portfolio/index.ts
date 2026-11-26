@@ -15,10 +15,14 @@ import { detectRecentShock24h, earningsCalendar, getMacroEventContext } from "..
 import {
   calcCandleAtrPct14,
   calcRollingReturnCorrelation,
+  computeAtrCompressionRatioAt,
+  computeCausalBetaAlphaAt,
   computeDailyMacroRegimeAt,
   computeIntradayVwapDistPctAt,
+  computeOvernightGapPctAt,
   computeTrueTakerBuyPct12At,
   computeUsdStrength5dAt,
+  getEquitySector,
   isGapInducedBar,
   isOpeningSession45mBar,
   LearningEngine,
@@ -898,6 +902,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
         ? {
             fundingBySymbol: binanceDerivativesCache.getFundingMap(),
             oiBySymbol: binanceDerivativesCache.getOiMap(),
+            basisBySymbol: binanceDerivativesCache.getBasisMap(),
+            longShortBySymbol: binanceDerivativesCache.getLongShortMap(),
           }
         : {}),
       force,
@@ -2152,6 +2158,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
               ? {
                   fundingBySymbol: binanceDerivativesCache.getFundingMap(),
                   oiBySymbol: binanceDerivativesCache.getOiMap(),
+                  basisBySymbol: binanceDerivativesCache.getBasisMap(),
+                  longShortBySymbol: binanceDerivativesCache.getLongShortMap(),
                 }
               : {}),
           }
@@ -2229,7 +2237,44 @@ export class MaFanPortfolioStrategy implements IStrategy {
         const liveTakerBuyPct12 = !isAlpaca && chInd ? computeTrueTakerBuyPct12At(chInd.c15, chInd.lastClosedIdx) : null;
         const liveDerivs = !isAlpaca
           ? binanceDerivativesCache.getLatestAt(ch.sym, barTimeSec)
-          : { fundingRateBps: null, oiDelta4hPct: null };
+          : { fundingRateBps: null, oiDelta4hPct: null, perpBasisBps: null, topLongShortRatio: null };
+        const liveAtrComp = chInd ? computeAtrCompressionRatioAt(chInd.c15, chInd.lastClosedIdx) : null;
+        const liveOvernightGapPct = isAlpaca && chInd ? computeOvernightGapPctAt(chInd.c15, chInd.lastClosedIdx) : null;
+        const liveSectorName = isAlpaca ? getEquitySector(ch.sym) : null;
+        let liveSectorBreadthPct: number | null = null;
+        if (liveSectorName) {
+          let secAbove = 0;
+          let secTot = 0;
+          for (const [sSym, sInd] of this.snapshots.entries()) {
+            if (sSym === this.benchmarkSymbol || getEquitySector(sSym) !== liveSectorName) continue;
+            const sIdx = sInd.lastClosedIdx;
+            if (sInd.c15[sIdx] && sInd.m25[sIdx]) {
+              secTot++;
+              if (sInd.c15[sIdx]!.close > sInd.m25[sIdx]!) secAbove++;
+            }
+          }
+          if (secTot >= 2) liveSectorBreadthPct = Number(((secAbove / secTot) * 100).toFixed(1));
+        }
+        let liveBetaAlpha24h: number | null = null;
+        if (chInd && chInd.lastClosedIdx >= 12 && this.benchmark15m.length >= 12) {
+          const benchIdxMap = new Map<number, number>();
+          for (let bi = 0; bi < this.benchmark15m.length; bi++) {
+            benchIdxMap.set(this.benchmark15m[bi]!.time, bi);
+          }
+          const ref24 = chInd.c15[Math.max(0, chInd.lastClosedIdx - 96)];
+          const prevC = chInd.c15[chInd.lastClosedIdx];
+          const coinRet24 = ref24 && prevC && ref24.open > 0 ? ((prevC.close - ref24.open) / ref24.open) * 100 : 0;
+          const ba = computeCausalBetaAlphaAt(
+            chInd.c15,
+            chInd.lastClosedIdx,
+            this.benchmark15m,
+            benchIdxMap,
+            coinRet24,
+            this.macroState.benchmarkRet24h ?? 0,
+            48,
+          );
+          if (ba) liveBetaAlpha24h = ba.betaAlpha24h;
+        }
         await this.executeEntrySlot(
           ch.sym,
           ch.price,
@@ -2258,6 +2303,13 @@ export class MaFanPortfolioStrategy implements IStrategy {
             takerBuyPct12: liveTakerBuyPct12,
             fundingRateBps: liveDerivs.fundingRateBps,
             oiDelta4hPct: liveDerivs.oiDelta4hPct,
+            betaAlpha24h: liveBetaAlpha24h,
+            atrCompressionRatio: liveAtrComp,
+            overnightGapPct: liveOvernightGapPct,
+            sectorName: liveSectorName,
+            sectorBreadthPct: liveSectorBreadthPct,
+            perpBasisBps: liveDerivs.perpBasisBps,
+            topLongShortRatio: liveDerivs.topLongShortRatio,
           },
         );
       }
@@ -2361,6 +2413,13 @@ export class MaFanPortfolioStrategy implements IStrategy {
       takerBuyPct12?: number | null;
       fundingRateBps?: number | null;
       oiDelta4hPct?: number | null;
+      betaAlpha24h?: number | null;
+      atrCompressionRatio?: number | null;
+      overnightGapPct?: number | null;
+      sectorName?: string | null;
+      sectorBreadthPct?: number | null;
+      perpBasisBps?: number | null;
+      topLongShortRatio?: number | null;
     },
   ): Promise<void> {
     const usedIdx = new Set(this.slots.map((s) => s.slotIndex));

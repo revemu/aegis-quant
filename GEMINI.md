@@ -10389,3 +10389,28 @@ When investigating live production behavior, debugging issues, or analyzing trad
   4. **Throttle `[Quant Q1 Corr Guard]` Log (`src/strategy/ma-fan-portfolio/index.ts`)**:
      - เก็บ `corrGuardLogBar` (`symbol:corrSym -> lastClosedTime`) เพื่อ log ได้ไม่เกิน 1 ครั้งต่อแท่ง 15m ต่อคู่ (เคลียร์ใน `updateExchangeClient` และ `resetBotState`)
 - **Version Bump**: **`0.3.1.19`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 364. Complete Tier 1-3 Zero-Lookahead Quantitative Learning Suite (`v0.3.1.20`)
+- **เป้าหมาย**: ยกระดับ Learning Engine จากการเก็บสถิติ Observe-Only ไปสู่การพิสูจน์ผลแบบ **Walk-Forward Out-of-Sample (Train 70% / OOS Test 30%)** ทั้งในระดับฟีเจอร์, จุดล็อกกำไร Auto-BE, การเลื่อนขั้น Context Gate และ Dynamic Confidence Sizing พร้อมเพิ่มสัญญาณ Quant ใหม่ทั้งตลาดหุ้น US และ Crypto แบบ Zero-Lookahead 100%
+- **โมดูลและฟังก์ชันที่พัฒนาเพิ่ม**:
+  1. **[`src/quant-learning-analytics.ts`](file:///c:/Sites/github/aegis-quant/src/quant-learning-analytics.ts)** (Pure Zero-Lookahead Analytics Module):
+     - **Tier 1 (Decision & Attribution Engines)**:
+       - `computeFactorRankIc`: คำนวณ **Spearman Rank IC** ของทุกฟีเจอร์เทียบกับ `netPnlPct` ทั้ง Full, Train 70%, และ OOS Test 30% จัดกลุ่มเป็น `HIGH_SIGNAL`, `INVERTED`, `UNSTABLE`, `NOISE`, `LOW_N`
+       - `evaluateMfeGivebackAndAutoBe`: วัดอัตราไม้ที่เคยบวกถึง `+0.8%` / `+1.0%` ก่อนไหลกลับไปโดน SL พร้อมจำลอง `simulateAutoBeVariant` แบบ causal (ตรวจ `lowPct <= activeStopPct` ก่อน promote BE) เพื่อทดสอบ OOS จุด Auto-BE (`0.6%`, `0.8%`, `1.0%`, `1.2%`, `1.5%`)
+       - `evaluateContextGatesOos`: ทดสอบ 12 Context Rules (`USD_SURGE`, `US_OVERLAP_14_21`, `US_OPEN_1H`, `ISOLATED_CONCURRENCY`, `OI_FLUSH`, `SELLER_DOM`, `BELOW_VWAP`, `MACRO_EVENT_DAY`, `NEGATIVE_ALPHA`, `VOL_EXHAUSTION`, `CROWDED_BASIS`, `OVERNIGHT_GAP_UP`) ทั้งแบบ Hard Gate (`0x`) และ Half-Size (`0.5x`) พร้อมสถานะ `PROMOTE_READY` / `OBSERVE` / `REJECT`
+       - `evaluateConfidenceSizingOos`: เรียนรู้ tag `0.5x` และ `1.25x` **จาก Train 70% เท่านั้น** แล้วประเมินเทียบ Equal-Weight บน OOS Test 30% (PF, MaxDD, Sharpe proxy, Calmar proxy)
+     - **Tier 2 & Tier 3 (Causal Quant & Market Microstructure Features)**:
+       - `computeCausalBetaAlphaAt`: คำนวณ Rolling Beta 48 แท่งแบบ causal แล้วถอด Beta ออกจาก RS 24h (`coinRet24h - beta * benchRet24h`)
+       - `computeAtrCompressionRatioAt`: คำนวณ `ATR(14)% / ATR(96)%` จับภาวะบีบอัด (`SQUEEZE < 0.75x`) vs เหวี่ยงเกิน (`EXPANDING > 1.25x`)
+       - `computeOvernightGapPctAt` & `getEquitySector` / `sectorBreadthPct` (สำหรับตลาดหุ้น US Alpaca)
+       - `lookupCausalPerpBasisBpsAt` & `lookupCausalLongShortRatioAt` (สำหรับ Crypto Binance)
+       - `computeDecayedRegimeMemory`: คำนวณ WR/Avg/PF ถ่วงน้ำหนักแบบ Exponential Decay (Half-Life 14 วัน) และตรวจทิศทาง Drift (`IMPROVING` / `STABLE` / `DETERIORATING`)
+  2. **[`src/strategy/ma-fan-portfolio/universe.ts`](file:///c:/Sites/github/aegis-quant/src/strategy/ma-fan-portfolio/universe.ts) (`BinanceDerivativesCache`)**:
+     - ดึง Binance Futures `premiumIndexKlines` (1h) และ `topLongShortAccountRatio` (1h) เพิ่มเติมแบบ best-effort พร้อม `perpSymbolAlias` (`1000PEPEUSDT`) และเมธอด `getBasisMap()` / `getLongShortMap()`
+  3. **[`src/learning-engine.ts`](file:///c:/Sites/github/aegis-quant/src/learning-engine.ts) & [`src/strategy/ma-fan-portfolio/index.ts`](file:///c:/Sites/github/aegis-quant/src/strategy/ma-fan-portfolio/index.ts)**:
+     - ผสานฟีเจอร์ใหม่ทั้งใน `runShadowWalkForward`, `computeObserveFactorsFromSetups`, `simulateMaFanCounterfactual` (`hitSl`), และ `onPortfolioEntry` (`observeContext` สำหรับเทรดจริง)
+  4. **Dashboard UI ([`public/app.js`](file:///c:/Sites/github/aegis-quant/public/app.js#L9999-L10085))**:
+     - เพิ่มการ์ดแสดงผล 4 ชุดใน Learning Report Modal: Quant Alpha & Microstructure + 14D Decayed Memory, Walk-Forward Factor Rank IC, MFE Giveback & Auto-BE OOS Audit, และ Context-Gate Promotion & Confidence Sizing OOS
+- **Version Bump**: **`0.3.1.20`** (`package.json`, `src/version.ts`, `public/index.html`)

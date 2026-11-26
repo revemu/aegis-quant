@@ -6,6 +6,12 @@ import { fetchAlpacaBars, fetchAlpacaMultiBars, fetchAlpacaMultiSnapshots, inter
 import { getActiveBinanceTradingSymbols } from "../../exchange/binance/client.js";
 import { STABLE_TOKENS } from "../../backtest-service.js";
 import { lookupCausalFundingBpsAt, lookupCausalOiDelta4hPctAt } from "../../learning-engine.js";
+import {
+  lookupCausalLongShortRatioAt,
+  lookupCausalPerpBasisBpsAt,
+  type LongShortRatioPoint,
+  type PerpBasisPoint,
+} from "../../quant-learning-analytics.js";
 import { isSyntheticOrStock } from "../../pair-rotator.js";
 import { filterChangedCandles, mergeCandles, type PgStore } from "../../pg-store.js";
 import type { SymbolIndicatorSnapshot } from "./types.js";
@@ -536,6 +542,8 @@ export interface OpenInterestPoint {
 export class BinanceDerivativesCache {
   private fundingMap = new Map<string, FundingRatePoint[]>();
   private oiMap = new Map<string, OpenInterestPoint[]>();
+  private basisMap = new Map<string, PerpBasisPoint[]>();
+  private lsRatioMap = new Map<string, LongShortRatioPoint[]>();
   private perpSymbolAlias = new Map<string, string>();
   private lastFetchMs = new Map<string, number>();
   private refreshInFlight: Promise<void> | null = null;
@@ -550,27 +558,55 @@ export class BinanceDerivativesCache {
     return this.oiMap;
   }
 
+  public getBasisMap(): Map<string, PerpBasisPoint[]> {
+    return this.basisMap;
+  }
+
+  public getLongShortMap(): Map<string, LongShortRatioPoint[]> {
+    return this.lsRatioMap;
+  }
+
   public getLatestAt(
     symbol: string,
     barTimeSec: number,
-  ): { fundingRateBps: number | null; oiDelta4hPct: number | null } {
+  ): {
+    fundingRateBps: number | null;
+    oiDelta4hPct: number | null;
+    perpBasisBps: number | null;
+    topLongShortRatio: number | null;
+  } {
     const sym = symbol.toUpperCase().trim();
     return {
       fundingRateBps: lookupCausalFundingBpsAt(this.fundingMap.get(sym), barTimeSec),
       oiDelta4hPct: lookupCausalOiDelta4hPctAt(this.oiMap.get(sym), barTimeSec),
+      perpBasisBps: lookupCausalPerpBasisBpsAt(this.basisMap.get(sym), barTimeSec),
+      topLongShortRatio: lookupCausalLongShortRatioAt(this.lsRatioMap.get(sym), barTimeSec),
     };
   }
 
   private async fetchPairForPerpSymbol(
     perpSym: string,
     lim: number,
-  ): Promise<{ funding: FundingRatePoint[]; oi: OpenInterestPoint[] }> {
-    const [fRes, oRes] = await Promise.all([
+  ): Promise<{
+    funding: FundingRatePoint[];
+    oi: OpenInterestPoint[];
+    basis: PerpBasisPoint[];
+    lsRatio: LongShortRatioPoint[];
+  }> {
+    const [fRes, oRes, bRes, lsRes] = await Promise.all([
       fetch(`https://fapi.binance.com/fapi/v1/fundingRate?symbol=${encodeURIComponent(perpSym)}&limit=${lim}`, {
         signal: AbortSignal.timeout(6000),
       }).catch(() => null),
       fetch(
         `https://fapi.binance.com/futures/data/openInterestHist?symbol=${encodeURIComponent(perpSym)}&period=1h&limit=${lim}`,
+        { signal: AbortSignal.timeout(6000) },
+      ).catch(() => null),
+      fetch(
+        `https://fapi.binance.com/fapi/v1/premiumIndexKlines?symbol=${encodeURIComponent(perpSym)}&interval=1h&limit=${lim}`,
+        { signal: AbortSignal.timeout(6000) },
+      ).catch(() => null),
+      fetch(
+        `https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol=${encodeURIComponent(perpSym)}&period=1h&limit=${lim}`,
         { signal: AbortSignal.timeout(6000) },
       ).catch(() => null),
     ]);
@@ -612,7 +648,38 @@ export class BinanceDerivativesCache {
       }
     }
 
-    return { funding, oi };
+    let basis: PerpBasisPoint[] = [];
+    if (bRes && bRes.ok) {
+      const bRaw = (await bRes.json()) as Array<Array<number | string>>;
+      if (Array.isArray(bRaw)) {
+        basis = bRaw
+          .map((k) => ({
+            timeMs: Number(k[0]),
+            basisBps: Number(k[4]) * 10000,
+          }))
+          .filter((p) => Number.isFinite(p.timeMs) && p.timeMs > 0 && Number.isFinite(p.basisBps))
+          .sort((a, b) => a.timeMs - b.timeMs);
+      }
+    }
+
+    let lsRatio: LongShortRatioPoint[] = [];
+    if (lsRes && lsRes.ok) {
+      const lsRaw = (await lsRes.json()) as Array<{
+        timestamp?: number | string;
+        longShortRatio?: number | string;
+      }>;
+      if (Array.isArray(lsRaw)) {
+        lsRatio = lsRaw
+          .map((r) => ({
+            timeMs: Number(r.timestamp),
+            longShortRatio: Number(r.longShortRatio),
+          }))
+          .filter((p) => Number.isFinite(p.timeMs) && p.timeMs > 0 && Number.isFinite(p.longShortRatio) && p.longShortRatio > 0)
+          .sort((a, b) => a.timeMs - b.timeMs);
+      }
+    }
+
+    return { funding, oi, basis, lsRatio };
   }
 
   public async refreshSymbols(
@@ -643,12 +710,13 @@ export class BinanceDerivativesCache {
                 if (
                   res.funding.length === 0 &&
                   res.oi.length === 0 &&
+                  res.basis.length === 0 &&
                   !initialPerp.startsWith("1000") &&
                   !this.perpSymbolAlias.has(sym)
                 ) {
                   const altSym = `1000${sym}`;
                   const altRes = await this.fetchPairForPerpSymbol(altSym, lim);
-                  if (altRes.funding.length > 0 || altRes.oi.length > 0) {
+                  if (altRes.funding.length > 0 || altRes.oi.length > 0 || altRes.basis.length > 0) {
                     this.perpSymbolAlias.set(sym, altSym);
                     res = altRes;
                   }
@@ -656,6 +724,8 @@ export class BinanceDerivativesCache {
 
                 if (res.funding.length > 0) this.fundingMap.set(sym, res.funding);
                 if (res.oi.length > 0) this.oiMap.set(sym, res.oi);
+                if (res.basis.length > 0) this.basisMap.set(sym, res.basis);
+                if (res.lsRatio.length > 0) this.lsRatioMap.set(sym, res.lsRatio);
               } catch {
                 // Best-effort observe-only enrichment; non-perp spot pairs cleanly skip
               }
@@ -667,6 +737,8 @@ export class BinanceDerivativesCache {
           this.hasLoggedInitial = true;
           const fundedCount = clean.filter((s) => (this.fundingMap.get(s)?.length ?? 0) > 0).length;
           const oiCount = clean.filter((s) => (this.oiMap.get(s)?.length ?? 0) > 0).length;
+          const basisCount = clean.filter((s) => (this.basisMap.get(s)?.length ?? 0) > 0).length;
+          const lsCount = clean.filter((s) => (this.lsRatioMap.get(s)?.length ?? 0) > 0).length;
           const aliases = clean
             .map((s) => {
               const alias = this.perpSymbolAlias.get(s);
@@ -674,7 +746,7 @@ export class BinanceDerivativesCache {
             })
             .filter((x): x is string => Boolean(x));
           opts.log(
-            `📥 [Binance Derivatives] Loaded Funding (${fundedCount}/${clean.length}) & OI ${lim}h (${oiCount}/${clean.length})${aliases.length > 0 ? ` | aliases: ${aliases.join(", ")}` : ""}`,
+            `📥 [Binance Derivatives] Loaded Funding (${fundedCount}/${clean.length}), OI ${lim}h (${oiCount}/${clean.length}), Basis (${basisCount}/${clean.length}) & L/S (${lsCount}/${clean.length})${aliases.length > 0 ? ` | aliases: ${aliases.join(", ")}` : ""}`,
           );
         }
       } finally {

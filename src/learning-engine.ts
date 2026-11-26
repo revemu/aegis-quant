@@ -31,6 +31,43 @@ import {
   type PullbackModeName,
 } from "./strategy/ma-fan-portfolio/signals.js";
 import type { PortfolioMacroState, PortfolioRadarCandidate } from "./strategy/ma-fan-portfolio/types.js";
+import {
+  AUTO_BE_TRIGGER_CANDIDATES,
+  classifyAtrSqueezeZone,
+  classifyBetaAlphaZone,
+  classifyLongShortZone,
+  classifyOvernightGapZone,
+  classifyPerpBasisZone,
+  classifySectorBreadthZone,
+  computeAtrCompressionRatioAt,
+  computeCausalBetaAlphaAt,
+  computeDecayedRegimeMemory,
+  computeFactorRankIc,
+  computeOvernightGapPctAt,
+  evaluateConfidenceSizingOos,
+  evaluateContextGatesOos,
+  evaluateMfeGivebackAndAutoBe,
+  getEquitySector,
+  lookupCausalLongShortRatioAt,
+  lookupCausalPerpBasisBpsAt,
+  simulateAutoBeVariant,
+  type AdvancedQuantSetupRecord,
+  type ConfidenceSizingAuditSummary,
+  type ContextGateOosSummary,
+  type DecayedRegimeMemorySummary,
+  type FactorRankIcRow,
+  type LongShortRatioPoint,
+  type MfeGivebackAutoBeSummary,
+  type PerpBasisPoint,
+} from "./quant-learning-analytics.js";
+export {
+  computeAtrCompressionRatioAt,
+  computeCausalBetaAlphaAt,
+  computeOvernightGapPctAt,
+  getEquitySector,
+  type LongShortRatioPoint,
+  type PerpBasisPoint,
+};
 
 const COOLDOWN_MS = 48 * 3_600_000;
 const BLOCKED_EVAL_HORIZON_MS = 4 * 3_600_000;
@@ -84,6 +121,11 @@ export interface ShadowLearningSummary {
   portfolioSim?: ShadowPortfolioReplaySummary | null;
   breadthSitOutAnalysis?: BreadthSitOutAnalysis | null;
   observeFactors?: ShadowObserveFactorsSummary | null;
+  factorRankIc?: FactorRankIcRow[];
+  mfeGivebackAudit?: MfeGivebackAutoBeSummary | null;
+  contextGateOos?: ContextGateOosSummary | null;
+  confidenceSizingAudit?: ConfidenceSizingAuditSummary | null;
+  decayedRegimeMemory?: DecayedRegimeMemorySummary | null;
   tuning?: TuningAnalysis | null;
 }
 
@@ -134,6 +176,12 @@ export interface ShadowObserveFactorsSummary {
   takerBuyBuckets?: Record<string, BucketMetric>;
   fundingBuckets?: Record<string, BucketMetric>;
   oiDeltaBuckets?: Record<string, BucketMetric>;
+  betaAlphaBuckets?: Record<string, BucketMetric>;
+  atrSqueezeBuckets?: Record<string, BucketMetric>;
+  overnightGapBuckets?: Record<string, BucketMetric>;
+  sectorBreadthBuckets?: Record<string, BucketMetric>;
+  perpBasisBuckets?: Record<string, BucketMetric>;
+  longShortBuckets?: Record<string, BucketMetric>;
   latestMacroRegime?: LatestMacroRegimeSnapshot | null;
 }
 
@@ -228,6 +276,8 @@ export interface ShadowWalkForwardContext {
   usdProxyFallback1d?: Candle[];
   fundingBySymbol?: Map<string, Array<{ timeMs: number; fundingRateBps: number }>>;
   oiBySymbol?: Map<string, Array<{ timeMs: number; openInterestValueUsd: number }>>;
+  basisBySymbol?: Map<string, PerpBasisPoint[]>;
+  longShortBySymbol?: Map<string, LongShortRatioPoint[]>;
   force?: boolean;
 }
 
@@ -587,6 +637,7 @@ export function simulateMaFanCounterfactual(
   finalRet: number;
   maePct: number;
   mfePct: number;
+  hitSl: boolean;
   exitBarsHeld: number;
   checkpointRetPct: Record<number, number | null>;
   verdict: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL";
@@ -608,6 +659,7 @@ export function simulateMaFanCounterfactual(
   let tp1Hit = false;
   let peakPctSinceTp1 = 0;
   let finalRet: number | null = null;
+  let hitSl = false;
   let exitBarsHeld = futureBars.length;
   let staleTriggeredAtBar = 0;
 
@@ -623,6 +675,7 @@ export function simulateMaFanCounterfactual(
     if (!tp1Hit) {
       if (lowPct <= slTriggerPct) {
         finalRet = slTriggerPct;
+        hitSl = true;
         exitBarsHeld = barsHeld;
         break;
       }
@@ -678,7 +731,7 @@ export function simulateMaFanCounterfactual(
   const mfePct = ((maxHigh - entryPrice) / entryPrice) * 100;
   const verdict: "WOULD_WIN" | "WOULD_LOSE" | "NEUTRAL" =
     netRet >= 0.35 ? "WOULD_WIN" : netRet <= -0.35 ? "WOULD_LOSE" : "NEUTRAL";
-  return { finalRet: netRet, maePct, mfePct, exitBarsHeld, checkpointRetPct, verdict };
+  return { finalRet: netRet, maePct, mfePct, hitSl, exitBarsHeld, checkpointRetPct, verdict };
 }
 
 export function classifyMayerZone(mayerMultiple: number | null): string | null {
@@ -989,6 +1042,12 @@ export interface ObserveSetupInput {
   takerBuyPct12?: number | null;
   fundingRateBps?: number | null;
   oiDelta4hPct?: number | null;
+  betaAlpha24h?: number | null;
+  atrCompressionRatio?: number | null;
+  overnightGapPct?: number | null;
+  sectorBreadthPct?: number | null;
+  perpBasisBps?: number | null;
+  topLongShortRatio?: number | null;
   checkpointRetPct?: Record<number, number | null>;
 }
 
@@ -1037,6 +1096,12 @@ export function computeObserveFactorsFromSetups(setups: ObserveSetupInput[]): Sh
   const takerMap = tally();
   const fundingMap = tally();
   const oiMap = tally();
+  const betaAlphaMap = tally();
+  const atrSqueezeMap = tally();
+  const overnightGapMap = tally();
+  const sectorBreadthMap = tally();
+  const perpBasisMap = tally();
+  const longShortMap = tally();
 
   for (const s of setups) {
     const scoreKey = s.score < 30 ? "<30" : s.score < 50 ? "30-50" : s.score < 70 ? "50-70" : ">=70";
@@ -1096,6 +1161,24 @@ export function computeObserveFactorsFromSetups(setups: ObserveSetupInput[]): Sh
 
     const oiZone = classifyOiDeltaZone(s.oiDelta4hPct ?? null);
     if (oiZone) bump(oiMap, oiZone, s.pnlPct);
+
+    const betaAlphaZone = classifyBetaAlphaZone(s.betaAlpha24h ?? null);
+    if (betaAlphaZone) bump(betaAlphaMap, betaAlphaZone, s.pnlPct);
+
+    const atrSqueezeZone = classifyAtrSqueezeZone(s.atrCompressionRatio ?? null);
+    if (atrSqueezeZone) bump(atrSqueezeMap, atrSqueezeZone, s.pnlPct);
+
+    const overnightGapZone = classifyOvernightGapZone(s.overnightGapPct ?? null);
+    if (overnightGapZone) bump(overnightGapMap, overnightGapZone, s.pnlPct);
+
+    const sectorBreadthZone = classifySectorBreadthZone(s.sectorBreadthPct ?? null);
+    if (sectorBreadthZone) bump(sectorBreadthMap, sectorBreadthZone, s.pnlPct);
+
+    const perpBasisZone = classifyPerpBasisZone(s.perpBasisBps ?? null);
+    if (perpBasisZone) bump(perpBasisMap, perpBasisZone, s.pnlPct);
+
+    const longShortZone = classifyLongShortZone(s.topLongShortRatio ?? null);
+    if (longShortZone) bump(longShortMap, longShortZone, s.pnlPct);
   }
 
   const cpDefs = [
@@ -1153,6 +1236,12 @@ export function computeObserveFactorsFromSetups(setups: ObserveSetupInput[]): Sh
     takerBuyBuckets: toRec(takerMap, ["SELLER_DOM (<48.5%)", "BALANCED (48.5-51.5%)", "BUYER_DOM (>=51.5%)"]),
     fundingBuckets: toRec(fundingMap, ["NEG_FUNDING (<0 bps)", "NEUTRAL_FUND (0-1 bps)", "CROWDED_LONG (>+1 bps)"]),
     oiDeltaBuckets: toRec(oiMap, ["OI_FLUSH (<-1%)", "OI_FLAT (-1..+1%)", "OI_BUILD (>+1%)"]),
+    betaAlphaBuckets: toRec(betaAlphaMap, ["NEG_ALPHA (<0%)", "NEUTRAL_ALPHA (0..+2%)", "STRONG_ALPHA (>=+2%)"]),
+    atrSqueezeBuckets: toRec(atrSqueezeMap, ["SQUEEZE (<0.75x)", "NORMAL (0.75-1.25x)", "EXPANDING (>1.25x)"]),
+    overnightGapBuckets: toRec(overnightGapMap, ["GAP_DOWN (<-0.5%)", "FLAT_OPEN (-0.5..+0.5%)", "GAP_UP (>+0.5%)"]),
+    sectorBreadthBuckets: toRec(sectorBreadthMap, ["WEAK_SECTOR (<35%)", "MID_SECTOR (35-65%)", "LEADING_SECTOR (>=65%)"]),
+    perpBasisBuckets: toRec(perpBasisMap, ["DISCOUNT (<-5 bps)", "NEUTRAL (-5..+5 bps)", "PREMIUM (>+5 bps)"]),
+    longShortBuckets: toRec(longShortMap, ["SHORT_CROWDED (<0.9)", "BALANCED (0.9-1.5)", "LONG_CROWDED (>1.5)"]),
   };
 }
 
@@ -2030,6 +2119,13 @@ export class LearningEngine {
       takerBuyPct12?: number | null;
       fundingRateBps?: number | null;
       oiDelta4hPct?: number | null;
+      betaAlpha24h?: number | null;
+      atrCompressionRatio?: number | null;
+      overnightGapPct?: number | null;
+      sectorName?: string | null;
+      sectorBreadthPct?: number | null;
+      perpBasisBps?: number | null;
+      topLongShortRatio?: number | null;
     };
   }): Promise<string> {
     const sym = params.symbol.toUpperCase();
@@ -2112,6 +2208,25 @@ export class LearningEngine {
                 : {}),
               ...(typeof oc.oiDelta4hPct === "number" && Number.isFinite(oc.oiDelta4hPct)
                 ? { oiDelta4hPct: Number(oc.oiDelta4hPct.toFixed(3)) }
+                : {}),
+              ...(typeof oc.betaAlpha24h === "number" && Number.isFinite(oc.betaAlpha24h)
+                ? { betaAlpha24h: Number(oc.betaAlpha24h.toFixed(3)) }
+                : {}),
+              ...(typeof oc.atrCompressionRatio === "number" && Number.isFinite(oc.atrCompressionRatio)
+                ? { atrCompressionRatio: Number(oc.atrCompressionRatio.toFixed(3)) }
+                : {}),
+              ...(typeof oc.overnightGapPct === "number" && Number.isFinite(oc.overnightGapPct)
+                ? { overnightGapPct: Number(oc.overnightGapPct.toFixed(3)) }
+                : {}),
+              ...(oc.sectorName ? { sectorName: oc.sectorName } : {}),
+              ...(typeof oc.sectorBreadthPct === "number" && Number.isFinite(oc.sectorBreadthPct)
+                ? { sectorBreadthPct: Number(oc.sectorBreadthPct.toFixed(1)) }
+                : {}),
+              ...(typeof oc.perpBasisBps === "number" && Number.isFinite(oc.perpBasisBps)
+                ? { perpBasisBps: Number(oc.perpBasisBps.toFixed(2)) }
+                : {}),
+              ...(typeof oc.topLongShortRatio === "number" && Number.isFinite(oc.topLongShortRatio)
+                ? { topLongShortRatio: Number(oc.topLongShortRatio.toFixed(3)) }
                 : {}),
             }
           : {}),
@@ -2674,19 +2789,23 @@ export class LearningEngine {
       // Build benchmark regime series & time-indexed universe breadth
       const bench15 = getBars(benchSym, "15m");
       const benchStateByTime = new Map<number, { ret24h: number; ret4h: number; isBear: boolean }>();
+      const benchIdxByTime = new Map<number, number>();
       if (bench15.length >= 200) {
         const benchCloses = bench15.map((c) => c.close);
         const benchM200 = calcEMA(benchCloses, 200);
-        for (let i = 200; i < bench15.length; i++) {
-          const ref24 = bench15[Math.max(0, i - 96)]!.open;
-          const ref4 = bench15[Math.max(0, i - 16)]!.open;
-          const ret24h = ref24 > 0 ? ((bench15[i]!.close - ref24) / ref24) * 100 : 0;
-          const ret4h = ref4 > 0 ? ((bench15[i]!.close - ref4) / ref4) * 100 : 0;
-          benchStateByTime.set(bench15[i]!.time, {
-            ret24h,
-            ret4h,
-            isBear: bench15[i]!.close < benchM200[i]!,
-          });
+        for (let i = 0; i < bench15.length; i++) {
+          benchIdxByTime.set(bench15[i]!.time, i);
+          if (i >= 200) {
+            const ref24 = bench15[Math.max(0, i - 96)]!.open;
+            const ref4 = bench15[Math.max(0, i - 16)]!.open;
+            const ret24h = ref24 > 0 ? ((bench15[i]!.close - ref24) / ref24) * 100 : 0;
+            const ret4h = ref4 > 0 ? ((bench15[i]!.close - ref4) / ref4) * 100 : 0;
+            benchStateByTime.set(bench15[i]!.time, {
+              ret24h,
+              ret4h,
+              isBear: bench15[i]!.close < benchM200[i]!,
+            });
+          }
         }
       }
 
@@ -2707,6 +2826,7 @@ export class LearningEngine {
 
       const precalc: PrecalcCoin[] = [];
       const breadthByTime = new Map<number, { above25: number; total: number }>();
+      const sectorBreadthByTime = new Map<string, Map<number, { above25: number; total: number }>>();
       let barSum = 0;
 
       for (const sym of cleanSymbols) {
@@ -2725,12 +2845,26 @@ export class LearningEngine {
         const rsi1h = c1h.length >= 20 ? calcRSI(c1h, 14) : [];
 
         if (sym !== benchSym) {
+          const sectorName = isAlpaca ? getEquitySector(sym) : null;
+          let secMap = sectorName ? sectorBreadthByTime.get(sectorName) : undefined;
+          if (sectorName && !secMap) {
+            secMap = new Map<number, { above25: number; total: number }>();
+            sectorBreadthByTime.set(sectorName, secMap);
+          }
           for (let i = 200; i < c15.length; i++) {
             const t = c15[i]!.time;
+            const above = c15[i]!.close > m25[i]!;
             const cur = breadthByTime.get(t) || { above25: 0, total: 0 };
             cur.total++;
-            if (c15[i]!.close > m25[i]!) cur.above25++;
+            if (above) cur.above25++;
             breadthByTime.set(t, cur);
+
+            if (secMap) {
+              const sCur = secMap.get(t) || { above25: 0, total: 0 };
+              sCur.total++;
+              if (above) sCur.above25++;
+              secMap.set(t, sCur);
+            }
           }
         }
 
@@ -2774,6 +2908,7 @@ export class LearningEngine {
       const sessionAcc = new Map<string, { setups: number; wins: number; sumPnl: number }>();
       const primaryReplaySetups: ShadowReplaySetupInput[] = [];
       const observeSetupRecords: ObserveSetupInput[] = [];
+      const advancedQuantRecords: AdvancedQuantSetupRecord[] = [];
       const openSessionAcc = { setups: 0, wins: 0, sumPnl: 0 };
 
       let totalSetups = 0;
@@ -3057,6 +3192,54 @@ export class LearningEngine {
                 const dUsdRet = pUsd >= 0 ? usd1dRets[pUsd] : null;
                 const symFundingSeries = !isAlpaca ? opts.fundingBySymbol?.get(coin.symbol) : undefined;
                 const symOiSeries = !isAlpaca ? opts.oiBySymbol?.get(coin.symbol) : undefined;
+                const symBasisSeries = !isAlpaca ? opts.basisBySymbol?.get(coin.symbol) : undefined;
+                const symLsSeries = !isAlpaca ? opts.longShortBySymbol?.get(coin.symbol) : undefined;
+
+                const causalVwap = isAlpaca ? computeIntradayVwapDistPctAt(coin.c15, prev) : null;
+                const causalTaker = !isAlpaca ? computeTrueTakerBuyPct12At(coin.c15, prev) : null;
+                const causalFunding = !isAlpaca ? lookupCausalFundingBpsAt(symFundingSeries, c.time) : null;
+                const causalOi = !isAlpaca ? lookupCausalOiDelta4hPctAt(symOiSeries, c.time) : null;
+                const causalBasis = !isAlpaca ? lookupCausalPerpBasisBpsAt(symBasisSeries, c.time) : null;
+                const causalLs = !isAlpaca ? lookupCausalLongShortRatioAt(symLsSeries, c.time) : null;
+                const betaAlphaRes = computeCausalBetaAlphaAt(
+                  coin.c15,
+                  prev,
+                  bench15,
+                  benchIdxByTime,
+                  coinRet24,
+                  benchInfo?.ret24h ?? 0,
+                  48,
+                );
+                const causalBetaAlpha = betaAlphaRes ? betaAlphaRes.betaAlpha24h : null;
+                const causalAtrSqueeze = computeAtrCompressionRatioAt(coin.c15, prev);
+                const causalGapPct = isAlpaca ? computeOvernightGapPctAt(coin.c15, prev) : null;
+                const sectorName = isAlpaca ? getEquitySector(coin.symbol) : null;
+                const secStats = sectorName ? sectorBreadthByTime.get(sectorName)?.get(prevBar.time) : undefined;
+                const causalSectorBreadth =
+                  secStats && secStats.total >= 2 ? Number(((secStats.above25 / secStats.total) * 100).toFixed(1)) : null;
+
+                const autoBeReturns: Record<string, number> = {};
+                const autoBeHitSl: Record<string, boolean> = {};
+                for (const beTrig of AUTO_BE_TRIGGER_CANDIDATES) {
+                  const beSim = simulateAutoBeVariant(
+                    simEntryPrice,
+                    distTarget,
+                    slTriggerPct,
+                    futureBars,
+                    costPct,
+                    {
+                      tp1FloorPct: shadowTp1FloorPct,
+                      runnerTrailPct: shadowRunnerTrailPct,
+                      staleExitBars: shadowStaleExitBars,
+                      staleExitMaxGainPct: shadowStaleMaxGainPct,
+                    },
+                    beTrig,
+                  );
+                  const beKey = beTrig.toFixed(1);
+                  autoBeReturns[beKey] = beSim.finalRet;
+                  autoBeHitSl[beKey] = beSim.hitSl;
+                }
+
                 observeSetupRecords.push({
                   entryTimeSec: c.time,
                   score: candScore,
@@ -3071,11 +3254,50 @@ export class LearningEngine {
                   mayerMultiple: dMacro?.mayerMultiple ?? null,
                   macroRiskIndex: dMacro?.macroRiskIndex ?? null,
                   usdRet5dPct: dUsdRet ?? null,
-                  vwapDistPct: isAlpaca ? computeIntradayVwapDistPctAt(coin.c15, prev) : null,
-                  takerBuyPct12: !isAlpaca ? computeTrueTakerBuyPct12At(coin.c15, prev) : null,
-                  fundingRateBps: !isAlpaca ? lookupCausalFundingBpsAt(symFundingSeries, c.time) : null,
-                  oiDelta4hPct: !isAlpaca ? lookupCausalOiDelta4hPctAt(symOiSeries, c.time) : null,
+                  vwapDistPct: causalVwap,
+                  takerBuyPct12: causalTaker,
+                  fundingRateBps: causalFunding,
+                  oiDelta4hPct: causalOi,
+                  betaAlpha24h: causalBetaAlpha,
+                  atrCompressionRatio: causalAtrSqueeze,
+                  overnightGapPct: causalGapPct,
+                  sectorBreadthPct: causalSectorBreadth,
+                  perpBasisBps: causalBasis,
+                  topLongShortRatio: causalLs,
                   checkpointRetPct: sim.checkpointRetPct,
+                });
+
+                advancedQuantRecords.push({
+                  entryTimeSec: c.time,
+                  symbol: coin.symbol,
+                  pnlPct: sim.finalRet,
+                  score: candScore,
+                  buyVolRatio12: volR,
+                  rawRs24h: rs24,
+                  betaAlpha24h: causalBetaAlpha,
+                  rsi1h: rsi1hVal,
+                  atrCompressionRatio: causalAtrSqueeze,
+                  distFromBottomLowPct,
+                  upperWickRatioPct,
+                  breadthDelta4h,
+                  concurrentSignals: 1,
+                  usdRet5dPct: dUsdRet ?? null,
+                  sessionBucket: sessKey,
+                  vwapDistPct: causalVwap,
+                  overnightGapPct: causalGapPct,
+                  sectorName,
+                  sectorBreadthPct: causalSectorBreadth,
+                  takerBuyPct12: causalTaker,
+                  oiDelta4hPct: causalOi,
+                  fundingRateBps: causalFunding,
+                  perpBasisBps: causalBasis,
+                  topLongShortRatio: causalLs,
+                  macroEventDay: macroEv.isEventDay,
+                  macroEventInWindow: macroEv.inWindow,
+                  hitSl: sim.hitSl,
+                  mfePct: sim.mfePct,
+                  autoBeReturns,
+                  autoBeHitSl,
                 });
 
                 if (isOpeningSession45mBar(coin.c15, idx, ex, false)) {
@@ -3207,11 +3429,23 @@ export class LearningEngine {
       const featureBucketEv = toBucketStatsRecord(featureBucketAcc);
       const regimeFeatureBucketEv = toBucketStatsRecord(regimeBucketAcc);
       const sessionStats = toBucketStatsRecord(sessionAcc);
-      const portfolioSim = simulatePortfolioShadowReplay(
-        primaryReplaySetups,
-        Math.max(1, Math.min(5, Number(opts.maxSlots) || 3)),
-      );
+      const shadowMaxSlots = Math.max(1, Math.min(5, Number(opts.maxSlots) || 3));
+      const portfolioSim = simulatePortfolioShadowReplay(primaryReplaySetups, shadowMaxSlots);
       const breadthSitOutAnalysis = evaluateBreadthSitOutOos(primaryReplaySetups, opts.sitOutMode || "dual");
+
+      const concurCountByTime = new Map<number, number>();
+      for (const r of advancedQuantRecords) {
+        concurCountByTime.set(r.entryTimeSec, (concurCountByTime.get(r.entryTimeSec) || 0) + 1);
+      }
+      for (const r of advancedQuantRecords) {
+        r.concurrentSignals = concurCountByTime.get(r.entryTimeSec) || 1;
+      }
+
+      const factorRankIc = computeFactorRankIc(advancedQuantRecords, ex);
+      const mfeGivebackAudit = evaluateMfeGivebackAndAutoBe(advancedQuantRecords);
+      const contextGateOos = evaluateContextGatesOos(advancedQuantRecords, ex, shadowMaxSlots);
+      const confidenceSizingAudit = evaluateConfidenceSizingOos(advancedQuantRecords, ex, shadowMaxSlots);
+      const decayedRegimeMemory = computeDecayedRegimeMemory(advancedQuantRecords, 14);
       const observeFactors = computeObserveFactorsFromSetups(observeSetupRecords);
       const latestBench = bench1d.length > 0 ? bench1dRegimes[bench1d.length - 1] : undefined;
       const latestUsd = usd1d.length > 0 ? usd1dRets[usd1d.length - 1] : null;
@@ -3263,6 +3497,11 @@ export class LearningEngine {
         portfolioSim,
         breadthSitOutAnalysis,
         observeFactors,
+        factorRankIc,
+        mfeGivebackAudit,
+        contextGateOos,
+        confidenceSizingAudit,
+        decayedRegimeMemory,
         tuning: analyzeTuning(tuningEvents, initTuneCfg, costPct),
       };
 
