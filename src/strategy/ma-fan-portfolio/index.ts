@@ -11,7 +11,7 @@ import { AlpacaPortfolioWsClient } from "../../exchange/alpaca/ws.js";
 import type { Candle } from "../../market-structure.js";
 import type { AtrSource } from "../../types.js";
 import { BotDatabase, getDatabase, type CorePendingOrderRecord, type PortfolioSlotRecord, type UnifiedOrderRecord } from "../../db.js";
-import { CoreOrderManager } from "../../core/order-manager.js";
+import { CoreOrderManager, CorePortfolioManager, computeSlotEntryBudget } from "../../core/index.js";
 import { detectRecentShock24h, earningsCalendar, getMacroEventContext } from "../../event-calendar.js";
 import {
   calcCandleAtrPct14,
@@ -134,6 +134,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
   private log: (msg: string) => void;
   private db: BotDatabase;
   private learning: LearningEngine;
+  private portfolio: CorePortfolioManager;
   private orderManager: CoreOrderManager;
   private isReconcilingOrders: boolean = false;
   private lastPendingReconcileTs: number = 0;
@@ -145,14 +146,13 @@ export class MaFanPortfolioStrategy implements IStrategy {
   private isSwitchingSymbol: boolean = false;
   private tickInProgress: boolean = false;
 
-  // Portfolio Capital & State
-  private slots: ActivePortfolioSlot[] = [];
-  private cashBalance: number = 0;
-  private initialCapital: number = 0;
-  private realizedPnl: number = 0;
-  private tradeRealizedPnl: number = 0;
-  private walletQuoteBalance: number = 0;
-  private walletQuoteTotal: number = 0;
+  private get slots(): ActivePortfolioSlot[] {
+    return this.portfolio.slots as ActivePortfolioSlot[];
+  }
+
+  private set slots(next: ActivePortfolioSlot[]) {
+    this.portfolio.slots = next;
+  }
 
   // Universe Scanner & Indicators
   private snapshots = new Map<string, SymbolIndicatorSnapshot>();
@@ -181,7 +181,6 @@ export class MaFanPortfolioStrategy implements IStrategy {
   private inspectedSymbol: string = "";
   private lastUniverseFetchTs: number = 0;
   private lastSnapshotPollTs: number = 0;
-  private lastBalanceSyncTs: number = 0;
   private lastTelemetryEmitTs: number = 0;
   private universeFetchPromise: Promise<void> | null = null;
   private latestSurvival: SurvivalGuardDecision | null = null;
@@ -207,6 +206,18 @@ export class MaFanPortfolioStrategy implements IStrategy {
     this.log = context.log ?? ((msg) => console.log(`[ma-fan-portfolio] ${msg}`));
     this.db = getDatabase({ dbPath: this.cfg.dbPath });
     this.learning = new LearningEngine(this.db, this.log);
+    this.portfolio = new CorePortfolioManager({
+      exchange: this.exchange,
+      isDryRun: () => this.cfg.dryRun,
+      getMaxSlots: () => Number(this.cfg.portfolioMaxSlots) || 3,
+      getCapitalUsagePct: () => Number(this.cfg.portfolioCapitalUsagePct),
+      getMaxBudgetUsd: () => Number(this.cfg.portfolioMaxBudgetUsd) || 0,
+      getDisasterSlPct: () => Number(this.cfg.portfolioDisasterSlPct ?? 3.5),
+      getDefaultCapital: () => (this.exchange.exchangeName === "alpaca" ? 10_000 : 200),
+      getFeeRate: (sym) => (this.exchange.exchangeName === "alpaca" || sym.endsWith("FDUSD") ? 0 : 0.00075),
+      getLivePrice: (sym) => this.snapshots.get(sym)?.livePrice,
+      log: this.log,
+    });
     this.orderManager = new CoreOrderManager({
       exchange: this.exchange,
       isDryRun: () => this.cfg.dryRun,
@@ -236,61 +247,27 @@ export class MaFanPortfolioStrategy implements IStrategy {
   }
 
   private getMaxSlots(): number {
-    return Math.max(1, Math.min(5, Number(this.cfg.portfolioMaxSlots) || 3));
+    return this.portfolio.getMaxSlots();
   }
 
   private getCapitalUsageRatio(): number {
-    const pct = Number(this.cfg.portfolioCapitalUsagePct);
-    return Math.min(100, Math.max(10, Number.isFinite(pct) && pct > 0 ? pct : 50)) / 100;
+    return this.portfolio.getCapitalUsageRatio();
   }
 
   private getEffectiveBudgetCap(): number {
-    const cap = Number(this.cfg.portfolioMaxBudgetUsd) || 0;
-    if (cap > 0) return cap;
-    const deployed = this.slots.reduce(
-      (s, slot) => s + (slot.entryPrice > 0 ? slot.qty * slot.entryPrice : slot.allocatedCapital),
-      0,
-    );
-    const heldVal = this.slots.reduce(
-      (s, slot) =>
-        s + slot.qty * (this.snapshots.get(slot.symbol)?.livePrice || slot.lastKnownPrice || slot.entryPrice),
-      0,
-    );
-    const rawFree =
-      !this.cfg.dryRun && this.exchange.hasCredentials() && this.walletQuoteBalance > 0
-        ? this.walletQuoteBalance
-        : this.cashBalance;
-    const liveEquity = this.walletQuoteTotal > 0 ? this.walletQuoteTotal : rawFree + (heldVal || deployed);
-    // Anchor to initialCapital (up to 1.25x liveEquity) so normal drawdowns absorbed by the reserve buffer do not shrink slot size
-    if (this.initialCapital > 0 && liveEquity > 0) {
-      return Math.max(liveEquity, Math.min(this.initialCapital, liveEquity * 1.25));
-    }
-    if (this.initialCapital > 0) return this.initialCapital;
-    if (liveEquity > 0) return liveEquity;
-    return this.exchange.exchangeName === "alpaca" ? 10_000 : 200;
+    return this.portfolio.getEffectiveBudgetCap();
   }
 
   private getMaxActiveBudget(): number {
-    return this.getEffectiveBudgetCap() * this.getCapitalUsageRatio();
+    return this.portfolio.getMaxActiveBudget();
   }
 
   private getStandardSlotUnit(): number {
-    return this.getMaxActiveBudget() / this.getMaxSlots();
+    return this.portfolio.getStandardSlotUnit();
   }
 
   private getAvailableBuyCash(): number {
-    const deployed = this.slots.reduce(
-      (s, slot) => s + (slot.entryPrice > 0 ? slot.qty * slot.entryPrice : slot.allocatedCapital),
-      0,
-    );
-    const mmRemaining = Math.max(0, this.getMaxActiveBudget() - deployed);
-    if (!this.cfg.dryRun && this.exchange.hasCredentials() && (this.lastBalanceSyncTs > 0 || this.walletQuoteBalance > 0)) {
-      return Math.min(Math.max(0, this.walletQuoteBalance), mmRemaining);
-    }
-    if (this.cashBalance > 0) {
-      return Math.min(this.cashBalance, mmRemaining);
-    }
-    return mmRemaining;
+    return this.portfolio.getAvailableBuyCash();
   }
 
   // ── Lifecycle & Interface Methods ──────────────────────────────────────────
@@ -618,36 +595,28 @@ export class MaFanPortfolioStrategy implements IStrategy {
   public reloadState(): void {
     const saved = this.db.getState(PORTFOLIO_DB_KEY);
     if (saved) {
-      this.slots = Array.isArray(saved.portfolioSlots) ? saved.portfolioSlots.map((s) => ({ ...s })) : [];
+      this.portfolio.loadState(saved);
       this.orderManager?.loadPendingOrders(Array.isArray(saved.portfolioPendingOrders) ? saved.portfolioPendingOrders : []);
-      this.realizedPnl = Number(saved.realizedPnl || 0);
-      this.tradeRealizedPnl = Number(saved.tradeRealizedPnl ?? saved.realizedPnl ?? 0);
-      this.cashBalance = Number(saved.portfolioCash || 0);
-      this.initialCapital = Number(saved.portfolioInitialCapital || 0);
-      if (typeof saved.isPaused === "boolean") {
-        // Keep safe boot respect if called from boot; update on explicit reload
-      }
       if (this.slots.length > 0 && !this.slots.some((s) => s.symbol === this.inspectedSymbol)) {
         this.inspectedSymbol = this.slots[0]!.symbol;
         this.cfg.portfolioInspectedSymbol = this.inspectedSymbol;
       }
     } else {
-      this.slots = [];
+      this.portfolio.loadState(undefined);
       this.orderManager?.loadPendingOrders([]);
-      this.realizedPnl = 0;
-      this.tradeRealizedPnl = 0;
     }
   }
 
   public saveState(immediate = false): void {
+    const pState = this.portfolio.exportState();
     this.db.saveState(
       {
-        portfolioSlots: this.slots.map((s) => ({ ...s })),
+        portfolioSlots: pState.portfolioSlots,
         portfolioPendingOrders: this.orderManager ? this.orderManager.getPendingOrders() : [],
-        portfolioCash: this.cashBalance,
-        portfolioInitialCapital: this.initialCapital,
-        realizedPnl: this.realizedPnl,
-        tradeRealizedPnl: this.tradeRealizedPnl,
+        portfolioCash: pState.portfolioCash,
+        portfolioInitialCapital: pState.portfolioInitialCapital,
+        realizedPnl: pState.realizedPnl,
+        tradeRealizedPnl: pState.tradeRealizedPnl,
         isPaused: this.isPaused,
         lastUpdated: Date.now(),
       },
@@ -671,15 +640,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
   }
 
   public getLots(): Lot[] {
-    return this.slots.map((s, idx) => ({
-      price: s.entryPrice,
-      qty: s.qty,
-      time: s.entryTime,
-      zoneIndex: idx,
-      stopLossPrice: s.stopLossPrice,
-      beLocked: s.beLocked,
-      profitLocked: s.tp1Done,
-    }));
+    return this.portfolio.toLots();
   }
 
   public setSwitchingSymbol(val: boolean): void {
@@ -693,6 +654,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
   public updateExchangeClient(newExchange: IExchangeClient, nextInfo: ExchangeSymbolInfo, atrSource: AtrSource): void {
     this.stop();
     this.exchange = newExchange;
+    this.portfolio?.setExchange(newExchange);
+    this.orderManager?.setExchange(newExchange);
     this.symbolInfo = nextInfo;
     this.atrSource = atrSource;
     this.snapshots.clear();
@@ -958,8 +921,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
         await this.db.syncRecentTradesFromExchange(this.exchange, "ALL").catch(() => {});
         const roundsSummary = this.db.getTradeRounds("ALL").summary;
         if (roundsSummary.closedRounds > 0) {
-          this.realizedPnl = roundsSummary.totalNetPnlQuote;
-          this.tradeRealizedPnl = roundsSummary.totalNetPnlQuote;
+          this.portfolio.syncRealizedPnl(roundsSummary.totalNetPnlQuote, roundsSummary.totalNetPnlQuote);
           this.saveState(true);
         }
       }
@@ -1021,12 +983,11 @@ export class MaFanPortfolioStrategy implements IStrategy {
     if (matchedRound) {
       const roundsSummary = this.db.getTradeRounds("ALL").summary;
       if (roundsSummary.closedRounds > 0) {
-        this.realizedPnl = roundsSummary.totalNetPnlQuote;
-        this.tradeRealizedPnl = roundsSummary.totalNetPnlQuote;
+        this.portfolio.syncRealizedPnl(roundsSummary.totalNetPnlQuote, roundsSummary.totalNetPnlQuote);
       }
     }
 
-    this.slots = this.slots.filter((s) => s.slotIndex !== slot.slotIndex);
+    this.portfolio.removeSlot(slot.slotIndex);
     if (this.slots.length > 0 && !this.slots.some((s) => s.symbol === this.inspectedSymbol)) {
       this.inspectedSymbol = this.slots[0]!.symbol;
       this.cfg.portfolioInspectedSymbol = this.inspectedSymbol;
@@ -1066,48 +1027,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
   // ── Wallet & Position Sync ─────────────────────────────────────────────────
 
   public async refreshWalletBalances(): Promise<any> {
-    try {
-      const targetSym = this.inspectedSymbol || this.symbolInfo.symbol;
-      if (!this.cfg.dryRun && this.exchange.hasCredentials()) {
-        const bal = await this.exchange.getAccountBalances(targetSym);
-        this.walletQuoteBalance = bal.quoteFree || 0;
-        this.walletQuoteTotal = bal.quoteTotal || this.walletQuoteBalance;
-        if (this.initialCapital <= 0 && this.walletQuoteTotal > 0) {
-          this.initialCapital = this.walletQuoteTotal;
-        }
-        if (this.cashBalance <= 0 && this.walletQuoteBalance > 0) {
-          this.cashBalance = this.walletQuoteBalance;
-        }
-        this.lastBalanceSyncTs = Date.now();
-        return {
-          base: bal.baseFree || 0,
-          quote: this.walletQuoteBalance,
-          somi: 0,
-          usdso: this.walletQuoteBalance,
-          address: this.exchange.exchangeName.toUpperCase(),
-        };
-      }
-    } catch (err) {
-      this.log(`⚠️ Portfolio wallet refresh error: ${(err as Error).message}`);
-    }
-
-    const defaultCap = this.exchange.exchangeName === "alpaca" ? 10_000 : 200;
-    if (this.initialCapital <= 0) {
-      this.initialCapital = this.cfg.portfolioMaxBudgetUsd > 0 ? this.cfg.portfolioMaxBudgetUsd : defaultCap;
-    }
-    const deployed = this.slots.reduce((s, slot) => s + (slot.entryPrice > 0 ? slot.qty * slot.entryPrice : slot.allocatedCapital), 0);
-    const estFree = Math.max(0, this.initialCapital + this.realizedPnl - deployed);
-    this.cashBalance = estFree;
-    this.walletQuoteBalance = estFree;
-    const heldMarketVal = this.slots.reduce((s, slot) => s + slot.qty * (slot.lastKnownPrice || slot.entryPrice), 0);
-    this.walletQuoteTotal = estFree + heldMarketVal;
-    return {
-      base: this.baseHeld(),
-      quote: estFree,
-      somi: 0,
-      usdso: estFree,
-      address: this.cfg.dryRun ? "SIMULATED" : this.exchange.exchangeName.toUpperCase(),
-    };
+    return this.portfolio.refreshWalletBalances(this.inspectedSymbol || this.symbolInfo.symbol, this.baseHeld());
   }
 
   private async applyBuyFillDelta(opts: {
@@ -1132,75 +1052,24 @@ export class MaFanPortfolioStrategy implements IStrategy {
 
     const now = Date.now();
     const isAlpaca = this.exchange.exchangeName === "alpaca";
-    const actualCost = execQty * execPrice;
-    const feePct = isAlpaca || symbol.endsWith("FDUSD") ? 0 : 0.00075;
-    const entryFee = actualCost * feePct;
-    const slPct = Number(this.cfg.portfolioDisasterSlPct ?? 3.5);
     const maxSlots = this.getMaxSlots();
-    const existingSlot = this.slots.find((s) => s.symbol === symbol);
+    const pbLabel = getPullbackModeLabel(normalizePullbackMode(this.cfg.portfolioPullbackMode));
+    const scoreStr = typeof opts.score === "number" ? opts.score.toFixed(1) : "0.0";
+    const entryReason = opts.reason || `MA-Fan Pullback ${pbLabel} (Score ${scoreStr})`;
 
-    let activeSlot: ActivePortfolioSlot;
-    if (existingSlot) {
-      const prevCost = existingSlot.qty * existingSlot.entryPrice;
-      const newQty = existingSlot.qty + execQty;
-      const newAvgEntry = newQty > 0 ? (prevCost + actualCost) / newQty : execPrice;
-      existingSlot.qty = newQty;
-      existingSlot.initialQty = (existingSlot.initialQty || 0) + execQty;
-      existingSlot.entryPrice = newAvgEntry;
-      existingSlot.allocatedCapital = (existingSlot.allocatedCapital || prevCost) + actualCost;
-      existingSlot.entryFeeQuote = (existingSlot.entryFeeQuote || 0) + entryFee;
-      existingSlot.lastKnownPrice = execPrice;
-      existingSlot.peakPrice = Math.max(existingSlot.peakPrice || execPrice, execPrice);
-      existingSlot.troughPrice = existingSlot.troughPrice > 0 ? Math.min(existingSlot.troughPrice, execPrice) : execPrice;
-      if (!existingSlot.beLocked && !existingSlot.tp1Done && slPct > 0) {
-        existingSlot.stopLossPrice = newAvgEntry * (1 - slPct / 100);
-      }
-      if (opts.targetCapital > 0) {
-        existingSlot.targetCapital = existingSlot.targetCapital
-          ? Math.min(existingSlot.targetCapital, opts.targetCapital)
-          : opts.targetCapital;
-      }
-      existingSlot.lastBuyAttemptMs = now;
-      activeSlot = existingSlot;
-    } else {
-      const usedIdx = new Set(this.slots.map((s) => s.slotIndex));
-      let slotIndex =
-        typeof opts.slotIndexHint === "number" && opts.slotIndexHint >= 0 && opts.slotIndexHint < maxSlots && !usedIdx.has(opts.slotIndexHint)
-          ? opts.slotIndexHint
-          : 0;
-      while (usedIdx.has(slotIndex)) slotIndex++;
+    const ledger = this.portfolio.applyBuyFill({
+      symbol,
+      qty: execQty,
+      execPrice,
+      targetCapital: opts.targetCapital,
+      slotIndexHint: opts.slotIndexHint,
+      entryReason,
+      createdAtMs: opts.createdAtMs,
+    });
+    const activeSlot = ledger.slot as ActivePortfolioSlot;
+    const { actualCost, entryFee, isTopUp } = ledger;
 
-      const slPrice = slPct > 0 ? execPrice * (1 - slPct / 100) : 0;
-      const pbLabel = getPullbackModeLabel(normalizePullbackMode(this.cfg.portfolioPullbackMode));
-      const scoreStr = typeof opts.score === "number" ? opts.score.toFixed(1) : "0.0";
-      const entryReason = opts.reason || `MA-Fan Pullback ${pbLabel} (Score ${scoreStr})`;
-      const baseCreatedAt = opts.createdAtMs || now;
-
-      activeSlot = {
-        slotIndex,
-        symbol,
-        entryTime: baseCreatedAt,
-        entryPrice: execPrice,
-        allocatedCapital: actualCost,
-        targetCapital: opts.targetCapital > 0 ? opts.targetCapital : actualCost,
-        topUpAttempts: 0,
-        topUpDeadlineMs: baseCreatedAt + 15 * 60_000,
-        lastBuyAttemptMs: now,
-        stopLossPrice: slPrice,
-        qty: execQty,
-        initialQty: execQty,
-        troughPrice: execPrice,
-        peakPrice: execPrice,
-        lastKnownPrice: execPrice,
-        beLocked: false,
-        tp1Done: false,
-        realizedProceeds: 0,
-        entryFeeQuote: entryFee,
-        realizedExitFees: 0,
-        activeBarsHeld: 0,
-        entryReason,
-      };
-      this.slots.push(activeSlot);
+    if (!isTopUp) {
       this.inspectedSymbol = symbol;
       this.cfg.portfolioInspectedSymbol = symbol;
 
@@ -1230,15 +1099,6 @@ export class MaFanPortfolioStrategy implements IStrategy {
       });
     }
 
-    if (this.cfg.dryRun || this.cashBalance > 0) {
-      this.cashBalance = Math.max(0, this.cashBalance - actualCost);
-    }
-    if (this.walletQuoteBalance > 0) {
-      this.walletQuoteBalance = Math.max(0, this.walletQuoteBalance - actualCost);
-    }
-
-    const pbLabel = getPullbackModeLabel(normalizePullbackMode(this.cfg.portfolioPullbackMode));
-    const isTopUp = Boolean(existingSlot);
     const orderRec: UnifiedOrderRecord = {
       id: `mafan_buy_${now}_${activeSlot.slotIndex}_${Math.random().toString(36).slice(2, 6)}`,
       orderId,
@@ -1287,30 +1147,9 @@ export class MaFanPortfolioStrategy implements IStrategy {
   ): Promise<void> {
     if (sellQty <= 0 || execPrice <= 0) return;
     const isAlpaca = this.exchange.exchangeName === "alpaca";
-    const boundedQty = Math.min(slot.qty, sellQty);
-    if (boundedQty <= 1e-8) return;
-
-    const proceeds = boundedQty * execPrice;
-    const feePct = isAlpaca || slot.symbol.endsWith("FDUSD") ? 0 : 0.00075;
-    const exitFee = proceeds * feePct;
-    const origQty = slot.initialQty > 0 ? slot.initialQty : slot.qty;
-    const soldShareOfInitial = origQty > 0 ? Math.min(1, boundedQty / origQty) : 1;
-    const costBasisSlice = slot.entryPrice > 0 ? boundedQty * slot.entryPrice : slot.allocatedCapital * soldShareOfInitial;
-    const entryFeeSlice = slot.entryFeeQuote * soldShareOfInitial;
-    const legPnl = proceeds - exitFee - costBasisSlice - entryFeeSlice;
-
-    slot.realizedProceeds += proceeds - exitFee;
-    slot.realizedExitFees += exitFee;
-    slot.qty = Math.max(0, slot.qty - boundedQty);
-
-    this.realizedPnl += legPnl;
-    this.tradeRealizedPnl += legPnl;
-    if (this.cfg.dryRun || this.cashBalance >= 0) {
-      this.cashBalance += proceeds - exitFee;
-    }
-    if (this.walletQuoteBalance >= 0) {
-      this.walletQuoteBalance += proceeds - exitFee;
-    }
+    const sellRes = this.portfolio.applySellFill(slot, { sellQty, execPrice });
+    if (sellRes.boundedQty <= 1e-8) return;
+    const { boundedQty, proceeds, exitFee, legPnl } = sellRes;
 
     const isSl = reason.startsWith("SL_");
     const now = Date.now();
@@ -1421,107 +1260,48 @@ export class MaFanPortfolioStrategy implements IStrategy {
   public async syncOnChainOrders(): Promise<void> {
     if (this.cfg.dryRun || !this.exchange.hasCredentials()) return;
     await this.reconcileOrderManager(false);
-    if (this.exchange.exchangeName === "alpaca" && typeof (this.exchange as any).getAllPositions === "function") {
-      try {
-        const positions = await (this.exchange as any).getAllPositions();
-        const heldMap = new Map<string, any>(positions.map((p: any) => [p.symbol, p]));
-        // Update live qty / price on matching persisted slots, clear closed Alpaca positions, and adopt orphaned ones
-        const retainedSlots: ActivePortfolioSlot[] = [];
-        const clearedSlots: ActivePortfolioSlot[] = [];
-        const adoptedSlots: ActivePortfolioSlot[] = [];
-        const shrunkSymbols = new Set<string>();
-        for (const slot of this.slots) {
-          const exPos = heldMap.get(slot.symbol);
-          if (exPos && exPos.qty > 0) {
-            if (exPos.qty < slot.qty - 1e-6) {
-              shrunkSymbols.add(slot.symbol);
-            }
-            slot.qty = exPos.qty;
-            slot.lastKnownPrice = exPos.currentPrice || slot.lastKnownPrice;
-            if (slot.entryPrice <= 0 && exPos.avgEntryPrice > 0) slot.entryPrice = exPos.avgEntryPrice;
-            retainedSlots.push(slot);
-            heldMap.delete(slot.symbol);
-          } else {
-            clearedSlots.push(slot);
-            this.log(`🔄 [Portfolio Sync] Slot ${slot.slotIndex + 1} (${slot.symbol}) position is 0 on Alpaca — clearing closed slot & reconciling fills`);
-          }
-        }
-        this.slots = retainedSlots;
-        const maxSlots = this.getMaxSlots();
-        const standardCap = this.getStandardSlotUnit();
-        for (const [sym, p] of heldMap.entries()) {
-          if (this.slots.length >= maxSlots) break;
-          const usedIdx = new Set(this.slots.map((s) => s.slotIndex));
-          let slotIndex = 0;
-          while (usedIdx.has(slotIndex)) slotIndex++;
-          const slPct = Number(this.cfg.portfolioDisasterSlPct ?? 3.5);
-          const entryPrice = p.avgEntryPrice || p.currentPrice;
-          const allocatedCapital = p.marketValue || entryPrice * p.qty;
-          const knownTarget = this.orderManager.getRecentEntryTarget(sym);
-          const adoptedTargetCap = knownTarget
-            ? Math.min(knownTarget.targetCapital, standardCap)
-            : undefined;
-          const adoptedSlot: ActivePortfolioSlot = {
-            slotIndex,
-            symbol: sym,
-            entryTime: knownTarget?.entryTime || Date.now(),
-            entryPrice,
-            allocatedCapital,
-            ...(adoptedTargetCap ? { targetCapital: adoptedTargetCap, topUpDeadlineMs: knownTarget!.deadlineMs, topUpAttempts: 0 } : {}),
-            stopLossPrice: slPct > 0 ? entryPrice * (1 - slPct / 100) : 0,
-            qty: p.qty,
-            initialQty: p.qty,
-            troughPrice: p.currentPrice || entryPrice,
-            peakPrice: p.currentPrice || entryPrice,
-            lastKnownPrice: p.currentPrice || entryPrice,
-            beLocked: false,
-            tp1Done: false,
-            realizedProceeds: 0,
-            entryFeeQuote: 0,
-            realizedExitFees: 0,
-            activeBarsHeld: 0,
-            entryReason: "Adopted Alpaca Position",
-          };
-          this.slots.push(adoptedSlot);
-          adoptedSlots.push(adoptedSlot);
-          this.log(`🔄 [Portfolio Sync] Adopted live Alpaca position into Slot ${slotIndex + 1}: ${sym} (${p.qty} @ $${p.avgEntryPrice})`);
-        }
-        for (const adopted of adoptedSlots) {
-          await this.db.syncRecentTradesFromExchange(this.exchange, adopted.symbol).catch(() => {});
-          adopted.learningJournalUid = await this.learning.onPortfolioEntry({
-            exchange: this.exchange.exchangeName,
-            symbol: adopted.symbol,
-            slotIndex: adopted.slotIndex,
-            entryTimeMs: adopted.entryTime,
-            entryPrice: adopted.entryPrice,
-            signalPrice: adopted.entryPrice,
-            qty: adopted.qty,
-            allocatedQuote: adopted.allocatedCapital,
-            snapshot: this.radarList.find((r) => r.symbol === adopted.symbol),
-            macro: this.macroState,
-            score: 0,
-          });
-        }
-        for (const sym of shrunkSymbols) {
-          await this.db.syncRecentTradesFromExchange(this.exchange, sym).catch(() => {});
-        }
-        for (const cleared of clearedSlots) {
-          await this.finalizeClosedPortfolioSlot(
-            cleared,
-            cleared.lastKnownPrice || cleared.entryPrice,
-            cleared.pendingExitReason || "ALPACA_SYNC_CLOSED",
-            undefined,
-            true,
-          );
-        }
-        if (this.slots.length > 0 && !this.slots.some((s) => s.symbol === this.inspectedSymbol)) {
-          this.inspectedSymbol = this.slots[0]!.symbol;
-          this.cfg.portfolioInspectedSymbol = this.inspectedSymbol;
-        }
-        this.saveState(clearedSlots.length > 0 || adoptedSlots.length > 0);
-      } catch (err) {
-        this.log(`⚠️ Failed to sync Alpaca positions: ${(err as Error).message}`);
+    try {
+      const syncRes = await this.portfolio.syncPositionsWithExchange({
+        getRecentEntryTarget: (sym) => this.orderManager.getRecentEntryTarget(sym),
+        adoptedReason: this.exchange.exchangeName === "alpaca" ? "Adopted Alpaca Position" : "Adopted Exchange Position",
+      });
+      if (!syncRes.supported) return;
+
+      for (const adopted of syncRes.adoptedSlots as ActivePortfolioSlot[]) {
+        await this.db.syncRecentTradesFromExchange(this.exchange, adopted.symbol).catch(() => {});
+        adopted.learningJournalUid = await this.learning.onPortfolioEntry({
+          exchange: this.exchange.exchangeName,
+          symbol: adopted.symbol,
+          slotIndex: adopted.slotIndex,
+          entryTimeMs: adopted.entryTime,
+          entryPrice: adopted.entryPrice,
+          signalPrice: adopted.entryPrice,
+          qty: adopted.qty,
+          allocatedQuote: adopted.allocatedCapital,
+          snapshot: this.radarList.find((r) => r.symbol === adopted.symbol),
+          macro: this.macroState,
+          score: 0,
+        });
       }
+      for (const sym of syncRes.shrunkSymbols) {
+        await this.db.syncRecentTradesFromExchange(this.exchange, sym).catch(() => {});
+      }
+      for (const cleared of syncRes.clearedSlots as ActivePortfolioSlot[]) {
+        await this.finalizeClosedPortfolioSlot(
+          cleared,
+          cleared.lastKnownPrice || cleared.entryPrice,
+          cleared.pendingExitReason || "ALPACA_SYNC_CLOSED",
+          undefined,
+          true,
+        );
+      }
+      if (this.slots.length > 0 && !this.slots.some((s) => s.symbol === this.inspectedSymbol)) {
+        this.inspectedSymbol = this.slots[0]!.symbol;
+        this.cfg.portfolioInspectedSymbol = this.inspectedSymbol;
+      }
+      this.saveState(syncRes.clearedSlots.length > 0 || syncRes.adoptedSlots.length > 0);
+    } catch (err) {
+      this.log(`⚠️ Failed to sync exchange positions: ${(err as Error).message}`);
     }
   }
 
@@ -1604,22 +1384,16 @@ export class MaFanPortfolioStrategy implements IStrategy {
   }
 
   public async resetPosition(): Promise<{ success: boolean; clearedLots: number }> {
-    const count = this.slots.length;
-    this.slots = [];
+    const count = this.portfolio.resetPositions();
     this.saveState(true);
     this.emitTelemetryTick();
     return { success: true, clearedLots: count };
   }
 
   public async resetBotState(opts?: any): Promise<{ success: boolean }> {
-    this.slots = [];
+    this.portfolio.resetState(opts);
     this.setupStates.clear();
     this.corrGuardLogBar.clear();
-    if (opts?.resetPnl || opts?.fullReset) {
-      this.realizedPnl = 0;
-      this.tradeRealizedPnl = 0;
-      this.cashBalance = this.initialCapital;
-    }
     this.saveState(true);
     this.emitTelemetryTick();
     return { success: true };
@@ -1654,7 +1428,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       }
 
       // 3. Synchronize exchange positions & wallet balance periodically (plus fast 5s pending OMS reconcile)
-      if (now - this.lastBalanceSyncTs >= 20_000) {
+      if (now - this.portfolio.lastBalanceSyncTs >= 20_000) {
         await this.syncOnChainOrders();
         await this.refreshWalletBalances();
       } else if (this.orderManager.getPendingOrders().length > 0 && now - this.lastPendingReconcileTs >= 5_000) {
@@ -2028,16 +1802,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
     }
 
     // 2. Evaluate Survival Guard & Scan Universe + Live Radar
-    const openHeldValue = this.slots.reduce(
-      (sum, slot) => sum + slot.qty * (this.snapshots.get(slot.symbol)?.livePrice || slot.lastKnownPrice || slot.entryPrice),
-      0,
-    );
-    const currentEquity =
-      Number(this.cfg.portfolioMaxBudgetUsd) > 0
-        ? Math.max(10, Number(this.cfg.portfolioMaxBudgetUsd) + this.realizedPnl)
-        : this.walletQuoteTotal > 0
-          ? this.walletQuoteTotal
-          : (this.cashBalance > 0 ? this.cashBalance : this.getEffectiveBudgetCap()) + openHeldValue;
+    const currentEquity = this.portfolio.computeCurrentEquity();
     const configuredMaxSlots = this.getMaxSlots();
     const nowObsMs = Date.now();
     if (this.macroState.universeCount > 0) {
@@ -2568,13 +2333,15 @@ export class MaFanPortfolioStrategy implements IStrategy {
         }
 
         const availCash = this.getAvailableBuyCash();
-        let volScale = 1.0;
         const chAtrPct = ch.cand.atrPct ?? 0.35;
-        if (q4VolActive && chAtrPct > medianAtrPct * 1.35) {
-          volScale = Math.max(0.7, Math.min(1.0, (medianAtrPct * 1.25) / chAtrPct));
-        }
-        const standardSlotAlloc = this.getStandardSlotUnit() * sizeScale * volScale;
-        const alloc = Math.min(standardSlotAlloc, availCash);
+        const { allocQuote: alloc } = computeSlotEntryBudget({
+          standardSlotUnit: this.getStandardSlotUnit(),
+          availCash,
+          sizeScale,
+          volTargetedEnabled: q4VolActive,
+          atrPct: chAtrPct,
+          medianAtrPct,
+        });
         if (alloc < 5) break;
         const survWarnReason =
           wouldBlockSurvivalMap.get(ch.sym) ||
@@ -3186,11 +2953,11 @@ export class MaFanPortfolioStrategy implements IStrategy {
     const effectiveRealizedPnl =
       roundsData.summary.totalRounds > 0
         ? roundsData.summary.totalNetPnlQuote
-        : (this.slots.length > 0 ? this.realizedPnl : 0);
+        : (this.slots.length > 0 ? this.portfolio.realizedPnl : 0);
     const effectiveTradeRealizedPnl =
       roundsData.summary.totalRounds > 0
         ? roundsData.summary.totalGrossPnlQuote
-        : (this.slots.length > 0 ? this.tradeRealizedPnl : 0);
+        : (this.slots.length > 0 ? this.portfolio.tradeRealizedPnl : 0);
 
     const roundsSummary = {
       winRate: roundsData.summary.winRatePct,
@@ -3276,7 +3043,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
       netPnlQuote: effectiveRealizedPnl,
       netPnlUsdso: effectiveRealizedPnl,
       avgEntry: inspectedSlot?.entryPrice || 0,
-      baseHeld: this.slots.reduce((s, x) => s + x.qty, 0),
+      baseHeld: this.portfolio.getBaseHeldTotal(),
       inventoryQuote: totalHeldValue,
       inventoryUsdso: totalHeldValue,
       maxInventoryQuote: this.getEffectiveBudgetCap(),

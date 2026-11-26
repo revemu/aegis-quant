@@ -10464,3 +10464,18 @@ When investigating live production behavior, debugging issues, or analyzing trad
   4. **Unit Tests ([`tests/core-order-manager.test.ts`](file:///c:/Sites/github/aegis-quant/tests/core-order-manager.test.ts))**:
      - ทดสอบครบ 6 ชุด (Delta sizing + cost cap, Lock 1 open BUY block, Lock 2 fail-closed on API errors, Lock 3 live holding anti-double-buy `VOO`, Write-Ahead + restart recovery + fail-closed reconcile + partial anti-double-count + 404 disappeared + stale cancel, และ Partial fill ➔ Delta top-up)
 - **Version Bump**: **`0.3.1.23`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 368. Shared Core Portfolio & Risk Manager (`v0.3.1.24`)
+- **สถาปัตยกรรม 4 ชั้น (Separation of Concerns)**:
+  1. **Strategy Layer (`src/strategy/*`)**: ตัดสินใจเฉพาะ Alpha/สัญญาณเข้า-ออก และกติกาบริหาร Exit (TP1, Trail, Time-Stop)
+  2. **Core Portfolio & Risk Manager (`src/core/portfolio-manager.ts`)**: จัดการบัญชีพอร์ต, MM Cap, Sizing (`computeSlotEntryBudget`), VWAP Cost-Basis & Pro-Rata PnL Ledger (`applyBuyFill` / `applySellFill`), และซิงก์พอร์ตจริงกับกระดาน (`refreshWalletBalances` / `syncPositionsWithExchange`)
+  3. **Core OMS (`src/core/order-manager.ts`)**: Write-Ahead `pendingOrders`, 5 Hard Locks, Delta Execution, และ 5-State Reconciler
+  4. **Exchange Adapters (`src/exchange/*`)**: แปลงคำสั่ง REST/WS ผ่าน `IExchangeClient` (`getOrderByClientId`, `getLiveHolding`, `getAllPositions`)
+- **สิ่งที่แก้ไข (`v0.3.1.24`)**:
+  1. **Standardized Exchange Position List ([`src/exchange/types.ts`](file:///c:/Sites/github/aegis-quant/src/exchange/types.ts#L151))**: เพิ่ม `getAllPositions?(): Promise<ExchangeLiveHolding[]>` บน `IExchangeClient`
+  2. **Core Portfolio & Risk Manager ([`src/core/portfolio-manager.ts`](file:///c:/Sites/github/aegis-quant/src/core/portfolio-manager.ts), [`src/core/index.ts`](file:///c:/Sites/github/aegis-quant/src/core/index.ts))**: แยกตรรกะบริหารเงินทุน, slot ledger, VWAP top-up, pro-rata sell PnL, wallet balance refresh, และ live position adopt/clear ออกมาเป็น Core กลางที่ใช้ร่วมกันได้ทุกกลยุทธ์
+  3. **Refactor `MaFanPortfolioStrategy` ([`src/strategy/ma-fan-portfolio/index.ts`](file:///c:/Sites/github/aegis-quant/src/strategy/ma-fan-portfolio/index.ts))**: ถอด state และคณิตศาสตร์พอร์ตที่ซ้ำซ้อนออกทั้งหมด ไปใช้ `this.portfolio` (`CorePortfolioManager`) และ `computeSlotEntryBudget`
+  4. **Unit Tests ([`tests/core-portfolio-manager.test.ts`](file:///c:/Sites/github/aegis-quant/tests/core-portfolio-manager.test.ts))**: ทดสอบครบ 6 ชุด (Budget & 1.25x anchor, Q4 ATR & cash clamp sizing, VWAP Buy/Top-Up ledger, Pro-rata Sell & fee/cash reconciliation, Exchange position sync & adopt recovery, State round-trip & reset)
+- **Version Bump**: **`0.3.1.24`** (`package.json`, `src/version.ts`, `public/index.html`)

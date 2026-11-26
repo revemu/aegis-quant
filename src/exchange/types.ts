@@ -148,6 +148,7 @@ export interface IExchangeClient {
   getOrder(symbol: string, orderId: string | number): Promise<ExchangeOpenOrder | ExchangeOrderResult>;
   getOrderByClientId?(symbol: string, clientOrderId: string): Promise<ExchangeOpenOrder | ExchangeOrderResult | null>;
   getLiveHolding?(symbol: string): Promise<ExchangeLiveHolding>;
+  getAllPositions?(): Promise<ExchangeLiveHolding[]>;
   getTopOfBook(symbol: string, forceFresh?: boolean): Promise<ExchangeTopOfBook | undefined>;
   placeOrder(params: PlaceOrderParams): Promise<ExchangeOrderResult>;
   cancelOrder(symbol: string, orderId: string | number): Promise<any>;
