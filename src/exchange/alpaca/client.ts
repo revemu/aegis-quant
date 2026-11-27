@@ -94,6 +94,7 @@ export class AlpacaClient implements IExchangeClient {
   public readonly hasGasFees = false;
   public readonly nativeGasAsset = "USD";
   public readonly supportsOrderExpiry = false;
+  public readonly usesSimulatedIocLimit = true;
 
   private apiKey: string;
   private apiSecret: string;
@@ -471,6 +472,7 @@ export class AlpacaClient implements IExchangeClient {
         err.orderId = o?.id;
         err.orderStatus = o?.status;
         err.isTerminal = isAlpacaTerminalStatus(o?.status);
+        err.isProtectiveTimeout = true;
         throw err;
       }
       if (
@@ -482,6 +484,7 @@ export class AlpacaClient implements IExchangeClient {
         err.orderId = o?.id;
         err.orderStatus = o?.status;
         err.isTerminal = isAlpacaTerminalStatus(o?.status);
+        err.isProtectiveTimeout = true;
         throw err;
       }
     }

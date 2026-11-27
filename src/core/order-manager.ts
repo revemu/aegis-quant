@@ -91,14 +91,17 @@ export interface TargetBuyResponse {
 export interface ManagedSellRequest {
   symbol: string;
   intent: "EXIT_TP1" | "EXIT_FULL";
-  orderType: "IOC" | "MARKET";
+  orderType?: "IOC" | "MARKET" | "AUTO";
+  urgent?: boolean;
   qty: number;
   price?: number;
   refPrice: number;
+  floorBuffer?: number;
   pricePrecision?: number;
   slotIndex?: number;
   reason?: string;
   cancelConflictingOpenSells?: boolean;
+  escalateToMarketOnTimeout?: boolean;
 }
 
 export interface ManagedSellResponse {
@@ -118,6 +121,7 @@ export interface ManagedSellResponse {
   executedQty: number;
   avgPrice: number;
   isTerminal: boolean;
+  escalatedToMarket?: boolean;
 }
 
 export interface ReconcileCallbacks {
@@ -253,6 +257,24 @@ export function isTerminalExchangeOrder(status?: string, isWorking?: boolean): b
   return isWorking !== true;
 }
 
+/**
+ * Computes the protective limit floor price for simulated-IOC exits, anchoring to live `bestBid`
+ * when sane (within 3% of `refPrice`) and applying `floorBuffer` (default 0.995 = -0.5%).
+ */
+export function resolveProtectiveSellLimitPrice(
+  refPrice: number,
+  bestBid?: number,
+  floorBuffer = 0.995,
+  pricePrecision = 2,
+): number {
+  const bid = Number(bestBid || 0);
+  const anchor =
+    bid > 0 && Math.abs(bid - refPrice) / Math.max(1e-9, refPrice) <= 0.03
+      ? Math.min(refPrice, bid)
+      : refPrice;
+  return Number((anchor * floorBuffer).toFixed(pricePrecision || 2));
+}
+
 export class CoreOrderManager {
   private exchange: IExchangeClient;
   private isDryRun: () => boolean;
@@ -265,6 +287,7 @@ export class CoreOrderManager {
   private pendingOrders: CorePendingOrderRecord[] = [];
   private inFlightSymbols = new Set<string>();
   private symbolCooldownUntil = new Map<string, number>();
+  private sellLimitTimeoutState = new Map<string, { count: number; lastFailMs: number; reason: string }>();
   private recentEntryTargets = new Map<
     string,
     { targetCapital: number; entryTime: number; deadlineMs: number }
@@ -501,12 +524,18 @@ export class CoreOrderManager {
         rec.filledQtyAccounted = cumFilled;
         rec.lastFillPrice = avgPrice;
         rec.updatedAt = now;
+        if (rec.side === "SELL") {
+          this.sellLimitTimeoutState.delete(rec.symbol);
+        }
         this.persist(this.getPendingOrders());
         summary.filledDeltas++;
         await callbacks.onFillDelta?.(rec, deltaFill, avgPrice, isTerminal);
       }
 
       if (isTerminal) {
+        if (rec.side === "SELL" && upperStatus === "FILLED") {
+          this.sellLimitTimeoutState.delete(rec.symbol);
+        }
         this.removePendingOrder(rec.clientOrderId);
         summary.resolvedTerminal++;
         await callbacks.onTerminal?.(rec, upperStatus, cumFilled, avgPrice);
@@ -846,7 +875,8 @@ export class CoreOrderManager {
   }
 
   /**
-   * Executes a managed SELL order with Write-Ahead persistence and duplicate-sell protection.
+   * Executes a managed SELL order with Write-Ahead persistence, duplicate-sell protection,
+   * capability-driven Bid-Anchor limit pricing, and fail-closed MARKET escalation on simulated-IOC timeouts.
    */
   public async submitManagedSell(req: ManagedSellRequest): Promise<ManagedSellResponse> {
     const symbol = req.symbol;
@@ -885,6 +915,48 @@ export class CoreOrderManager {
         };
       }
 
+      const usesSimIoc = Boolean(this.exchange.usesSimulatedIocLimit);
+      const isUrgent = Boolean(req.urgent || req.cancelConflictingOpenSells);
+      const reasonKey = req.reason || req.intent;
+      const now = this.nowFn();
+      const prevTimeout = this.sellLimitTimeoutState.get(symbol);
+      const recentTimeout =
+        Boolean(prevTimeout) &&
+        now - prevTimeout!.lastFailMs <= 120_000 &&
+        prevTimeout!.reason === reasonKey;
+      const allowEscalation = usesSimIoc && req.escalateToMarketOnTimeout !== false;
+
+      let effectiveOrderType: "IOC" | "MARKET";
+      let escalatedToMarket = false;
+      if (req.orderType === "MARKET") {
+        effectiveOrderType = "MARKET";
+      } else if (req.orderType === "IOC") {
+        if (allowEscalation && recentTimeout && (prevTimeout?.count ?? 0) >= 1) {
+          effectiveOrderType = "MARKET";
+          escalatedToMarket = true;
+        } else {
+          effectiveOrderType = "IOC";
+        }
+      } else {
+        if (usesSimIoc && isUrgent) {
+          effectiveOrderType = "MARKET";
+        } else if (allowEscalation && recentTimeout && (prevTimeout?.count ?? 0) >= 1) {
+          effectiveOrderType = "MARKET";
+          escalatedToMarket = true;
+        } else {
+          effectiveOrderType = "IOC";
+        }
+      }
+
+      if (escalatedToMarket) {
+        this.log(
+          `⚡ [OMS Exit Escalation] ${symbol} (${reasonKey}) using MARKET after prior protective limit timeout`,
+        );
+      }
+      const shouldCancelConflicting = Boolean(
+        req.cancelConflictingOpenSells || isUrgent || effectiveOrderType === "MARKET",
+      );
+
       // Check existing open sells on exchange (fail-closed)
       let openOrders: ExchangeOpenOrder[];
       try {
@@ -904,7 +976,7 @@ export class CoreOrderManager {
       const openSells = openOrders.filter((o) => o.side === "SELL");
       if (openSells.length > 0) {
         const hasPendingMarket = openSells.some((o) => String(o.type || "").toUpperCase() === "MARKET");
-        if (hasPendingMarket || !req.cancelConflictingOpenSells) {
+        if (hasPendingMarket || !shouldCancelConflicting) {
           const existing = openSells[0]!;
           const cid = existing.clientOrderId || `ext_sell_${existing.orderId}`;
           if (!this.pendingOrders.some((r) => r.clientOrderId === cid || r.orderId === String(existing.orderId))) {
@@ -944,6 +1016,27 @@ export class CoreOrderManager {
         await new Promise((r) => setTimeout(r, 800));
       }
 
+      const pricePrecision = req.pricePrecision || 2;
+      let limitPrice: number | undefined;
+      if (effectiveOrderType !== "MARKET") {
+        if (req.price !== undefined) {
+          limitPrice = Number(req.price.toFixed(pricePrecision));
+        } else {
+          const floorBuffer = req.floorBuffer ?? (usesSimIoc ? 0.995 : 0.998);
+          if (usesSimIoc) {
+            const topBook = await this.exchange.getTopOfBook(symbol).catch(() => undefined);
+            limitPrice = resolveProtectiveSellLimitPrice(
+              req.refPrice,
+              topBook?.bestBid,
+              floorBuffer,
+              pricePrecision,
+            );
+          } else {
+            limitPrice = Number((req.refPrice * floorBuffer).toFixed(pricePrecision));
+          }
+        }
+      }
+
       const pendingRec: CorePendingOrderRecord = {
         clientOrderId,
         symbol,
@@ -966,9 +1059,9 @@ export class CoreOrderManager {
         const res = await this.exchange.placeOrder({
           symbol,
           side: "SELL",
-          type: req.orderType,
+          type: effectiveOrderType,
           qty: req.qty,
-          price: req.price !== undefined ? Number(req.price.toFixed(req.pricePrecision || 2)) : undefined,
+          price: limitPrice,
           clientOrderId,
         });
 
@@ -981,6 +1074,7 @@ export class CoreOrderManager {
           pendingRec.filledQtyAccounted = execQty;
           this.removePendingOrder(clientOrderId);
           if (execQty > 0) {
+            this.sellLimitTimeoutState.delete(symbol);
             return {
               outcome: execQty >= req.qty * 0.99 ? "FILLED" : "PARTIAL_TERMINAL",
               clientOrderId,
@@ -988,6 +1082,7 @@ export class CoreOrderManager {
               executedQty: execQty,
               avgPrice,
               isTerminal: true,
+              escalatedToMarket,
             };
           }
           return {
@@ -997,6 +1092,7 @@ export class CoreOrderManager {
             executedQty: 0,
             avgPrice,
             isTerminal: true,
+            escalatedToMarket,
           };
         }
 
@@ -1012,6 +1108,7 @@ export class CoreOrderManager {
           executedQty: execQty,
           avgPrice,
           isTerminal: false,
+          escalatedToMarket,
         };
       } catch (err) {
         const errAny = err as any;
@@ -1019,6 +1116,164 @@ export class CoreOrderManager {
         pendingRec.status = "OPEN";
         pendingRec.updatedAt = this.nowFn();
         this.persist(this.getPendingOrders());
+
+        const isProtectiveTimeout =
+          Boolean(errAny?.isProtectiveTimeout) ||
+          /unfilled within timeout/i.test(String(errAny?.message || ""));
+
+        if (allowEscalation && effectiveOrderType === "IOC" && isProtectiveTimeout) {
+          this.sellLimitTimeoutState.set(symbol, {
+            count: (recentTimeout ? prevTimeout!.count : 0) + 1,
+            lastFailMs: this.nowFn(),
+            reason: reasonKey,
+          });
+
+          let exOrder: ExchangeOpenOrder | ExchangeOrderResult | null = null;
+          try {
+            exOrder = await this.lookupPendingOrderOnExchange(pendingRec);
+          } catch {
+            exOrder = null;
+          }
+
+          if (exOrder) {
+            const raceExecQty = Math.max(0, Number(exOrder.executedQty || 0));
+            const raceTerminal = isTerminalExchangeOrder(exOrder.status, (exOrder as any).isWorking);
+
+            // Case A: Cancel-race fill -> account fill without placing duplicate MARKET order
+            if (raceExecQty > 0) {
+              const raceAvgPx = this.extractAvgPrice(exOrder, req.refPrice);
+              if (raceTerminal) {
+                pendingRec.filledQtyAccounted = raceExecQty;
+                this.removePendingOrder(clientOrderId);
+                this.sellLimitTimeoutState.delete(symbol);
+                return {
+                  outcome: raceExecQty >= req.qty * 0.99 ? "FILLED" : "PARTIAL_TERMINAL",
+                  clientOrderId,
+                  orderId: exOrder.orderId ? String(exOrder.orderId) : pendingRec.orderId,
+                  executedQty: raceExecQty,
+                  avgPrice: raceAvgPx,
+                  isTerminal: true,
+                };
+              }
+              pendingRec.orderId = exOrder.orderId ? String(exOrder.orderId) : pendingRec.orderId;
+              pendingRec.status = "PARTIALLY_FILLED";
+              pendingRec.filledQtyAccounted = raceExecQty;
+              pendingRec.lastFillPrice = raceAvgPx;
+              pendingRec.updatedAt = this.nowFn();
+              this.persist(this.getPendingOrders());
+              return {
+                outcome: "PARTIAL_WORKING",
+                clientOrderId,
+                orderId: pendingRec.orderId,
+                executedQty: raceExecQty,
+                avgPrice: raceAvgPx,
+                isTerminal: false,
+              };
+            }
+
+            // Case B: Confirmed terminal 0-fill -> fail-closed clear & escalate immediately to MARKET
+            if (raceTerminal) {
+              this.removePendingOrder(clientOrderId);
+              this.log(
+                `⚡ [OMS Exit Escalation] ${symbol} (${reasonKey}) protective limit #${pendingRec.orderId || clientOrderId} confirmed ${exOrder.status} (0 fill) — escalating to MARKET`,
+              );
+
+              const fallbackClientOrderId = this.buildClientOrderId("SELL", symbol, undefined, 1);
+              const fallbackRec: CorePendingOrderRecord = {
+                clientOrderId: fallbackClientOrderId,
+                symbol,
+                side: "SELL",
+                intent: req.intent,
+                targetCapital: 0,
+                requestedQty: req.qty,
+                filledQtyAccounted: 0,
+                refPrice: req.refPrice,
+                createdAt: this.nowFn(),
+                updatedAt: this.nowFn(),
+                status: "SUBMITTING",
+                slotIndex: req.slotIndex,
+                reason: req.reason,
+              };
+              this.pendingOrders.push(fallbackRec);
+              this.persist(this.getPendingOrders());
+
+              try {
+                const fbRes = await this.exchange.placeOrder({
+                  symbol,
+                  side: "SELL",
+                  type: "MARKET",
+                  qty: req.qty,
+                  price: undefined,
+                  clientOrderId: fallbackClientOrderId,
+                });
+
+                fallbackRec.orderId = fbRes.orderId ? String(fbRes.orderId) : fallbackRec.orderId;
+                const fbExecQty = Math.max(0, Number(fbRes.executedQty || 0));
+                const fbAvgPx = this.extractAvgPrice(fbRes, req.refPrice);
+                const fbTerminal = isTerminalExchangeOrder(fbRes.status, (fbRes as any).isWorking);
+
+                if (fbTerminal) {
+                  fallbackRec.filledQtyAccounted = fbExecQty;
+                  this.removePendingOrder(fallbackClientOrderId);
+                  if (fbExecQty > 0) {
+                    this.sellLimitTimeoutState.delete(symbol);
+                    return {
+                      outcome: fbExecQty >= req.qty * 0.99 ? "FILLED" : "PARTIAL_TERMINAL",
+                      clientOrderId: fallbackClientOrderId,
+                      orderId: fallbackRec.orderId,
+                      executedQty: fbExecQty,
+                      avgPrice: fbAvgPx,
+                      isTerminal: true,
+                      escalatedToMarket: true,
+                    };
+                  }
+                  return {
+                    outcome: "UNFILLED_TERMINAL",
+                    clientOrderId: fallbackClientOrderId,
+                    orderId: fallbackRec.orderId,
+                    executedQty: 0,
+                    avgPrice: fbAvgPx,
+                    isTerminal: true,
+                    escalatedToMarket: true,
+                  };
+                }
+
+                fallbackRec.status = fbExecQty > 0 ? "PARTIALLY_FILLED" : "OPEN";
+                fallbackRec.filledQtyAccounted = fbExecQty;
+                fallbackRec.lastFillPrice = fbAvgPx;
+                fallbackRec.updatedAt = this.nowFn();
+                this.persist(this.getPendingOrders());
+                return {
+                  outcome: fbExecQty > 0 ? "PARTIAL_WORKING" : "OPEN_WORKING",
+                  clientOrderId: fallbackClientOrderId,
+                  orderId: fallbackRec.orderId,
+                  executedQty: fbExecQty,
+                  avgPrice: fbAvgPx,
+                  isTerminal: false,
+                  escalatedToMarket: true,
+                };
+              } catch (fbErr) {
+                const fbErrAny = fbErr as any;
+                if (fbErrAny?.orderId) fallbackRec.orderId = String(fbErrAny.orderId);
+                fallbackRec.status = "OPEN";
+                fallbackRec.updatedAt = this.nowFn();
+                this.persist(this.getPendingOrders());
+                return {
+                  outcome: "ERROR_PENDING_RECONCILE",
+                  error: (fbErr as Error).message,
+                  clientOrderId: fallbackClientOrderId,
+                  orderId: fallbackRec.orderId,
+                  executedQty: 0,
+                  avgPrice: req.refPrice,
+                  isTerminal: false,
+                  escalatedToMarket: true,
+                };
+              }
+            }
+          }
+          // Case C: Non-terminal / pending_cancel / lookup null or error -> keep pendingRec locked (fail-closed)
+        }
+
         return {
           outcome: "ERROR_PENDING_RECONCILE",
           error: (err as Error).message,
@@ -1027,6 +1282,7 @@ export class CoreOrderManager {
           executedQty: 0,
           avgPrice: req.refPrice,
           isTerminal: false,
+          escalatedToMarket,
         };
       }
     } finally {

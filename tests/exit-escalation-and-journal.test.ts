@@ -4,10 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { LearningEngine } from "../src/learning-engine.js";
-import {
-  MaFanPortfolioStrategy,
-  resolveAlpacaExitLimitPrice,
-} from "../src/strategy/ma-fan-portfolio/index.js";
+import { resolveProtectiveSellLimitPrice } from "../src/core/order-manager.js";
+import { MaFanPortfolioStrategy } from "../src/strategy/ma-fan-portfolio/index.js";
 import type { Config } from "../src/config.js";
 import type { LearningJournalRecord, SymbolLearningStateRecord } from "../src/pg-store.js";
 import type {
@@ -146,6 +144,7 @@ function createMockExchange(overrides: Partial<IExchangeClient> = {}): IExchange
     isDex: false,
     hasGasFees: false,
     nativeGasAsset: "USD",
+    usesSimulatedIocLimit: true,
     hasCredentials: () => true,
     syncTime: async () => Date.now(),
     getExchangeInfo: async () => symInfo,
@@ -184,12 +183,12 @@ function createMockExchange(overrides: Partial<IExchangeClient> = {}): IExchange
   };
 }
 
-test("1. resolveAlpacaExitLimitPrice anchors to bestBid and widens protective buffer to -0.5%", () => {
+test("1. resolveProtectiveSellLimitPrice anchors to bestBid and widens protective buffer to -0.5%", () => {
   // Anchors to lower bestBid when within 3% of refPrice
-  assert.equal(resolveAlpacaExitLimitPrice(149.5, 149.2, 0.995, 2), Number((149.2 * 0.995).toFixed(2)));
+  assert.equal(resolveProtectiveSellLimitPrice(149.5, 149.2, 0.995, 2), Number((149.2 * 0.995).toFixed(2)));
   // Falls back to refPrice when bestBid is missing or stale (>3% away)
-  assert.equal(resolveAlpacaExitLimitPrice(149.5, undefined, 0.995, 2), Number((149.5 * 0.995).toFixed(2)));
-  assert.equal(resolveAlpacaExitLimitPrice(149.5, 130.0, 0.995, 2), Number((149.5 * 0.995).toFixed(2)));
+  assert.equal(resolveProtectiveSellLimitPrice(149.5, undefined, 0.995, 2), Number((149.5 * 0.995).toFixed(2)));
+  assert.equal(resolveProtectiveSellLimitPrice(149.5, 130.0, 0.995, 2), Number((149.5 * 0.995).toFixed(2)));
 });
 
 test("2. reconcileJournalFromOrders protects active live slots and skips rounds ended before entry", async () => {

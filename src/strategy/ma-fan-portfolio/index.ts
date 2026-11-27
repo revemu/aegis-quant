@@ -81,24 +81,6 @@ export function resolveAlpacaAvailableExitQty(
 }
 
 /**
- * Computes the protective limit floor price for Alpaca exits, anchoring to live `bestBid`
- * when sane (within 3% of `refPrice`) and applying a `floorBuffer` (default 0.995 = -0.5%).
- */
-export function resolveAlpacaExitLimitPrice(
-  refPrice: number,
-  bestBid?: number,
-  floorBuffer = 0.995,
-  pricePrecision = 2,
-): number {
-  const bid = Number(bestBid || 0);
-  const anchor =
-    bid > 0 && Math.abs(bid - refPrice) / Math.max(1e-9, refPrice) <= 0.03
-      ? Math.min(refPrice, bid)
-      : refPrice;
-  return Number((anchor * floorBuffer).toFixed(pricePrecision || 2));
-}
-
-/**
  * Counts how many closed 15m bars exist strictly after `refBarTime` up to `lastClosedIdx`.
  * Used instead of wall-clock timestamps so US equity overnight (17.5h) and weekend (65.5h) gaps
  * never falsely expire valid active MA-Fan setups.
@@ -156,7 +138,6 @@ export class MaFanPortfolioStrategy implements IStrategy {
   private orderManager: CoreOrderManager;
   private isReconcilingOrders: boolean = false;
   private lastPendingReconcileTs: number = 0;
-  private exitLimitFailState = new Map<string, { count: number; lastFailMs: number; reason: string }>();
 
   private eventListeners: ((event: StrategyEvent) => void)[] = [];
   private isPaused: boolean = true;
@@ -1024,7 +1005,6 @@ export class MaFanPortfolioStrategy implements IStrategy {
       }
     }
 
-    this.exitLimitFailState.delete(slot.symbol);
     this.portfolio.removeSlot(slot.slotIndex);
     if (this.slots.length > 0 && !this.slots.some((s) => s.symbol === this.inspectedSymbol)) {
       this.inspectedSymbol = this.slots[0]!.symbol;
@@ -1187,7 +1167,6 @@ export class MaFanPortfolioStrategy implements IStrategy {
     const isAlpaca = this.exchange.exchangeName === "alpaca";
     const sellRes = this.portfolio.applySellFill(slot, { sellQty, execPrice });
     if (sellRes.boundedQty <= 1e-8) return;
-    this.exitLimitFailState.delete(slot.symbol);
     const { boundedQty, proceeds, exitFee, legPnl } = sellRes;
 
     const isSl = reason.startsWith("SL_");
@@ -2788,19 +2767,6 @@ export class MaFanPortfolioStrategy implements IStrategy {
           reason.startsWith("EMERGENCY") ||
           reason.startsWith("MANUAL") ||
           reason.startsWith("PENDING_EXIT");
-        const prevFail = this.exitLimitFailState.get(slot.symbol);
-        const recentTimeoutFail =
-          Boolean(prevFail) &&
-          Date.now() - prevFail!.lastFailMs <= 120_000 &&
-          prevFail!.reason === reason;
-        const escalateToMarket = isAlpaca && !isUrgentExit && recentTimeoutFail && (prevFail?.count ?? 0) >= 1;
-        const orderType: "MARKET" | "IOC" = isAlpaca && (isUrgentExit || escalateToMarket) ? "MARKET" : "IOC";
-        if (escalateToMarket) {
-          this.log(
-            `⚡ [Slot ${slot.slotIndex + 1} ${slot.symbol}] Escalating Exit (${reason}) to MARKET after prior protective limit timeout`,
-          );
-        }
-        const floorBuffer = isAlpaca ? 0.995 : 0.998;
 
         if (isAlpaca && typeof (this.exchange as any).getAllPositions === "function") {
           const posList = await (this.exchange as any).getAllPositions().catch(() => null);
@@ -2824,28 +2790,18 @@ export class MaFanPortfolioStrategy implements IStrategy {
           }
         }
 
-        const pricePrecision = symInfo.pricePrecision || 2;
-        let limitPrice: number | undefined;
-        if (orderType !== "MARKET") {
-          if (isAlpaca) {
-            const topBook = await this.exchange.getTopOfBook(slot.symbol).catch(() => undefined);
-            limitPrice = resolveAlpacaExitLimitPrice(execPrice, topBook?.bestBid, floorBuffer, pricePrecision);
-          } else {
-            limitPrice = Number((execPrice * floorBuffer).toFixed(pricePrecision));
-          }
-        }
-
         const sellRes = await this.orderManager.submitManagedSell({
           symbol: slot.symbol,
           intent: closeFullSlot ? "EXIT_FULL" : "EXIT_TP1",
-          orderType,
+          orderType: "AUTO",
+          urgent: isUrgentExit,
           qty: sellQty,
-          price: limitPrice,
           refPrice: execPrice,
-          pricePrecision,
+          pricePrecision: symInfo.pricePrecision || 2,
           slotIndex: slot.slotIndex,
           reason,
-          cancelConflictingOpenSells: isUrgentExit || orderType === "MARKET",
+          cancelConflictingOpenSells: isUrgentExit,
+          escalateToMarketOnTimeout: !this.isMarketClosed,
         });
 
         if (sellRes.outcome === "ABORTED_FAIL_CLOSED" || sellRes.outcome === "BLOCKED") {
@@ -2857,63 +2813,11 @@ export class MaFanPortfolioStrategy implements IStrategy {
           this.log(`❌ [Slot ${slot.slotIndex + 1} ${slot.symbol}] Exit (${reason}) unresolved: ${sellRes.error || "error"} — triggering OMS reconcile`);
           await this.reconcileOrderManager(true);
 
-          // Cancel-race protection: if the protective limit filled during cancel/reconcile, treat as resolved
+          // Belt-and-suspenders cancel-race check if OMS reconcile resolved a fill
           const stillHeldSlot = this.slots.find((s) => s.symbol === slot.symbol);
           if (!stillHeldSlot || stillHeldSlot.qty < qtyBeforeAttempt - 1e-6) {
-            this.exitLimitFailState.delete(slot.symbol);
             return true;
           }
-
-          if (isAlpaca && orderType === "IOC" && String(sellRes.error || "").toLowerCase().includes("unfilled within timeout")) {
-            this.exitLimitFailState.set(slot.symbol, {
-              count: (recentTimeoutFail ? prevFail!.count : 0) + 1,
-              lastFailMs: Date.now(),
-              reason,
-            });
-            // Fail-closed: escalate to MARKET only when OMS reconcile confirmed zero open/pending SELL orders
-            if (!this.orderManager.hasBlockingPendingOrder(slot.symbol, "SELL") && !this.isMarketClosed) {
-              const fallbackQty = Math.min(stillHeldSlot.qty, sellQty);
-              if (fallbackQty > 1e-6) {
-                this.log(
-                  `⚡ [Slot ${slot.slotIndex + 1} ${slot.symbol}] Protective limit confirmed CANCELED (0 fill) — escalating Exit (${reason}) to MARKET`,
-                );
-                const fallbackRes = await this.orderManager.submitManagedSell({
-                  symbol: slot.symbol,
-                  intent: closeFullSlot ? "EXIT_FULL" : "EXIT_TP1",
-                  orderType: "MARKET",
-                  qty: fallbackQty,
-                  price: undefined,
-                  refPrice: execPrice,
-                  pricePrecision,
-                  slotIndex: slot.slotIndex,
-                  reason,
-                  cancelConflictingOpenSells: true,
-                });
-                if (fallbackRes.executedQty > 0) {
-                  this.exitLimitFailState.delete(slot.symbol);
-                  const fbOrderId = String(fallbackRes.orderId || fallbackRes.clientOrderId || orderId);
-                  const fbQty = Math.min(stillHeldSlot.qty, fallbackRes.executedQty);
-                  const fbPx = fallbackRes.avgPrice > 0 ? fallbackRes.avgPrice : execPrice;
-                  await this.applySellFillDelta(stillHeldSlot, fbQty, fbPx, fbOrderId, reason, closeFullSlot);
-                  return true;
-                }
-                if (fallbackRes.outcome === "OPEN_WORKING") {
-                  stillHeldSlot.pendingExitOnOpen = true;
-                  stillHeldSlot.pendingExitReason = reason;
-                  this.saveState(true);
-                  this.log(
-                    `⏳ [Slot ${slot.slotIndex + 1} ${slot.symbol}] Escalated MARKET Exit (${reason}) queued on exchange — tracked by OMS & marked Pending Exit.`,
-                  );
-                  return false;
-                }
-                if (fallbackRes.outcome === "ERROR_PENDING_RECONCILE") {
-                  await this.reconcileOrderManager(true);
-                  return false;
-                }
-              }
-            }
-          }
-
           if (isAlpaca && (String(sellRes.error || "").includes("403") || String(sellRes.error || "").includes("422"))) {
             await this.syncOnChainOrders().catch(() => {});
           }

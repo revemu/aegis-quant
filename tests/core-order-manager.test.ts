@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   CoreOrderManager,
   computeDeltaBuyPlan,
+  resolveProtectiveSellLimitPrice,
   type CorePendingOrderRecord,
 } from "../src/core/order-manager.js";
 import type {
@@ -656,4 +657,245 @@ test("6. Partial Fill -> Delta Top-Up respects 15s cooldown then strictly buys r
   const totalValue = (entry.executedQty + topUp.executedQty) * 147.66;
   assert.ok(totalValue > 16660 && totalValue <= targetCap + 0.05);
   assert.ok(submittedQtys[1]! < submittedQtys[0]!); // 2nd buy ordered ONLY delta (~77.87), NOT full ~112.87!
+});
+
+test("7. Core OMS capability-driven exit policy: Bid-Anchor limit, confirmed-cancel MARKET escalation, cancel-race guard, and fail-closed lock", async () => {
+  // Pure helper check
+  assert.equal(resolveProtectiveSellLimitPrice(149.5, 149.2, 0.995, 2), Number((149.2 * 0.995).toFixed(2)));
+  assert.equal(resolveProtectiveSellLimitPrice(149.5, undefined, 0.995, 2), Number((149.5 * 0.995).toFixed(2)));
+  assert.equal(resolveProtectiveSellLimitPrice(149.5, 130.0, 0.995, 2), Number((149.5 * 0.995).toFixed(2)));
+
+  // 7a. Simulated-IOC exchange: Bid-anchor limit -> timeout -> confirmed CANCELED (0 fill) -> immediate MARKET escalation
+  let now = 1_795_820_000_000;
+  const ordersA: PlaceOrderParams[] = [];
+  const omsA = new CoreOrderManager({
+    exchange: createMockExchange({
+      usesSimulatedIocLimit: true,
+      getTopOfBook: async () => ({ bestBid: 149.2, bestAsk: 149.3, mid: 149.25, bidQty: 100, askQty: 100, time: Math.floor(now / 1000) }),
+      getOrder: async (_sym, id) => ({
+        symbol: "NVDA",
+        orderId: id,
+        clientOrderId: "cid",
+        price: 148.45,
+        origQty: 17.5,
+        executedQty: 0,
+        cummulativeQuoteQty: 0,
+        status: "CANCELED",
+        timeInForce: "DAY",
+        type: "LIMIT",
+        side: "SELL",
+        time: Math.floor(now / 1000),
+        updateTime: Math.floor(now / 1000),
+        isWorking: false,
+      }),
+      placeOrder: async (params) => {
+        ordersA.push(params);
+        if (params.type === "IOC") {
+          const err = new Error(`Alpaca protective limit ${params.symbol} @ $${params.price} unfilled within timeout (canceled)`) as any;
+          err.orderId = "ord_ioc_1";
+          err.orderStatus = "canceled";
+          err.isTerminal = true;
+          err.isProtectiveTimeout = true;
+          throw err;
+        }
+        return {
+          symbol: params.symbol,
+          orderId: "ord_mkt_1",
+          clientOrderId: params.clientOrderId || "",
+          transactTime: Math.floor(now / 1000),
+          price: 149.21,
+          origQty: params.qty,
+          executedQty: params.qty,
+          cummulativeQuoteQty: 149.21 * params.qty,
+          status: "FILLED",
+          timeInForce: "DAY",
+          type: "MARKET",
+          side: "SELL",
+        };
+      },
+    }),
+    isDryRun: () => false,
+    nowFn: () => now,
+    persist: () => {},
+  });
+
+  const resA = await omsA.submitManagedSell({
+    symbol: "NVDA",
+    intent: "EXIT_TP1",
+    orderType: "AUTO",
+    qty: 17.5,
+    refPrice: 149.5,
+    pricePrecision: 2,
+    reason: "TP1_EMA25",
+  });
+  assert.equal(resA.outcome, "FILLED");
+  assert.equal(resA.escalatedToMarket, true);
+  assert.equal(ordersA.length, 2);
+  assert.equal(ordersA[0]!.type, "IOC");
+  assert.equal(ordersA[0]!.price, Number((149.2 * 0.995).toFixed(2)));
+  assert.equal(ordersA[1]!.type, "MARKET");
+  assert.notEqual(ordersA[0]!.clientOrderId, ordersA[1]!.clientOrderId);
+  assert.equal(omsA.getPendingOrders().length, 0);
+
+  // 7b. Cancel-race fill: timeout throws, lookup sees FILLED -> ZERO duplicate MARKET order
+  const ordersB: PlaceOrderParams[] = [];
+  const omsB = new CoreOrderManager({
+    exchange: createMockExchange({
+      usesSimulatedIocLimit: true,
+      getOrder: async (_sym, id) => ({
+        symbol: "VOO",
+        orderId: id,
+        clientOrderId: "cid_race",
+        price: 665.51,
+        origQty: 3,
+        executedQty: 3,
+        cummulativeQuoteQty: 665.51 * 3,
+        status: "FILLED",
+        timeInForce: "DAY",
+        type: "LIMIT",
+        side: "SELL",
+        time: Math.floor(now / 1000),
+        updateTime: Math.floor(now / 1000),
+        isWorking: false,
+      }),
+      placeOrder: async (params) => {
+        ordersB.push(params);
+        const err = new Error("Alpaca protective limit unfilled within timeout (new)") as any;
+        err.orderId = "ord_race";
+        err.isProtectiveTimeout = true;
+        throw err;
+      },
+    }),
+    isDryRun: () => false,
+    nowFn: () => now,
+    persist: () => {},
+  });
+  const resB = await omsB.submitManagedSell({
+    symbol: "VOO",
+    intent: "EXIT_TP1",
+    orderType: "AUTO",
+    qty: 3,
+    refPrice: 665.5,
+    pricePrecision: 2,
+    reason: "TP1_EMA25",
+  });
+  assert.equal(resB.outcome, "FILLED");
+  assert.equal(resB.executedQty, 3);
+  assert.equal(ordersB.length, 1);
+  assert.equal(omsB.getPendingOrders().length, 0);
+
+  // 7c. Non-terminal after timeout (still NEW/working) -> fail-closed lock, NO MARKET order until reconciled CANCELED; then next call escalates immediately
+  let workingOnEx = true;
+  const ordersC: PlaceOrderParams[] = [];
+  const omsC = new CoreOrderManager({
+    exchange: createMockExchange({
+      usesSimulatedIocLimit: true,
+      getOrder: async (_sym, id) => ({
+        symbol: "XOM",
+        orderId: id,
+        clientOrderId: "cid_xom",
+        price: 160.2,
+        origQty: 10,
+        executedQty: 0,
+        cummulativeQuoteQty: 0,
+        status: workingOnEx ? "NEW" : "CANCELED",
+        timeInForce: "DAY",
+        type: "LIMIT",
+        side: "SELL",
+        time: Math.floor(now / 1000),
+        updateTime: Math.floor(now / 1000),
+        isWorking: workingOnEx,
+      }),
+      placeOrder: async (params) => {
+        ordersC.push(params);
+        if (params.type === "IOC") {
+          const err = new Error("Alpaca protective limit unfilled within timeout (new)") as any;
+          err.orderId = "ord_xom_1";
+          err.isProtectiveTimeout = true;
+          throw err;
+        }
+        return {
+          symbol: params.symbol,
+          orderId: "ord_xom_mkt",
+          clientOrderId: params.clientOrderId || "",
+          transactTime: Math.floor(now / 1000),
+          price: 160.9,
+          origQty: params.qty,
+          executedQty: params.qty,
+          cummulativeQuoteQty: 160.9 * params.qty,
+          status: "FILLED",
+          timeInForce: "DAY",
+          type: "MARKET",
+          side: "SELL",
+        };
+      },
+    }),
+    isDryRun: () => false,
+    nowFn: () => now,
+    persist: () => {},
+  });
+
+  const resC1 = await omsC.submitManagedSell({
+    symbol: "XOM",
+    intent: "EXIT_TP1",
+    orderType: "AUTO",
+    qty: 10,
+    refPrice: 161.0,
+    pricePrecision: 2,
+    reason: "TP1_EMA25",
+  });
+  assert.equal(resC1.outcome, "ERROR_PENDING_RECONCILE");
+  assert.equal(ordersC.length, 1); // Fail-closed: did NOT fire MARKET while order still working
+  assert.equal(omsC.hasBlockingPendingOrder("XOM", "SELL"), true);
+
+  // Reconcile resolves terminal CANCELED -> next call within 120s goes straight to MARKET
+  workingOnEx = false;
+  await omsC.reconcilePendingOrders();
+  assert.equal(omsC.hasBlockingPendingOrder("XOM", "SELL"), false);
+
+  now += 5_000;
+  const resC2 = await omsC.submitManagedSell({
+    symbol: "XOM",
+    intent: "EXIT_TP1",
+    orderType: "AUTO",
+    qty: 10,
+    refPrice: 161.0,
+    pricePrecision: 2,
+    reason: "TP1_EMA25",
+  });
+  assert.equal(resC2.outcome, "FILLED");
+  assert.equal(resC2.escalatedToMarket, true);
+  assert.equal(ordersC.length, 2);
+  assert.equal(ordersC[1]!.type, "MARKET");
+
+  // 7d. Native-IOC exchange (usesSimulatedIocLimit: false) -> uses refPrice * 0.998 and does NOT escalate to MARKET
+  const ordersD: PlaceOrderParams[] = [];
+  const omsD = new CoreOrderManager({
+    exchange: createMockExchange({
+      exchangeName: "binance",
+      usesSimulatedIocLimit: false,
+      placeOrder: async (params) => {
+        ordersD.push(params);
+        const err = new Error("unfilled within timeout") as any;
+        err.orderId = "ord_bin_1";
+        throw err;
+      },
+    }),
+    isDryRun: () => false,
+    nowFn: () => now,
+    persist: () => {},
+  });
+  const resD = await omsD.submitManagedSell({
+    symbol: "BTCUSDT",
+    intent: "EXIT_TP1",
+    orderType: "AUTO",
+    qty: 0.1,
+    refPrice: 60_000,
+    pricePrecision: 2,
+    reason: "TP1_EMA200",
+  });
+  assert.equal(resD.outcome, "ERROR_PENDING_RECONCILE");
+  assert.equal(ordersD.length, 1);
+  assert.equal(ordersD[0]!.type, "IOC");
+  assert.equal(ordersD[0]!.price, 59880);
 });

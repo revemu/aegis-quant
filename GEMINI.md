@@ -10499,3 +10499,19 @@ When investigating live production behavior, debugging issues, or analyzing trad
   4. **Unit Tests ([`tests/exit-escalation-and-journal.test.ts`](file:///c:/Sites/github/aegis-quant/tests/exit-escalation-and-journal.test.ts))**:
      - ทดสอบครบ 5 ชุด (Protective limit bid-anchor, Active-slot protection, Journal backfill idempotency, Survival Guard reason alignment, และ Alpaca timeout -> MARKET escalation + cancel-race guard)
 - **Version Bump**: **`0.3.1.25`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 370. Capability-Driven Core OMS Exit Escalation (`v0.3.1.26`)
+- **ปัญหาเชิงสถาปัตยกรรม**: ใน `v0.3.1.25` ตรรกะ Bid-Anchor protective limit, Cancel-Race check, และ Fail-Closed `IOC -> MARKET` Escalation ยังถูกวางไว้ใน `executeExitSlot` ของ `MaFanPortfolioStrategy` พร้อมเช็ก `if (isAlpaca)` ทำให้กลยุทธ์อื่นหรือ Adapter อื่นที่มีพฤติกรรม Simulated-IOC ไม่ได้รับกลไกนี้ร่วมกัน
+- **สิ่งที่แก้ไข (`v0.3.1.26`)**:
+  1. **Exchange Capability Flag ([`src/exchange/types.ts`](file:///c:/Sites/github/aegis-quant/src/exchange/types.ts#L139-L146), [`src/exchange/alpaca/client.ts`](file:///c:/Sites/github/aegis-quant/src/exchange/alpaca/client.ts#L96-L97))**:
+     - เพิ่ม `usesSimulatedIocLimit?: boolean` บน `IExchangeClient` (ตั้งเป็น `true` บน `AlpacaClient`) และแนบ `err.isProtectiveTimeout = true` เมื่อคำสั่ง protective limit หมดเวลาไม่แมตช์
+  2. **Core OMS Exit Policy & Fail-Closed Escalation ([`src/core/order-manager.ts`](file:///c:/Sites/github/aegis-quant/src/core/order-manager.ts))**:
+     - ย้าย `resolveProtectiveSellLimitPrice`, `sellLimitTimeoutState` (120 วินาที, เคลียร์อัตโนมัติเมื่อ fill/reconcile), Bid-Anchor limit pricing (`-0.5%`), Cancel-Race fill verification, และ Fail-Closed `MARKET` escalation เข้าสู่ `CoreOrderManager.submitManagedSell` โดยรองรับ `orderType: "AUTO"` + `urgent` + `escalateToMarketOnTimeout`
+     - ยืนยันหลักการ **Fail-Closed 100%**: หากหลัง timeout แล้ว `lookupPendingOrderOnExchange` ยังพบสถานะ working (`NEW`/`pending_cancel`), error หรือ `null` ระบบจะคงล็อกใน `pendingOrders` และไม่ส่ง `MARKET` ซ้ำ จะสลับเป็น `MARKET` ก็ต่อเมื่อยืนยันสถานะ terminal (`CANCELED`/`EXPIRED`/`REJECTED`) ด้วย `0` fill แล้วเท่านั้น
+  3. **Clean Strategy Layer ([`src/strategy/ma-fan-portfolio/index.ts`](file:///c:/Sites/github/aegis-quant/src/strategy/ma-fan-portfolio/index.ts#L2763-L2835))**:
+     - ถอด `resolveAlpacaExitLimitPrice` และ `exitLimitFailState` ออกจาก Strategy Layer ทั้งหมด ให้ `executeExitSlot` ส่งแค่เจตนา (`orderType: "AUTO"`, `urgent: isUrgentExit`) เข้า `this.orderManager.submitManagedSell(...)`
+  4. **Unit Tests ([`tests/core-order-manager.test.ts`](file:///c:/Sites/github/aegis-quant/tests/core-order-manager.test.ts#L661-L899), [`tests/exit-escalation-and-journal.test.ts`](file:///c:/Sites/github/aegis-quant/tests/exit-escalation-and-journal.test.ts))**:
+     - เพิ่ม Test 7 ใน `core-order-manager.test.ts` ทดสอบครบทั้ง Simulated-IOC Bid-Anchor + Timeout -> MARKET Escalation, Cancel-Race guard, Non-terminal Fail-Closed lock, และ Native-IOC non-escalation
+- **Version Bump**: **`0.3.1.26`** (`package.json`, `src/version.ts`, `public/index.html`)

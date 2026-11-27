@@ -137,6 +137,13 @@ export interface IExchangeClient {
   readonly hasGasFees: boolean;
   readonly nativeGasAsset?: string;
   readonly supportsOrderExpiry?: boolean;
+  /**
+   * True when the adapter simulates "IOC" orders via timed DAY limit + cancel
+   * (e.g. Alpaca fractional equities) rather than atomic exchange-native IOC.
+   * Core OMS uses this flag to anchor protective exit limits to live `bestBid`
+   * and perform fail-closed MARKET escalation after confirmed 0-fill timeouts.
+   */
+  readonly usesSimulatedIocLimit?: boolean;
   onGasSpent?: (fee: number, label: string, txHash?: string) => void;
   hasCredentials(): boolean;
   syncTime(): Promise<number>;
