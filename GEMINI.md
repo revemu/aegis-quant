@@ -10479,3 +10479,23 @@ When investigating live production behavior, debugging issues, or analyzing trad
   3. **Refactor `MaFanPortfolioStrategy` ([`src/strategy/ma-fan-portfolio/index.ts`](file:///c:/Sites/github/aegis-quant/src/strategy/ma-fan-portfolio/index.ts))**: ถอด state และคณิตศาสตร์พอร์ตที่ซ้ำซ้อนออกทั้งหมด ไปใช้ `this.portfolio` (`CorePortfolioManager`) และ `computeSlotEntryBudget`
   4. **Unit Tests ([`tests/core-portfolio-manager.test.ts`](file:///c:/Sites/github/aegis-quant/tests/core-portfolio-manager.test.ts))**: ทดสอบครบ 6 ชุด (Budget & 1.25x anchor, Q4 ATR & cash clamp sizing, VWAP Buy/Top-Up ledger, Pro-rata Sell & fee/cash reconciliation, Exchange position sync & adopt recovery, State round-trip & reset)
 - **Version Bump**: **`0.3.1.24`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 369. Alpaca Exit Market Escalation, Active-Slot Journal Sync & Survival Reason Alignment (`v0.3.1.25`)
+- **สาเหตุของปัญหา (พบจากการตรวจ Live Production `alpaca_kyne`)**:
+  1. **Protective Limit Exit Timeout Storm (`src/strategy/ma-fan-portfolio/index.ts`)**: คำสั่งขาย `TP1_EMA25` บน Alpaca ส่งเป็น Protective Limit (`refPrice * 0.997`) ซึ่งในช่วงตลาด US เปิดมีโอกาสไม่แมตช์ภายใน timeout 3.8 วินาที จึงถูก cancel ซ้ำหลายรอบ (เช่น `VOO`/`NVDA` รวม 21 ครั้ง) และทำให้ `NVDA` พลาดปิดกำไร TP1 ก่อนกลับตัวโดน `SL_BREAKEVEN`
+  2. **Learning Journal `openTrades` ขาดจาก Slot จริง (`src/learning-engine.ts`)**: Slot ที่เข้าผ่าน `Reconciled Buy Fill` หรือมีรหัสบัญชีแยกจากรอบก่อนอาจไม่ถูกบันทึก/ผูกใน `trade_learning_journal` และ `reconcileJournalFromOrders` เดิมไม่ได้กันการปิด row ของ Slot ที่ยังเปิดอยู่จริงหากชนกับรอบเก่าภายใน 24 ชม.
+  3. **Survival Guard Reason Mismatch (`src/learning-engine.ts`)**: เมื่อ `DEFENSIVE` ถูกทริกเกอร์จาก `Rolling DD >= 4%` เพียงอย่างเดียว แต่บังเอิญ `bothMacroFail` เป็นจริงพร้อม Breadth สูง (`85%`) โค้ดเดิมยังพิมพ์ `"SPY 4H+1D bear & Breadth 85%"` ปนออกมา
+- **สิ่งที่แก้ไข (`v0.3.1.25`)**:
+  1. **Alpaca Protective Limit Anchor + Fail-Closed Market Escalation ([`src/strategy/ma-fan-portfolio/index.ts`](file:///c:/Sites/github/aegis-quant/src/strategy/ma-fan-portfolio/index.ts))**:
+     - เพิ่ม `resolveAlpacaExitLimitPrice` เพื่อยึดราคา `bestBid` จริง (เมื่อต่างจาก `refPrice` ไม่เกิน 3%) พร้อมขยาย protective buffer เป็น `-0.5%` (`0.995`)
+     - หลัง `ERROR_PENDING_RECONCILE` และรัน `reconcileOrderManager(true)` แล้ว: ตรวจสอบ Cancel-Race Fill ก่อน (ถ้า `slot.qty` ลดลงแล้วให้ถือว่าปิดสำเร็จ ห้ามขายซ้ำ), และหาก OMS ยืนยันว่าออเดอร์เป็น `CANCELED` (`0` fill) แล้วโดยไม่มี `hasBlockingPendingOrder(symbol, "SELL")` ให้ส่ง `MARKET` exit ต่อทันที พร้อมจำ `exitLimitFailState` 120 วินาที
+  2. **Active-Slot Journal Sync & Protection ([`src/learning-engine.ts`](file:///c:/Sites/github/aegis-quant/src/learning-engine.ts), [`src/strategy/ma-fan-portfolio/index.ts`](file:///c:/Sites/github/aegis-quant/src/strategy/ma-fan-portfolio/index.ts))**:
+     - เพิ่ม `ensureActiveSlotsInJournal` เพื่อผูกหรือ backfill `trade_learning_journal` (`OPEN`) ให้ตรงกับทุก Slot ที่ถืออยู่จริงบน `reconcileAndRunInitialShadow` และ `reconcileLearningJournal`
+     - อัปเดต `reconcileJournalFromOrders(exchange, activeSlots)` ให้ข้าม row ที่ตรงกับ `activeSlots` ที่ยังเปิดอยู่ และกรองรอบปิดที่ `endTime < jEntryMs - 15m` ออกจาก fallback 24h
+  3. **Survival Guard Reason Alignment ([`src/learning-engine.ts`](file:///c:/Sites/github/aegis-quant/src/learning-engine.ts))**:
+     - แยกเงื่อนไข `defensiveMacroTrigger` และ `cautiousTrapTrigger` เพื่อให้แสดงเหตุผล macro bear-breadth เฉพาะเมื่อ macro+breadth เป็นตัวทริกเกอร์จริง
+  4. **Unit Tests ([`tests/exit-escalation-and-journal.test.ts`](file:///c:/Sites/github/aegis-quant/tests/exit-escalation-and-journal.test.ts))**:
+     - ทดสอบครบ 5 ชุด (Protective limit bid-anchor, Active-slot protection, Journal backfill idempotency, Survival Guard reason alignment, และ Alpaca timeout -> MARKET escalation + cancel-race guard)
+- **Version Bump**: **`0.3.1.25`** (`package.json`, `src/version.ts`, `public/index.html`)

@@ -2649,6 +2649,72 @@ export class LearningEngine {
     return evaluatedCount;
   }
 
+  public async ensureActiveSlotsInJournal(params: {
+    exchange: string;
+    slots: Array<{
+      slotIndex: number;
+      symbol: string;
+      entryTime: number;
+      entryPrice: number;
+      qty: number;
+      initialQty?: number;
+      allocatedCapital: number;
+      learningJournalUid?: string;
+    }>;
+    radarList?: PortfolioRadarCandidate[];
+    macro?: PortfolioMacroState;
+  }): Promise<number> {
+    const pg = this.getPg();
+    if (!pg || params.slots.length === 0) return 0;
+
+    const exLower = params.exchange.toLowerCase();
+    const openRows = (await pg.loadLearningJournal("TRADE", "OPEN", 200).catch(() => [] as LearningJournalRecord[]))
+      .filter((r) => r.exchange.toLowerCase() === exLower);
+    const claimedUids = new Set<string>();
+    let changed = 0;
+
+    for (const slot of params.slots) {
+      const cleanSym = slot.symbol.toUpperCase().replace(/[\/\-_:]/g, "");
+      const slotEntryMs = normalizeTsMs(slot.entryTime);
+      let matched = slot.learningJournalUid
+        ? openRows.find((r) => !claimedUids.has(r.journalUid) && r.journalUid === slot.learningJournalUid)
+        : undefined;
+      if (!matched) {
+        matched = openRows.find((r) => {
+          if (claimedUids.has(r.journalUid)) return false;
+          const rSym = r.symbol.toUpperCase().replace(/[\/\-_:]/g, "");
+          return rSym === cleanSym && Math.abs(normalizeTsMs(r.entryTimeMs) - slotEntryMs) <= 30 * 60_000;
+        });
+      }
+
+      if (matched) {
+        claimedUids.add(matched.journalUid);
+        if (slot.learningJournalUid !== matched.journalUid) {
+          slot.learningJournalUid = matched.journalUid;
+          changed++;
+        }
+      } else {
+        const uid = await this.onPortfolioEntry({
+          exchange: params.exchange,
+          symbol: slot.symbol,
+          slotIndex: slot.slotIndex,
+          entryTimeMs: slotEntryMs,
+          entryPrice: slot.entryPrice,
+          signalPrice: slot.entryPrice,
+          qty: slot.initialQty && slot.initialQty > 0 ? slot.initialQty : slot.qty,
+          allocatedQuote: slot.allocatedCapital,
+          snapshot: params.radarList?.find((r) => r.symbol === slot.symbol),
+          macro: params.macro,
+          score: 0,
+        });
+        claimedUids.add(uid);
+        slot.learningJournalUid = uid;
+        changed++;
+      }
+    }
+    return changed;
+  }
+
   /**
    * Synchronize `trade_learning_journal` closed TRADE rows & `symbol_learning_state`
    * against reconciled exchange trade rounds in `BotDatabase` so inaccurate pre-sync
@@ -2656,6 +2722,7 @@ export class LearningEngine {
    */
   public async reconcileJournalFromOrders(
     exchange: string,
+    activeSlots?: Array<{ symbol: string; learningJournalUid?: string; entryTime: number }>,
   ): Promise<{ updatedTrades: number; updatedSymbols: number }> {
     const pg = this.getPg();
     if (!pg) return { updatedTrades: 0, updatedSymbols: 0 };
@@ -2671,6 +2738,17 @@ export class LearningEngine {
     const filteredJournal = journalTrades.filter((j) => j.exchange.toLowerCase() === exLower);
     if (filteredJournal.length === 0) return { updatedTrades: 0, updatedSymbols: 0 };
 
+    const activeUids = new Set<string>();
+    const activeEntriesBySym = new Map<string, number[]>();
+    for (const s of activeSlots ?? []) {
+      if (s.learningJournalUid) activeUids.add(s.learningJournalUid);
+      const cleanActiveSym = s.symbol.toUpperCase().replace(/[\/\-_:]/g, "");
+      if (!cleanActiveSym) continue;
+      const list = activeEntriesBySym.get(cleanActiveSym) || [];
+      list.push(normalizeTsMs(s.entryTime));
+      activeEntriesBySym.set(cleanActiveSym, list);
+    }
+
     const roundsBySym = new Map<string, typeof closedRounds>();
     for (const r of closedRounds) {
       const sym = String((r as any).symbol || "").toUpperCase().replace(/[\/\-_:]/g, "");
@@ -2685,10 +2763,17 @@ export class LearningEngine {
 
     for (const j of filteredJournal) {
       const cleanSym = j.symbol.toUpperCase().replace(/[\/\-_:]/g, "");
+      const jEntryMs = normalizeTsMs(j.entryTimeMs);
+      if (j.status !== "CLOSED") {
+        const isLiveSlot =
+          activeUids.has(j.journalUid) ||
+          Boolean(activeEntriesBySym.get(cleanSym)?.some((t) => Math.abs(jEntryMs - t) <= 30 * 60_000));
+        if (isLiveSlot) continue;
+      }
+
       const symRounds = roundsBySym.get(cleanSym);
       if (!symRounds || symRounds.length === 0) continue;
 
-      const jEntryMs = normalizeTsMs(j.entryTimeMs);
       let matched = symRounds.find((r) => {
         const sMs = normalizeTsMs(r.startTime);
         const eMs = normalizeTsMs(r.endTime || r.startTime);
@@ -2697,6 +2782,7 @@ export class LearningEngine {
 
       if (!matched) {
         const sameDay = symRounds
+          .filter((r) => normalizeTsMs(r.endTime || r.startTime) >= jEntryMs - 15 * 60_000)
           .map((r) => ({ r, diff: Math.abs(jEntryMs - normalizeTsMs(r.startTime)) }))
           .filter((x) => x.diff <= 24 * 3_600_000)
           .sort((a, b) => a.diff - b.diff);
@@ -3776,6 +3862,10 @@ export class LearningEngine {
     const reasons: string[] = [];
 
     const capPresStreakTrigger = recentConsecutiveLosses >= 4 && (lastLossWithin24h || !recoveryOk);
+    const defensiveMacroTrigger =
+      (bothMacroFail && breadth < 25 && (shadowBearNegative || blockedTrapHigh)) ||
+      (bothMacroFail && breadth < 20);
+    const cautiousTrapTrigger = bothMacroFail && blockedTrapHigh;
     if (rollingDrawdownPct >= 7.0 || capPresStreakTrigger) {
       posture = "CAPITAL_PRESERVATION";
       effectiveMaxSlots = 0;
@@ -3789,8 +3879,7 @@ export class LearningEngine {
     } else if (
       rollingDrawdownPct >= 4.0 ||
       recentConsecutiveLosses >= 3 ||
-      (bothMacroFail && breadth < 25 && (shadowBearNegative || blockedTrapHigh)) ||
-      (bothMacroFail && breadth < 20)
+      defensiveMacroTrigger
     ) {
       posture = "DEFENSIVE";
       effectiveMaxSlots = Math.min(configuredMaxSlots, 1);
@@ -3801,14 +3890,16 @@ export class LearningEngine {
       blockRiskySymbols = true;
       if (rollingDrawdownPct >= 4.0) reasons.push(`Rolling DD ${rollingDrawdownPct.toFixed(1)}% >= 4%`);
       if (recentConsecutiveLosses >= 3) reasons.push(`${recentConsecutiveLosses} consecutive losses`);
-      if (bothMacroFail) reasons.push(`${params.macro.benchmarkSymbol} 4H+1D bear & Breadth ${breadth.toFixed(0)}%`);
-      if (shadowBearNegative) reasons.push(`Shadow BearAvg ${bearMacroAvgPnl!.toFixed(2)}%`);
-      if (blockedTrapHigh) reasons.push(`Trap rate ${this.recentBlockedStats!.loseRatePct.toFixed(0)}%`);
+      if (defensiveMacroTrigger) {
+        reasons.push(`${params.macro.benchmarkSymbol} 4H+1D bear & Breadth ${breadth.toFixed(0)}%`);
+        if (shadowBearNegative) reasons.push(`Shadow BearAvg ${bearMacroAvgPnl!.toFixed(2)}%`);
+        if (blockedTrapHigh) reasons.push(`Trap rate ${this.recentBlockedStats!.loseRatePct.toFixed(0)}%`);
+      }
     } else if (
       recentConsecutiveLosses >= 2 ||
       rollingDrawdownPct >= 2.5 ||
       (breadth < 35 && (!pass4h || !pass1d)) ||
-      (bothMacroFail && blockedTrapHigh)
+      cautiousTrapTrigger
     ) {
       posture = "CAUTIOUS";
       effectiveMaxSlots = Math.max(1, Math.min(configuredMaxSlots, configuredMaxSlots - 1));
@@ -3822,7 +3913,7 @@ export class LearningEngine {
       if (breadth < 35 && (!pass4h || !pass1d)) {
         reasons.push(`Weak breadth ${breadth.toFixed(0)}% (<35%)`);
       }
-      if (blockedTrapHigh) reasons.push(`Blocked signal lose rate ${this.recentBlockedStats!.loseRatePct.toFixed(0)}%`);
+      if (cautiousTrapTrigger) reasons.push(`Blocked signal lose rate ${this.recentBlockedStats!.loseRatePct.toFixed(0)}%`);
     } else {
       reasons.push("Regime & portfolio metrics healthy");
     }
