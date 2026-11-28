@@ -27,6 +27,10 @@ This document is the persistent operational and architectural knowledge base for
 >     - Portfolio Radar: `GET /i/<instanceKey>/api/portfolio/radar`
 >     - Learning Report: `GET /i/<instanceKey>/api/learning/report`
 >     - Trades DB: `GET /i/<instanceKey>/api/db/trades`
+> - **SSH Deploy Target (`aegis-prod`)**:
+>   - SSH Alias: `aegis-prod` (key-based auth configured locally in `~/.ssh/config`; **ห้ามเก็บ private key/รหัสผ่าน/token ลงใน repo เด็ดขาด**)
+>   - Project Path: `/home/kyne/trade/aegis-quant` (branch `main`, Node `v20`, PostgreSQL 18)
+>   - PM2 Process Name: **`aegis-quant`** (`npm run orchestrator`) — **STRICT PM2 SAFETY**: สั่งจัดการได้เฉพาะ `aegis-quant` (เช่น `pm2 restart aegis-quant`) เท่านั้น และทำเฉพาะเมื่อผู้ใช้สั่งตรงๆ ห้ามรัน `pm2 kill`, `pm2 delete all`, หรือแตะต้อง process อื่นบนเครื่อง (เช่น `exthot`) เด็ดขาด
 >
 > ⚠️ **STRICT INVESTIGATION & CONFIG GUARDRAILS**:
 > 1. **ต้องดึงสถานะสดจาก Orchestrator เสมอ**: เมื่อผู้ใช้ถามสถานะ แจ้งปัญหา หรือส่งรูปภาพ ต้องล็อกอินด้วย `.env` (`ORCH_URL` / `ORCH_USERNAME` / `ORCH_PASSWORD`) แล้วดึงข้อมูลจาก `/api/orch/instances` และ `/i/<instanceKey>/api/*` เสมอ ห้ามสรุปจากไฟล์บนเครื่อง Local เด็ดขาด
