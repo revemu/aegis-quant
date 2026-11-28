@@ -10519,3 +10519,21 @@ When investigating live production behavior, debugging issues, or analyzing trad
   4. **Unit Tests ([`tests/core-order-manager.test.ts`](file:///c:/Sites/github/aegis-quant/tests/core-order-manager.test.ts#L661-L899), [`tests/exit-escalation-and-journal.test.ts`](file:///c:/Sites/github/aegis-quant/tests/exit-escalation-and-journal.test.ts))**:
      - เพิ่ม Test 7 ใน `core-order-manager.test.ts` ทดสอบครบทั้ง Simulated-IOC Bid-Anchor + Timeout -> MARKET Escalation, Cancel-Race guard, Non-terminal Fail-Closed lock, และ Native-IOC non-escalation
 - **Version Bump**: **`0.3.1.26`** (`package.json`, `src/version.ts`, `public/index.html`)
+
+---
+
+## 371. Quant Q6 Closed-Loop OOS Context Gate Promotion & Factor Lab CLI (`v0.3.1.27`)
+- **แรงบันดาลใจและการคัดกรองจาก AI Quant Desk**:
+  - นำแนวคิด **Hypothesis ➔ OOS Validation ➔ Auto-Promote / Auto-Demote Loop** (แบบ `RD-Agent`) มาสร้างลงบนเอนจิน Zero-Lookahead ของ `aegis-quant` โดยตรง (ไม่พึ่ง LLM ในการยิงออเดอร์และไม่ใช้ Qlib Daily engine ที่ไม่ตรงกับระบบ Intraday 15m + OMS)
+- **สิ่งที่เพิ่มเข้ามา (`v0.3.1.27`)**:
+  1. **Single-Source-of-Truth Context Gate Engine ([`src/quant-learning-analytics.ts`](file:///c:/Sites/github/aegis-quant/src/quant-learning-analytics.ts))**:
+     - ขยาย Rule Library ใน `getContextGateRuleDefs()` เพิ่ม `ATR_SQUEEZE` (`<0.75x ATR96`) และ `FRESH_BOTTOM_LOW` (`<1.5%` จาก bottom low สำหรับคริปโต)
+     - เพิ่ม `evaluateLiveContextGates()` ใช้ predicate ชุดเดียวกับ `evaluateContextGatesOos()` (Zero research-vs-live drift) และบังคับใช้เฉพาะกฎที่ได้สถานะ `PROMOTE_READY` ทั้ง Train 70% + OOS Test 30% (ถ้า OOS ตกเมื่อไร ระบบ Demote อัตโนมัติทันที)
+  2. **Closed-Loop Integration & 4 Enforcement Modes ([`src/config.ts`](file:///c:/Sites/github/aegis-quant/src/config.ts), [`src/learning-engine.ts`](file:///c:/Sites/github/aegis-quant/src/learning-engine.ts), [`src/strategy/ma-fan-portfolio/index.ts`](file:///c:/Sites/github/aegis-quant/src/strategy/ma-fan-portfolio/index.ts))**:
+     - เพิ่ม `portfolioQuantContextGateMode`: `"off" | "observe" | "auto_half_size" | "auto_enforce"` (ค่าเริ่มต้น `"auto_half_size"` — ลดขนาดไม้เหลือ `0.5x` เมื่อเข้าเงื่อนไข `PROMOTE_READY` เช่น `USD_SURGE`, `NEGATIVE_ALPHA`, `ISOLATED_CONCURRENCY`)
+     - เชื่อม `barReadySymbols` (นับ concurrency ระดับแท่ง 15m ให้ตรง Shadow), บันทึก `SHADOW_CTX_*` / `FILTER:CTX_*` ลง counterfactual journal, และเปิดเผย `activePromotedContextGates` ใน `/api/learning/report`
+  3. **Offline Quant Factor Lab CLI ([`src/research/factor-lab.ts`](file:///c:/Sites/github/aegis-quant/src/research/factor-lab.ts), [`package.json`](file:///c:/Sites/github/aegis-quant/package.json))**:
+     - เพิ่มสคริปต์ `npm run research:factors` (Read-Only) ดึง Train/OOS Baseline, Factor Rank IC Leaderboard, Context Gate OOS Tournament, และ Blocked-Signal Counterfactuals จาก Orchestrator มาแสดงผลเป็นตารางวิเคราะห์
+  4. **Unit Tests ([`tests/quant-context-gates.test.ts`](file:///c:/Sites/github/aegis-quant/tests/quant-context-gates.test.ts))**:
+     - ทดสอบ `ATR_SQUEEZE` / `FRESH_BOTTOM_LOW` บน 70/30 OOS split, โหมด `off` / `observe` / `auto_half_size` / `auto_enforce`, auto-demotion, และ `normalizeBlockReasonKey`
+- **Version Bump**: **`0.3.1.27`** (`package.json`, `src/version.ts`, `public/index.html`)

@@ -980,7 +980,173 @@ function getContextGateRuleDefs(): ContextGateRuleDef[] {
       market: "all",
       matches: (r) => r.subBarPathShape === "FADE_TOP",
     },
+    {
+      id: "ATR_SQUEEZE",
+      label: "ATR Squeeze (<0.75x ATR96)",
+      market: "all",
+      matches: (r) => r.atrCompressionRatio !== null && r.atrCompressionRatio < 0.75,
+    },
+    {
+      id: "FRESH_BOTTOM_LOW",
+      label: "Unconfirmed Bottom (<1.5% from low)",
+      market: "crypto",
+      matches: (r) => r.distFromBottomLowPct < 1.5,
+    },
   ];
+}
+
+export type ContextGateEnforcementMode = "off" | "observe" | "auto_half_size" | "auto_enforce";
+
+export interface LiveContextGateInput {
+  usdRet5dPct: number | null;
+  betaAlpha24h: number | null;
+  atrCompressionRatio: number | null;
+  concurrentSignals: number;
+  vwapDistPct: number | null;
+  distFromBottomLowPct: number;
+  sessionBucket: string;
+  macroEventDay: boolean;
+  macroEventInWindow: boolean;
+  oiDelta4hPct: number | null;
+  takerBuyPct12: number | null;
+  perpBasisBps: number | null;
+  overnightGapPct: number | null;
+  subBarPathShape: string | null;
+}
+
+export interface LiveContextGateDecision {
+  mode: ContextGateEnforcementMode;
+  action: "ALLOW" | "HALF_SIZE" | "BLOCK";
+  sizeMultiplier: number;
+  triggeredRules: Array<{
+    id: string;
+    label: string;
+    recommendedAction: ContextGateRuleResult["recommendedAction"];
+    appliedAction: "OBSERVE" | "HALF_SIZE" | "BLOCK";
+    reason: string;
+  }>;
+  primaryBlockReason: string | null;
+}
+
+/**
+ * Closed-loop live Context Gate evaluator using the exact same causal predicates as
+ * `evaluateContextGatesOos`, enforcing ONLY rules currently marked `PROMOTE_READY`.
+ */
+export function evaluateLiveContextGates(params: {
+  promotedRules: ContextGateRuleResult[];
+  mode: ContextGateEnforcementMode;
+  exchange: string;
+  input: LiveContextGateInput;
+}): LiveContextGateDecision {
+  const mode = params.mode;
+  if (mode === "off") {
+    return { mode, action: "ALLOW", sizeMultiplier: 1.0, triggeredRules: [], primaryBlockReason: null };
+  }
+
+  const promoted = (params.promotedRules || []).filter((r) => r.status === "PROMOTE_READY");
+  if (promoted.length === 0) {
+    return { mode, action: "ALLOW", sizeMultiplier: 1.0, triggeredRules: [], primaryBlockReason: null };
+  }
+
+  const isAlpaca = params.exchange.toLowerCase() === "alpaca";
+  const defMap = new Map(getContextGateRuleDefs().map((d) => [d.id, d]));
+  const inp = params.input;
+  const evalRecord: AdvancedQuantSetupRecord = {
+    entryTimeSec: 0,
+    symbol: "",
+    pnlPct: 0,
+    score: 0,
+    buyVolRatio12: 0,
+    rawRs24h: 0,
+    betaAlpha24h: inp.betaAlpha24h,
+    rsi1h: 50,
+    atrCompressionRatio: inp.atrCompressionRatio,
+    distFromBottomLowPct: inp.distFromBottomLowPct,
+    upperWickRatioPct: 0,
+    breadthDelta4h: 0,
+    concurrentSignals: inp.concurrentSignals,
+    usdRet5dPct: inp.usdRet5dPct,
+    sessionBucket: inp.sessionBucket,
+    vwapDistPct: inp.vwapDistPct,
+    overnightGapPct: inp.overnightGapPct,
+    sectorName: null,
+    sectorBreadthPct: null,
+    takerBuyPct12: inp.takerBuyPct12,
+    oiDelta4hPct: inp.oiDelta4hPct,
+    fundingRateBps: null,
+    perpBasisBps: inp.perpBasisBps,
+    topLongShortRatio: null,
+    macroEventDay: inp.macroEventDay,
+    macroEventInWindow: inp.macroEventInWindow,
+    hitSl: false,
+    mfePct: 0,
+    subBarPathShape: inp.subBarPathShape,
+    lateBarCloseStrength: null,
+    usedSubBar1m: false,
+    autoBeReturns: {},
+    autoBeHitSl: {},
+  };
+
+  const triggered: LiveContextGateDecision["triggeredRules"] = [];
+  for (const rule of promoted) {
+    const def = defMap.get(rule.id);
+    if (!def) continue;
+    if (def.market === "alpaca" && !isAlpaca) continue;
+    if (def.market === "crypto" && isAlpaca) continue;
+    if (!def.matches(evalRecord)) continue;
+
+    const appliedAction: "OBSERVE" | "HALF_SIZE" | "BLOCK" =
+      mode === "observe"
+        ? "OBSERVE"
+        : mode === "auto_half_size"
+          ? "HALF_SIZE"
+          : rule.recommendedAction === "HARD_GATE"
+            ? "BLOCK"
+            : "HALF_SIZE";
+
+    triggered.push({
+      id: rule.id,
+      label: def.label,
+      recommendedAction: rule.recommendedAction,
+      appliedAction,
+      reason: rule.reason,
+    });
+  }
+
+  if (triggered.length === 0) {
+    return { mode, action: "ALLOW", sizeMultiplier: 1.0, triggeredRules: [], primaryBlockReason: null };
+  }
+
+  if (mode === "observe") {
+    return {
+      mode,
+      action: "ALLOW",
+      sizeMultiplier: 1.0,
+      triggeredRules: triggered,
+      primaryBlockReason: `SHADOW_CTX_${triggered[0]!.id}`,
+    };
+  }
+
+  if (mode === "auto_enforce") {
+    const hardHit = triggered.find((t) => t.appliedAction === "BLOCK");
+    if (hardHit) {
+      return {
+        mode,
+        action: "BLOCK",
+        sizeMultiplier: 0,
+        triggeredRules: triggered,
+        primaryBlockReason: `FILTER:CTX_${hardHit.id}`,
+      };
+    }
+  }
+
+  return {
+    mode,
+    action: "HALF_SIZE",
+    sizeMultiplier: 0.5,
+    triggeredRules: triggered,
+    primaryBlockReason: null,
+  };
 }
 
 /**

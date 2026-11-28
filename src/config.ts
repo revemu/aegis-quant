@@ -458,6 +458,8 @@ export const defaultStrategyConfig = {
   portfolioQuantVolTargetedRisk: true,
   /** Quant Q5: Empirical Bayes Expected Value ranking from Shadow Walk-Forward buckets. */
   portfolioQuantEmpiricalEv: true,
+  /** Quant Q6: Closed-loop OOS Context Gate enforcement ("off" | "observe" | "auto_half_size" | "auto_enforce"). */
+  portfolioQuantContextGateMode: "auto_half_size" as "off" | "observe" | "auto_half_size" | "auto_enforce",
   /** Minimum 12-bar buy volume ratio required before entering a pullback (default 1.3). */
   portfolioMinBuyVolRatio: 1.3,
   /** Minimum 24h relative strength vs benchmark in % required before entering (default -1.0). */
@@ -724,6 +726,14 @@ export function loadConfigFromDatabase(): typeof defaultStrategyConfig {
       }
       if (typeof saved.portfolioQuantEmpiricalEv === "boolean") {
         merged.portfolioQuantEmpiricalEv = saved.portfolioQuantEmpiricalEv;
+      }
+      if (
+        saved.portfolioQuantContextGateMode === "off" ||
+        saved.portfolioQuantContextGateMode === "observe" ||
+        saved.portfolioQuantContextGateMode === "auto_half_size" ||
+        saved.portfolioQuantContextGateMode === "auto_enforce"
+      ) {
+        merged.portfolioQuantContextGateMode = saved.portfolioQuantContextGateMode;
       }
       if (saved.portfolioMinBuyVolRatio !== undefined && Number.isFinite(Number(saved.portfolioMinBuyVolRatio))) {
         merged.portfolioMinBuyVolRatio = Math.min(5.0, Math.max(0.5, Number(saved.portfolioMinBuyVolRatio)));

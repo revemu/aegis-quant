@@ -49,6 +49,7 @@ import {
   computeSubBar15mFeatures,
   evaluateConfidenceSizingOos,
   evaluateContextGatesOos,
+  evaluateLiveContextGates,
   evaluateMfeGivebackAndAutoBe,
   getEquitySector,
   lookupCausalLongShortRatioAt,
@@ -57,9 +58,12 @@ import {
   sliceSubBarsInWindow,
   type AdvancedQuantSetupRecord,
   type ConfidenceSizingAuditSummary,
+  type ContextGateEnforcementMode,
   type ContextGateOosSummary,
+  type ContextGateRuleResult,
   type DecayedRegimeMemorySummary,
   type FactorRankIcRow,
+  type LiveContextGateDecision,
   type LongShortRatioPoint,
   type MfeGivebackAutoBeSummary,
   type PerpBasisPoint,
@@ -68,7 +72,11 @@ export {
   computeAtrCompressionRatioAt,
   computeCausalBetaAlphaAt,
   computeOvernightGapPctAt,
+  evaluateLiveContextGates,
   getEquitySector,
+  type ContextGateEnforcementMode,
+  type ContextGateRuleResult,
+  type LiveContextGateDecision,
   type LongShortRatioPoint,
   type PerpBasisPoint,
 };
@@ -527,7 +535,7 @@ export function computeFeatureBucketKey(
 
 export function normalizeBlockReasonKey(rawReason: string | null | undefined): string {
   const first = (rawReason || "OTHER").split(",")[0]?.trim() || "OTHER";
-  if (first === "MACRO_SIT_OUT" || first === "SHADOW_BEAR_MACRO" || first === "FILTER_FAIL") {
+  if (first === "MACRO_SIT_OUT" || first === "SHADOW_BEAR_MACRO" || first === "FILTER_FAIL" || first.startsWith("SHADOW_CTX_")) {
     return first;
   }
   if (first.startsWith("SURVIVAL_GUARD:")) {
@@ -535,6 +543,7 @@ export function normalizeBlockReasonKey(rawReason: string | null | undefined): s
   }
   if (first.startsWith("FILTER:")) {
     const detail = first.slice("FILTER:".length).trim();
+    if (detail.startsWith("CTX_")) return `FILTER:${detail.split(/\s+/)[0]}`;
     if (detail.startsWith("RiskyShadow") || detail.includes("RISKY_SYMBOL")) return "SURVIVAL_GUARD:RISKY_SYMBOL";
     if (detail.startsWith("1hRSI")) return "FILTER:1hRSI";
     if (detail.startsWith("VolR")) return "FILTER:VolR";
@@ -2093,6 +2102,10 @@ export class LearningEngine {
     return this.shadowSummary;
   }
 
+  public getPromotedContextGates(): ContextGateRuleResult[] {
+    return (this.shadowSummary?.contextGateOos?.rules || []).filter((r) => r.status === "PROMOTE_READY");
+  }
+
   public getLastSurvivalDecision(): SurvivalGuardDecision | null {
     return this.lastSurvivalDecision;
   }
@@ -2175,6 +2188,9 @@ export class LearningEngine {
       sectorBreadthPct?: number | null;
       perpBasisBps?: number | null;
       topLongShortRatio?: number | null;
+      contextGateMode?: string;
+      contextGateAction?: string;
+      contextGateTriggered?: string[];
     };
   }): Promise<string> {
     const sym = params.symbol.toUpperCase();
@@ -2276,6 +2292,11 @@ export class LearningEngine {
                 : {}),
               ...(typeof oc.topLongShortRatio === "number" && Number.isFinite(oc.topLongShortRatio)
                 ? { topLongShortRatio: Number(oc.topLongShortRatio.toFixed(3)) }
+                : {}),
+              ...(oc.contextGateMode ? { contextGateMode: oc.contextGateMode } : {}),
+              ...(oc.contextGateAction ? { contextGateAction: oc.contextGateAction } : {}),
+              ...(Array.isArray(oc.contextGateTriggered) && oc.contextGateTriggered.length > 0
+                ? { contextGateTriggered: oc.contextGateTriggered }
                 : {}),
             }
           : {}),
@@ -4249,6 +4270,7 @@ export class LearningEngine {
       portfolioQuantSessionGuard: cfg.portfolioQuantSessionGuard !== false,
       portfolioQuantVolTargetedRisk: cfg.portfolioQuantVolTargetedRisk !== false,
       portfolioQuantEmpiricalEv: cfg.portfolioQuantEmpiricalEv !== false,
+      portfolioQuantContextGateMode: cfg.portfolioQuantContextGateMode || "auto_half_size",
       portfolioSurvivalGuardEnforced: Boolean(cfg.portfolioSurvivalGuardEnforced),
     };
 
@@ -4261,6 +4283,12 @@ export class LearningEngine {
         summary: { activeTechnicalParams },
         survival: this.lastSurvivalDecision,
         shadowLearning: this.shadowSummary,
+      activePromotedContextGates: this.getPromotedContextGates().map((r) => ({
+        id: r.id,
+        label: r.label,
+        recommendedAction: r.recommendedAction,
+        reason: r.reason,
+      })),
         message: "PostgreSQL not connected; learning journal requires DATABASE_URL.",
       };
     }
@@ -4422,6 +4450,12 @@ export class LearningEngine {
       executionAudit,
       postExitAudit,
       shadowLearning: this.shadowSummary,
+      activePromotedContextGates: this.getPromotedContextGates().map((r) => ({
+        id: r.id,
+        label: r.label,
+        recommendedAction: r.recommendedAction,
+        reason: r.reason,
+      })),
       exitReasons: Array.from(byReasonMap.entries()).map(([reason, r]) => ({
         reason,
         count: r.count,

@@ -23,7 +23,9 @@ import {
   computeOvernightGapPctAt,
   computeTrueTakerBuyPct12At,
   computeUsdStrength5dAt,
+  evaluateLiveContextGates,
   getEquitySector,
+  getSessionBucketLabel,
   isGapInducedBar,
   isOpeningSession45mBar,
   LearningEngine,
@@ -188,6 +190,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
   private initialShadowBootstrapComplete: boolean = false;
   private breadthHistory: Array<{ timeMs: number; breadthPct: number }> = [];
   private corrGuardLogBar = new Map<string, number>();
+  private barReadySymbols = new Map<number, Set<string>>();
+  private contextGateLogBar = new Map<string, number>();
 
   // Real-time Alpaca WebSocket hybrid stream (<= 30 symbols) & live chart sync
   private alpacaWs?: AlpacaPortfolioWsClient;
@@ -516,6 +520,14 @@ export class MaFanPortfolioStrategy implements IStrategy {
         (this.cfg as any)[qKey] = Boolean(clean[qKey]);
       }
     }
+    if (
+      clean.portfolioQuantContextGateMode === "off" ||
+      clean.portfolioQuantContextGateMode === "observe" ||
+      clean.portfolioQuantContextGateMode === "auto_half_size" ||
+      clean.portfolioQuantContextGateMode === "auto_enforce"
+    ) {
+      this.cfg.portfolioQuantContextGateMode = clean.portfolioQuantContextGateMode;
+    }
     if (Number.isFinite(Number(this.cfg.portfolioMinBuyVolRatio))) {
       this.cfg.portfolioMinBuyVolRatio = Math.min(5.0, Math.max(0.5, Number(this.cfg.portfolioMinBuyVolRatio)));
     }
@@ -572,6 +584,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
     this.db.setSetting("portfolioQuantSessionGuard", this.cfg.portfolioQuantSessionGuard !== false);
     this.db.setSetting("portfolioQuantVolTargetedRisk", this.cfg.portfolioQuantVolTargetedRisk !== false);
     this.db.setSetting("portfolioQuantEmpiricalEv", this.cfg.portfolioQuantEmpiricalEv !== false);
+    this.db.setSetting("portfolioQuantContextGateMode", this.cfg.portfolioQuantContextGateMode || "auto_half_size");
     this.db.setSetting("portfolioMinBuyVolRatio", this.cfg.portfolioMinBuyVolRatio ?? 1.3);
     this.db.setSetting("portfolioMinRelStrength24h", this.cfg.portfolioMinRelStrength24h ?? -1.0);
     this.db.setSetting("portfolioMinRsi1h", this.cfg.portfolioMinRsi1h ?? 40);
@@ -2222,6 +2235,19 @@ export class MaFanPortfolioStrategy implements IStrategy {
         extraBlocked.push({ candidate: cand, blockReason: "SHADOW_BEAR_MACRO", barTimeSec: barTime });
       }
 
+      if (stage === "PULLBACK_READY" && !onLearningCooldown) {
+        let readySet = this.barReadySymbols.get(barTime);
+        if (!readySet) {
+          readySet = new Set<string>();
+          this.barReadySymbols.set(barTime, readySet);
+          if (this.barReadySymbols.size > 6) {
+            const oldestBar = Math.min(...this.barReadySymbols.keys());
+            this.barReadySymbols.delete(oldestBar);
+          }
+        }
+        readySet.add(sym);
+      }
+
       if (
         !isHeld &&
         !this.isMarketClosed &&
@@ -2316,6 +2342,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
 
     if (canExecute && freeSlots > 0 && sizeScale > 0 && !sitOutEval.isSitOut && entryCandidates.length > 0) {
       const concurrentReadyCount = entryCandidates.length;
+      const contextGateMode = this.cfg.portfolioQuantContextGateMode || "auto_half_size";
+      const promotedContextGates = this.learning.getPromotedContextGates();
+      const q6BlockedToRecord: Array<{ candidate: PortfolioRadarCandidate; blockReason: string; barTimeSec?: number }> = [];
+
       for (const ch of entryCandidates) {
         if (this.slots.length >= effectiveMaxSlots) break;
 
@@ -2350,30 +2380,10 @@ export class MaFanPortfolioStrategy implements IStrategy {
           }
         }
 
-        const availCash = this.getAvailableBuyCash();
-        const chAtrPct = ch.cand.atrPct ?? 0.35;
-        const { allocQuote: alloc } = computeSlotEntryBudget({
-          standardSlotUnit: this.getStandardSlotUnit(),
-          availCash,
-          sizeScale,
-          volTargetedEnabled: q4VolActive,
-          atrPct: chAtrPct,
-          medianAtrPct,
-        });
-        if (alloc < 5) break;
-        const survWarnReason =
-          wouldBlockSurvivalMap.get(ch.sym) ||
-          (survival.posture === "CAPITAL_PRESERVATION" || this.slots.length >= survival.effectiveMaxSlots
-            ? `SURVIVAL_OBSERVE:${survival.posture}`
-            : null);
-        if (!survival.enforced && survWarnReason) {
-          this.log(
-            `👁️ [Survival Observe] ${ch.sym} would be warned/blocked by ${survWarnReason} — executing normally to gather real trade verification`,
-          );
-        }
         const chInd = this.snapshots.get(ch.sym);
         const chSetup = this.setupStates.get(ch.sym);
         const chClosedBar = chInd ? chInd.c15[chInd.lastClosedIdx] : undefined;
+        const chAtrPct = ch.cand.atrPct ?? 0.35;
         const distFromBottomLowPct =
           chSetup && Number.isFinite(chSetup.bottomLow) && chSetup.bottomLow > 0
             ? ((ch.price - chSetup.bottomLow) / chSetup.bottomLow) * 100
@@ -2383,6 +2393,7 @@ export class MaFanPortfolioStrategy implements IStrategy {
             ? ((chClosedBar.high - Math.max(chClosedBar.open, chClosedBar.close)) / (chClosedBar.high - chClosedBar.low)) * 100
             : 0;
         const barTimeSec = chClosedBar?.time || Math.floor(Date.now() / 1000);
+        const barConcurrentCount = Math.max(concurrentReadyCount, this.barReadySymbols.get(barTimeSec)?.size ?? 0);
         const liveVwapDistPct = isAlpaca && chInd ? computeIntradayVwapDistPctAt(chInd.c15, chInd.lastClosedIdx) : null;
         const liveTakerBuyPct12 = !isAlpaca && chInd ? computeTrueTakerBuyPct12At(chInd.c15, chInd.lastClosedIdx) : null;
         const liveDerivs = !isAlpaca
@@ -2425,6 +2436,81 @@ export class MaFanPortfolioStrategy implements IStrategy {
           );
           if (ba) liveBetaAlpha24h = ba.betaAlpha24h;
         }
+
+        // Quant Q6: Closed-Loop OOS Context Gate Evaluation (auto-promoted/auto-demoted from OOS rules)
+        const macroEv = getMacroEventContext(barTimeSec);
+        const ctxDecision = evaluateLiveContextGates({
+          promotedRules: promotedContextGates,
+          mode: contextGateMode,
+          exchange: this.exchange.exchangeName,
+          input: {
+            usdRet5dPct: liveUsdRet5dPct ?? null,
+            betaAlpha24h: liveBetaAlpha24h,
+            atrCompressionRatio: liveAtrComp,
+            concurrentSignals: barConcurrentCount,
+            vwapDistPct: liveVwapDistPct,
+            distFromBottomLowPct: distFromBottomLowPct ?? 99,
+            sessionBucket: getSessionBucketLabel(barTimeSec, this.exchange.exchangeName),
+            macroEventDay: macroEv.isEventDay,
+            macroEventInWindow: macroEv.inWindow,
+            oiDelta4hPct: liveDerivs.oiDelta4hPct,
+            takerBuyPct12: liveTakerBuyPct12,
+            perpBasisBps: liveDerivs.perpBasisBps,
+            overnightGapPct: liveOvernightGapPct,
+            subBarPathShape: null,
+          },
+        });
+
+        const ctxLogKey = `${ch.sym}:${ctxDecision.action}`;
+        if (ctxDecision.action === "BLOCK" && ctxDecision.primaryBlockReason) {
+          q6BlockedToRecord.push({
+            candidate: ch.cand,
+            blockReason: ctxDecision.primaryBlockReason,
+            barTimeSec: ch.cand.barTimeSec,
+          });
+          if (this.contextGateLogBar.get(ctxLogKey) !== barTimeSec) {
+            this.contextGateLogBar.set(ctxLogKey, barTimeSec);
+            this.log(
+              `🛡️ [Quant Q6 Context Gate] Blocked ${ch.sym} (${ctxDecision.primaryBlockReason}: ${ctxDecision.triggeredRules.map((r) => r.label).join(", ")})`,
+            );
+          }
+          continue;
+        }
+        if (ctxDecision.action === "ALLOW" && ctxDecision.primaryBlockReason) {
+          q6BlockedToRecord.push({
+            candidate: ch.cand,
+            blockReason: ctxDecision.primaryBlockReason,
+            barTimeSec: ch.cand.barTimeSec,
+          });
+        }
+        const entrySizeScale = sizeScale * ctxDecision.sizeMultiplier;
+        if (ctxDecision.action === "HALF_SIZE" && this.contextGateLogBar.get(ctxLogKey) !== barTimeSec) {
+          this.contextGateLogBar.set(ctxLogKey, barTimeSec);
+          this.log(
+            `⚖️ [Quant Q6 Context Gate] Half-Size 0.5x on ${ch.sym} (${ctxDecision.triggeredRules.map((r) => r.id).join(", ")})`,
+          );
+        }
+
+        const availCash = this.getAvailableBuyCash();
+        const { allocQuote: alloc } = computeSlotEntryBudget({
+          standardSlotUnit: this.getStandardSlotUnit(),
+          availCash,
+          sizeScale: entrySizeScale,
+          volTargetedEnabled: q4VolActive,
+          atrPct: chAtrPct,
+          medianAtrPct,
+        });
+        if (alloc < 5) break;
+        const survWarnReason =
+          wouldBlockSurvivalMap.get(ch.sym) ||
+          (survival.posture === "CAPITAL_PRESERVATION" || this.slots.length >= survival.effectiveMaxSlots
+            ? `SURVIVAL_OBSERVE:${survival.posture}`
+            : null);
+        if (!survival.enforced && survWarnReason) {
+          this.log(
+            `👁️ [Survival Observe] ${ch.sym} would be warned/blocked by ${survWarnReason} — executing normally to gather real trade verification`,
+          );
+        }
         await this.executeEntrySlot(
           ch.sym,
           ch.price,
@@ -2442,8 +2528,8 @@ export class MaFanPortfolioStrategy implements IStrategy {
             atrPct: chAtrPct,
             breadthDelta4h: liveBreadthDelta4h,
             benchmarkRet4h: liveBenchmarkRet4h,
-            concurrentSignalsCount: concurrentReadyCount,
-            macroEventTag: getMacroEventContext(barTimeSec).tag,
+            concurrentSignalsCount: barConcurrentCount,
+            macroEventTag: macroEv.tag,
             earningsTag: isAlpaca ? earningsCalendar.getEarningsTag(ch.sym) : null,
             hasShock24h: chInd ? detectRecentShock24h(chInd.c15, chInd.lastClosedIdx, chAtrPct) : false,
             mayerMultiple: liveMacro1d?.mayerMultiple ?? null,
@@ -2460,8 +2546,22 @@ export class MaFanPortfolioStrategy implements IStrategy {
             sectorBreadthPct: liveSectorBreadthPct,
             perpBasisBps: liveDerivs.perpBasisBps,
             topLongShortRatio: liveDerivs.topLongShortRatio,
+            contextGateMode: ctxDecision.mode,
+            contextGateAction: ctxDecision.action,
+            contextGateTriggered: ctxDecision.triggeredRules.map((r) => r.id),
           },
         );
+      }
+
+      if (q6BlockedToRecord.length > 0 && fallbackClosedBarSec > 0) {
+        void this.learning.recordBlockedSignals({
+          exchange: this.exchange.exchangeName,
+          barTimeSec: fallbackClosedBarSec,
+          macro: this.macroState,
+          candidates: [],
+          extraBlocked: q6BlockedToRecord,
+          tp1TargetMode: this.cfg.portfolioTp1TargetMode,
+        });
       }
     }
   }
@@ -2656,6 +2756,9 @@ export class MaFanPortfolioStrategy implements IStrategy {
       sectorBreadthPct?: number | null;
       perpBasisBps?: number | null;
       topLongShortRatio?: number | null;
+      contextGateMode?: string;
+      contextGateAction?: string;
+      contextGateTriggered?: string[];
     },
   ): Promise<void> {
     const usedIdx = new Set(this.slots.map((s) => s.slotIndex));
